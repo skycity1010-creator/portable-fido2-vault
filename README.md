@@ -1,7 +1,7 @@
 # 可攜式 FIDO2 密碼金庫（portable-fido2-vault）v0.1
 
 Windows 桌面、**完全離線**、**portable 免安裝**的 FIDO2 密碼金庫。
-單一資料夾（`PortableFidoVault.exe + vault.db`）複製到任何 Windows 電腦即可使用。
+單一資料夾（`portable-fido-vault.exe + vault.db`）複製到任何 Windows 電腦即可使用。
 
 - 首次執行建立帳號：主密碼經 **Argon2id** 派生金鑰
 - 之後**主密碼或任一支已註冊 FIDO2 金鑰**皆可登入（允許多支）
@@ -36,10 +36,10 @@ portable-fido2-vault/
 # bash / git-bash（WS2）
 export PATH="$HOME/.cargo/bin:$HOME/tools/winlibs-x86_64-posix-seh-gcc-14.2.0-mingw-w64ucrt-12.0.0-r2/bin:$PATH"
 cd C:/project/portable-fido2-vault/src-tauri
-cargo +stable-x86_64-pc-windows-gnu build --release   # 產出 target/release/PortableFidoVault.exe
+cargo +stable-x86_64-pc-windows-gnu build --release   # 產出 target/release/portable-fido-vault.exe
 ```
 
-> portable 部署：將 `target\release\PortableFidoVault.exe` 複製到任意資料夾即完成安裝；
+> portable 部署：將 `target\release\portable-fido-vault.exe` 複製到任意資料夾即完成安裝；
 > 首次執行後該資料夾會多出 `vault.db`（你的金庫）。整個資料夾＝全部資產。
 
 ## 使用流程
@@ -55,7 +55,7 @@ cargo +stable-x86_64-pc-windows-gnu build --release   # 產出 target/release/Po
 
 ```powershell
 # 本機打包
-Copy-Item target\release\PortableFidoVault.exe C:\deploy\fido-vault\
+Copy-Item target\release\portable-fido-vault.exe C:\deploy\fido-vault\
 # 把整個 fido-vault 資料夾（含 vault.db）複製/USB 到 NB，雙擊 exe 即可
 ```
 

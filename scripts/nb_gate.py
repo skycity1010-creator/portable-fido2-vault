@@ -8,7 +8,7 @@
   3. CopyFromScreen 截圖 → base64 回傳存本機 gate1_screenshot.png
   4. （若有 vault_cli）NB 上跑 CLI E2E：create/register/login/add/list/audit
 """
-import base64, hashlib, os, subprocess, sys
+import base64, hashlib, os, re, subprocess, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from nb_push import run_ps_inner, push  # noqa: E402
@@ -23,14 +23,16 @@ def kill_app():
 
 
 def launch_and_check(wait_s=12):
+    # 注意：PS 單引號字串**不展開變數** → 證據行一律用 + 串接。
     inner = (
         f"$p = Start-Process -FilePath '{REMOTE_DIR}\\portable-fido-vault.exe' -WorkingDirectory '{REMOTE_DIR}' -PassThru; "
         f"Start-Sleep -Seconds {wait_s}; "
-        f"$alive = Get-Process -Id $p.Id -ErrorAction SilentlyContinue; "
-        f"if ($alive) {{ 'ALIVE pid=$($p.Id) session=$($alive.SessionId) mem=$([int]($alive.WorkingSet/1MB))MB' }} else {{ 'DEAD' }}; "
-        f"$wv = @(Get-CimInstance Win32_Process -Filter \"Name='msedgewebview2.exe'\" | Where-Object {{ $_.ParentProcessId -eq $p.Id }}).Count; "
-        f"'WEBVIEW2_CHILDREN=$wv'; "
-        f"Get-CimInstance Win32_Process -Filter \"Name='msedgewebview2.exe'\" | Select-Object ProcessId, ParentProcessId | ForEach-Object {{ 'WV pid=$($_.ProcessId) parent=$($_.ParentProcessId)' }}"
+        "$alive = Get-Process -Id $p.Id -ErrorAction SilentlyContinue; "
+        "'GUI=' + ($(if ($alive) {'ALIVE'} else {'DEAD'})) + ' pid=' + $p.Id + "
+        "' session=' + $(if ($alive) {$alive.SessionId} else {0}) + "
+        "' mem=' + $(if ($alive) {[int]($alive.WorkingSet/1MB)} else {0}) + 'MB'; "
+        "$wv = @(Get-CimInstance Win32_Process -Filter \"Name='msedgewebview2.exe'\" | Where-Object { $_.ParentProcessId -eq $p.Id }).Count; "
+        "'WEBVIEW2_CHILDREN_OF_GUI=' + $wv"
     )
     o, e = run_ps_inner(inner)
     return (o or e).strip()
@@ -99,11 +101,14 @@ def main():
     print("[2] launch GUI + 10s alive check")
     kill_app()
     status = launch_and_check(10)
-    print("  ", status)
-    alive = 'ALIVE' in status
+    print("  ", status.replace("\n", " | "))
 
-    print("[3] screenshot evidence")
-    shot = screenshot() if alive else False
+    print("[3] GUI liveness (session-0 WinRM 無法截互動桌面 → 以過程存活+WebView2 子程序為證據)")
+    wv_count = -1
+    m = re.search(r"WEBVIEW2_CHILDREN_OF_GUI=(\d+)", status)
+    if m:
+        wv_count = int(m.group(1))
+    alive = "GUI=ALIVE" in status and wv_count >= 1
 
     ok2 = True
     if cli_exe and os.path.exists(cli_exe):
@@ -113,9 +118,10 @@ def main():
         print("[4] skip (no vault_cli.exe)")
 
     kill_app()
-    print("\nGATE1:", "PASS" if (alive and shot) else ("PARTIAL(alive, no shot)" if alive else "FAIL"),
-          "| NB-CLI:", "PASS" if ok2 else "SKIP/FAIL")
-    sys.exit(0 if alive else 1)
+    print("\nGATE1:", "PASS" if alive else "FAIL",
+          f"(alive={ 'ALIVE' in status }, webview2_children={wv_count})",
+          "| NB-CLI(Gate8):", "PASS" if ok2 else "SKIP/FAIL")
+    sys.exit(0 if (alive and ok2) else 1)
 
 
 if __name__ == "__main__":
