@@ -72,7 +72,7 @@ python ../scripts/gate_e2e.py     # 逐項 PASS/FAIL + 證據；全綠 = exit 0
 手動範例（CLI 參數皆為 `--flag value`）：
 
 ```bash
-V=./test-vault.db; P=target/release/vault_cli.exe
+V=./test-vault.db; P=target/release/examples/vault_cli.exe
 $P create       --path $V --pw Test1234!
 $P register-key --path $V --pw Test1234! --kind pin --pin 2468   # 類型：fingerprint|pin|touch_only；--no-prf 模擬不支援 PRF 的金鑰（應被拒絕）
 $P login-key    --path $V --idx 0

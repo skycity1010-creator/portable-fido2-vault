@@ -6,7 +6,6 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
 };
 use argon2::{
-    password_hash::{PasswordHasher, SaltString},
     Argon2, Algorithm, Version,
 };
 use hkdf::Hkdf;
@@ -50,16 +49,16 @@ impl std::error::Error for CryptoError {}
 
 /// Argon2id → 32-byte KEK。salt 為原始位元組（建議 32B）。
 pub fn argon2id_derive(password: &[u8], salt: &[u8]) -> Result<[u8; 32], CryptoError> {
-    let salt_b64 = SaltString::encode_b64(salt).map_err(|e| CryptoError::Kdf(e.to_string()))?;
     let mut out = [0u8; 32];
     Argon2::new(
         Algorithm::Argon2id,
         Version::V0x13,
         // argon2 crate 的 m_cost 單位是 KiB（直接傳 19456，勿再乘 1024）
-        argon2::Params::new(ARGON2_M_COST_KIB, ARGON2_T_COST, ARGON2_P_COST, None)
+        argon2::Params::new(ARGON2_M_COST, ARGON2_T_COST, ARGON2_P_COST, None)
             .map_err(|e| CryptoError::Kdf(e.to_string()))?,
     )
-    .hash_password_into(password, &salt_b64, &mut out)
+    // hash_password_into 直接吃原始 salt byte（不需 base64 包裝）
+    .hash_password_into(password, salt, &mut out)
     .map_err(|e| CryptoError::Kdf(e.to_string()))?;
     Ok(out)
 }

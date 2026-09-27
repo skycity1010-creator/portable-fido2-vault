@@ -8,7 +8,7 @@ import hashlib, os, shutil, subprocess, sys, tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(ROOT, "src-tauri")
-BIN = os.path.join(SRC, "target", "release", "vault_cli.exe")
+BIN = os.path.join(SRC, "target", "release", "examples", "vault_cli.exe")
 VDIR = sys.argv[1] if len(sys.argv) > 1 else os.path.join(tempfile.gettempdir(), "f2v-gate")
 
 results = []
@@ -17,7 +17,8 @@ def cli(*args):
     r = subprocess.run([BIN, *args], capture_output=True, text=True, cwd=SRC)
     out = (r.stdout or "").strip()
     err = (r.stderr or "").strip()
-    return r.returncode, out, err
+    # CLI 成功訊息走 stdout、錯誤訊息走 stderr → 合併供判定（evidence 保留分流）
+    return r.returncode, out + ("\n" + err if err else ""), err
 
 def check(name, ok, evidence=""):
     results.append((name, ok, evidence))
@@ -87,13 +88,8 @@ def main():
     for line in out2.splitlines():
         if "site=example.com" not in line:
             continue
-        # 行格式: "<id8> | site=... account=... created=<ts> updated=<ts>"
-        fields = [f.strip() for f in line.split("|")]
-        kv = {}
-        for f in fields:
-            if "=" in f:
-                k, v = f.split("=", 1)
-                kv[k.strip()] = v.strip()
+        # 行格式: "<id8> | site=... account=... created=<ts> updated=<ts>"（pipe 只分 id，其餘以空白分隔）
+        kv = dict(p.split("=", 1) for p in line.split() if "=" in p)
         created, updated = kv.get("created"), kv.get("updated")
     rc3, out3, err3 = cli("update-entry", "--path", V, "--pw", "Gate-Pass-1", "--id", eid, "--pass", "NewPass!9")
     rc4, out4, _ = cli("list", "--path", V, "--pw", "Gate-Pass-1")
@@ -101,12 +97,7 @@ def main():
     for line in out4.splitlines():
         if "site=example.com" not in line:
             continue
-        fields = [f.strip() for f in line.split("|")]
-        kv = {}
-        for f in fields:
-            if "=" in f:
-                k, v = f.split("=", 1)
-                kv[k.strip()] = v.strip()
+        kv = dict(p.split("=", 1) for p in line.split() if "=" in p)
         created2, updated2 = kv.get("created"), kv.get("updated")
     check("G5.2 created_at/updated_at 正確（更新後 updated>created，created 不變）",
           rc3 == 0 and created == created2 and updated2 and updated != updated2,

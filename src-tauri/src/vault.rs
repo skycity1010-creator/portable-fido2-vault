@@ -11,7 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::crypto::{
     aes_gcm_decrypt, aes_gcm_encrypt, argon2id_derive, base64_decode, base64_encode,
@@ -48,6 +48,18 @@ impl std::error::Error for VaultError {}
 impl From<std::io::Error> for VaultError {
     fn from(e: std::io::Error) -> Self {
         Self::Io(e)
+    }
+}
+
+impl From<FidoError> for VaultError {
+    fn from(e: FidoError) -> Self {
+        Self::Fido(e)
+    }
+}
+
+impl From<CryptoError> for VaultError {
+    fn from(e: CryptoError) -> Self {
+        Self::Crypto(e)
     }
 }
 
@@ -149,8 +161,10 @@ impl Vault {
         }
         let kek = random_kek();
         let salt = random_bytes(32);
+        // 密碼槽：以 Argon2id(master_password) 派生的金流包裝 KEK（open_password 用同參數解包）。
+        let pw_key = argon2id_derive(password.as_bytes(), &salt)?;
         let nonce = random_nonce();
-        let ct = aes_gcm_encrypt(&kek, &nonce, &kek.as_slice().try_into().unwrap());
+        let ct = aes_gcm_encrypt(&pw_key, &nonce, kek.as_slice());
 
         let header = Header {
             v: 1,
@@ -168,7 +182,7 @@ impl Vault {
                 method: "setup".into(),
                 detail: format!(
                     "argon2id m={}KiB t={} p={}",
-                    crate::crypto::ARGON2_M_COST_KIB,
+                    crate::crypto::ARGON2_M_COST,
                     crate::crypto::ARGON2_T_COST,
                     crate::crypto::ARGON2_P_COST
                 ),
@@ -176,7 +190,7 @@ impl Vault {
             settings: Settings { idle_lock_minutes: 5 },
         };
 
-        let mut vault = Self { path: path.to_path_buf(), header, data, kek };
+        let vault = Self { path: path.to_path_buf(), header, data, kek };
         vault.write_file()?;
         Ok(vault)
     }
@@ -211,7 +225,7 @@ impl Vault {
         path: &Path,
         credential_id_b64: &str,
         pin: Option<&str>,
-        backend: &mut impl FidoBackend,
+        backend: &mut (dyn FidoBackend + 'static),
     ) -> Result<Self, VaultError> {
         let (header, payload) = Self::read_file(path)?;
         let slot = header
@@ -414,7 +428,8 @@ impl Vault {
             e.notes = v.into();
         }
         e.updated_at = now_rfc3339();
-        self.record("entry_updated", "manual", &e.site)?;
+        let site = e.site.clone(); // 先取值，避免與 record() 的 &mut self 重疊借用
+        self.record("entry_updated", "manual", &site)?;
         Ok(())
     }
 
@@ -439,7 +454,7 @@ impl Vault {
     /// 偵測 + 註冊新金鑰：以目前 KEK 包出新槽位。
     /// PIN 型金鑰註冊時即需提供 PIN（makeCredential 需與 token 建立安全通道）。
     /// **產品決策：不支援 PRF/hmac-secret 的金鑰一律拒絕註冊**（無法解鎖離線金庫）。
-    pub fn register_key(&mut self, backend: &mut impl FidoBackend, pin: Option<&str>) -> Result<RegisteredCredential, VaultError> {
+    pub fn register_key(&mut self, backend: &mut (dyn FidoBackend + 'static), pin: Option<&str>) -> Result<RegisteredCredential, VaultError> {
         if !backend.prf_supported() {
             return Err(VaultError::Fido(FidoError::PrfNotSupported));
         }
@@ -448,7 +463,7 @@ impl Vault {
         let secret = backend.get_prf_secret(&reg.credential_id, pin)?;
         let k = kek_from_prf_secret(&secret);
         let nonce = random_nonce();
-        let ct = aes_gcm_encrypt(&k, &nonce, &self.kek.as_slice().try_into().unwrap());
+        let ct = aes_gcm_encrypt(&k, &nonce, self.kek.as_slice());
 
         self.header.key_slots.push(KeySlot {
             credential_id: base64_encode(&reg.credential_id),
@@ -458,7 +473,8 @@ impl Vault {
             nonce: base64_encode(&nonce),
             ct: base64_encode(&ct),
         });
-        self.record("key_registered", &format!("fido2:{}", reg.label), &format!("type={}", reg.kind))?;
+        let kind_str = format!("{}", reg.kind);
+        self.record("key_registered", &format!("fido2:{}", reg.label), &format!("type={kind_str}"))?;
         Ok(reg)
     }
 
@@ -523,9 +539,9 @@ fn trim_audit(audit: &mut Vec<AuditEvent>) {
 }
 
 // ── 未解鎖失敗記錄（sidecar）──
-//! 登入失敗時沒有 KEK，無法改動加密 payload；header 明文區又不放大 audit。
-//! 失敗事件寫入同資料夾 sidecar `vault.db.failures`（僅時間戳+method，無機密，上限 10 筆）。
-//! 成功解鎖時合併進加密 audit 並刪除 sidecar → Gate 2「錯誤密碼拒絕且計入軌跡」可驗證。
+// 登入失敗時沒有 KEK，無法改動加密 payload；header 明文區又不放大 audit。
+// 失敗事件寫入同資料夾 sidecar `vault.db.failures`（僅時間戳+method，無機密，上限 10 筆）。
+// 成功解鎖時合併進加密 audit 並刪除 sidecar → Gate 2「錯誤密碼拒絕且計入軌跡」可驗證。
 
 pub fn failures_path(vault_path: &Path) -> PathBuf {
     let mut s = vault_path.as_os_str().to_owned();
@@ -717,7 +733,7 @@ mod tests {
         let _ = fs::remove_file(&p);
         let v = Vault::create(&p, "Pw-12345").unwrap();
         let mut v = v;
-        v.add_entry("bank.com", "bob", "Bank-Pass-000", "").unwrap().ok();
+        v.add_entry("bank.com", "bob", "Bank-Pass-000", "").unwrap();
 
         // 重新解鎖後檢查 audit JSON 內不含任何條目密碼。
         drop(v);

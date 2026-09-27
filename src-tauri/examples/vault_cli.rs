@@ -16,7 +16,7 @@
 //!   cargo run --example vault_cli -- copy-test  --src A --dst B --pw PASS [--key-idx N]
 
 use portable_fido_vault::fido2::{KeyKind, MockBackend};
-use portable_fido_vault::vault::{record_login_failure, failures_path, Vault};
+use portable_fido_vault::vault::{failures_path, Vault};
 use std::path::PathBuf;
 
 struct Opts {
@@ -47,7 +47,7 @@ fn parse(args: &[String]) -> (String, Opts) {
     while i < args.len() {
         match args[i].as_str() {
             a if !a.starts_with("--") => cmd = a.to_string(),
-            "--path" => o.path = Some(next(args, &mut i)),
+            "--path" => o.path = Some(PathBuf::from(next(args, &mut i))),
             "--pw" => o.pw = Some(next(args, &mut i)),
             "--kind" => o.kind = KeyKind::parse(&next(args, &mut i)),
             "--idx" => o.idx = Some(next(args, &mut i).parse().unwrap_or(0)),
@@ -58,8 +58,8 @@ fn parse(args: &[String]) -> (String, Opts) {
             "--notes" => o.notes = Some(next(args, &mut i)),
             "--id" => o.id = Some(next(args, &mut i)),
             "--minutes" => o.minutes = Some(next(args, &mut i).parse().unwrap_or(5)),
-            "--src" => o.src = Some(next(args, &mut i)),
-            "--dst" => o.dst = Some(next(args, &mut i)),
+            "--src" => o.src = Some(PathBuf::from(next(args, &mut i))),
+            "--dst" => o.dst = Some(PathBuf::from(next(args, &mut i))),
             "--no-prf" => o.no_prf = true,
             _ => {}
         }
@@ -86,16 +86,26 @@ fn open_with_pw(path: &PathBuf, pw: &str) -> Result<Vault, String> {
 }
 
 fn main() {
+    match run() {
+        Ok(m) => println!("{m}"),
+        Err(m) => { eprintln!("{m}"); std::process::exit(1); }
+    }
+}
+
+fn run() -> Result<String, String> {
     let (cmd, o) = parse(&std::env::args().skip(1).collect::<Vec<_>>());
-    let r: Result<String, String> = match cmd.as_str() {
+    match cmd.as_str() {
         "create" => {
             let path = req_path(&o.path);
             let pw = o.pw.clone().unwrap_or_default();
-            if pw.len() < 8 { return Err("主密碼至少 8 字元".into()); }
-            let _ = std::fs::remove_file(&path); // CLI 測試用：重跑先清
-            let v = Vault::create(&path, &pw).map_err(|e| e.to_string())?;
-            drop(v);
-            Ok(format!("OK created {}", path.display()))
+            if pw.len() < 8 {
+                Err("主密碼至少 8 字元".into())
+            } else {
+                let _ = std::fs::remove_file(&path); // CLI 測試用：重跑先清
+                let v = Vault::create(&path, &pw).map_err(|e| e.to_string())?;
+                drop(v);
+                Ok(format!("OK created {}", path.display()))
+            }
         }
         "login-pw" => {
             let path = req_path(&o.path);
@@ -109,7 +119,9 @@ fn main() {
             let idx = o.idx.unwrap_or(0);
             // 讀 header 取 credential_id（不需 KEK）
             let (h, _) = read_header_only(&path)?;
-            if idx >= h.key_slots.len() { return Err(format!("idx {idx} 超出（共 {} 支）", h.key_slots.len())); }
+            if idx >= h.key_slots.len() {
+                return Err(format!("idx {idx} 超出（共 {} 支）", h.key_slots.len()));
+            }
             let cid = h.key_slots[idx].credential_id.clone();
             let label = h.key_slots[idx].label.clone();
             let mut b = backend(None, true);
@@ -224,16 +236,12 @@ fn main() {
             let wrong = o.pw.clone().unwrap_or_default();
             match Vault::open_password(&path, &wrong) {
                 Err(_) => {} // 預期失敗
-                Ok(_) => return Err("意外：錯誤密碼竟登入成功").into(),
+                Ok(_) => return Err("意外：錯誤密碼竟登入成功".into()),
             }
             let fc = std::fs::read_to_string(failures_path(&path)).unwrap_or_default();
             Ok(format!("OK wrong-pw rejected; sidecar={fc}"))
         }
         _ => Err("help".into()),
-    };
-    match r {
-        Ok(m) => println!("{m}"),
-        Err(m) => { eprintln!("{m}"); std::process::exit(1); }
     }
 }
 

@@ -69,6 +69,18 @@ impl KeyKind {
     }
 }
 
+impl std::fmt::Display for KeyKind {
+    /// 與 serde snake_case 命名一致（軌跡/CLI 顯示用）。
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            KeyKind::Fingerprint => "fingerprint",
+            KeyKind::Pin => "pin",
+            KeyKind::TouchOnly => "touch_only",
+        };
+        f.write_str(s)
+    }
+}
+
 /// 偵測結果（註冊前預覽用）。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DetectedKey {
@@ -144,8 +156,10 @@ pub trait FidoBackend: Send {
 
 /// 模擬金鑰：無狀態、純函數。PRF secret 由 credential_id 決定 → 跨行程一致。
 pub struct MockBackend {
-    /// detect() 計數（模擬依序插入不同金鑰；類型循環 fingerprint→pin→touch-only）。
+    /// detect() 自動循環計數（fingerprint→pin→touch-only；override 不推進）。
     detect_count: u32,
+    /// 依序偵測到的金鑰編號（label/AAGUID 用，恆 +1 → 每支 label 唯一）。
+    seq: u32,
     /// CLI/測試可指定「下一支偵測到的金鑰類型」（覆蓋自動循環）。
     next_kind_override: Option<KeyKind>,
     /// 模擬金鑰是否支援 hmac-secret/PRF（預設 true = YubiKey 5+；--no-prf 驗證裁決②）。
@@ -162,6 +176,7 @@ impl MockBackend {
     pub fn new() -> Self {
         Self {
             detect_count: 0,
+            seq: 0,
             next_kind_override: None,
             prf_enabled: true,
         }
@@ -215,15 +230,21 @@ impl MockBackend {
 
 impl FidoBackend for MockBackend {
     fn detect(&mut self) -> Result<DetectedKey, FidoError> {
-        let kind = self
-            .next_kind_override
-            .take()
-            .unwrap_or_else(|| KeyKind::from_u8(self.detect_count % 3));
-        self.detect_count += 1;
-        let aaguid = mock_aaguid(self.detect_count);
+        // override（CLI --kind / UI 指定）只生效一次，**不推進自動循環計數** →
+        // 其後回到的仍是循環起點（與 peek_kind 一致）。
+        let kind = match self.next_kind_override.take() {
+            Some(k) => k,
+            None => {
+                let k = KeyKind::from_u8((self.detect_count % 3) as u8);
+                self.detect_count += 1;
+                k
+            }
+        };
+        self.seq += 1; // 每支偵測到的金鑰都有獨立編號（label/AAGUID 唯一）
+        let aaguid = mock_aaguid(self.seq);
         Ok(DetectedKey {
             kind,
-            label: format!("Mock YubiKey #{}", self.detect_count),
+            label: format!("Mock YubiKey #{}", self.seq),
             aaguid,
         })
     }
@@ -248,7 +269,7 @@ impl FidoBackend for MockBackend {
 
     fn peek_kind(&self) -> KeyKind {
         // 與 detect() 的取值邏輯一致（override 優先，否則循環）→ UI 預覽不偏。
-        self.next_kind_override.unwrap_or_else(|| KeyKind::from_u8(self.detect_count % 3))
+        self.next_kind_override.unwrap_or_else(|| KeyKind::from_u8((self.detect_count % 3) as u8))
     }
 
     fn prf_supported(&self) -> bool {

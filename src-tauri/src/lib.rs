@@ -161,14 +161,13 @@ fn login_key(state: tauri::State<VaultState>, credential_id: String, pin: Option
 /// 上鎖（手動或閒置）。回傳登入畫面資訊。
 #[tauri::command]
 fn lock(state: tauri::State<VaultState>, reason: Option<String>) -> Result<LoginScreenInfo> {
-    let path = path_from_state_or_default();
     let header = state.with_lock(|g| {
         match g.vault.take() {
             Some(v) => Ok(if reason.as_deref() == Some("idle") { v.auto_lock() } else { v.lock() }),
             None => Err("尚未解鎖".to_string()),
         }
     })?;
-    Ok(LoginScreenInfo { has_vault: true, keys: header.into(), idle_lock_minutes: 5 })
+    Ok(LoginScreenInfo { has_vault: true, keys: (&header).into(), idle_lock_minutes: 5 })
 }
 
 fn with_unlocked<R>(state: &VaultState, f: impl FnOnce(&mut vault::Vault) -> Result<R>) -> Result<R> {
