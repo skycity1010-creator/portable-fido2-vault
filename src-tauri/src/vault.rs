@@ -438,7 +438,11 @@ impl Vault {
 
     /// 偵測 + 註冊新金鑰：以目前 KEK 包出新槽位。
     /// PIN 型金鑰註冊時即需提供 PIN（makeCredential 需與 token 建立安全通道）。
+    /// **產品決策：不支援 PRF/hmac-secret 的金鑰一律拒絕註冊**（無法解鎖離線金庫）。
     pub fn register_key(&mut self, backend: &mut impl FidoBackend, pin: Option<&str>) -> Result<RegisteredCredential, VaultError> {
+        if !backend.prf_supported() {
+            return Err(VaultError::Fido(FidoError::PrfNotSupported));
+        }
         let detected = backend.detect()?;
         let reg = backend.register_credential(&detected)?;
         let secret = backend.get_prf_secret(&reg.credential_id, pin)?;
@@ -549,8 +553,34 @@ pub fn record_login_failure(vault_path: &Path, method: &str) -> Result<(), Vault
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fido2::MockBackend;
+    use crate::fido2::{FidoBackend, FidoError, KeyKind, MockBackend};
     use std::env;
+
+    /// 不支援 PRF 的金鑰包裝（驗證裁決②：拒絕註冊）。
+    struct NoPrfBackend(MockBackend);
+    impl FidoBackend for NoPrfBackend {
+        fn detect(&mut self) -> Result<crate::fido2::DetectedKey, FidoError> { self.0.detect() }
+        fn register_credential(&mut self, d: &crate::fido2::DetectedKey) -> Result<crate::fido2::RegisteredCredential, FidoError> { self.0.register_credential(d) }
+        fn get_prf_secret(&mut self, id: &[u8], pin: Option<&str>) -> Result<[u8; 32], FidoError> { self.0.get_prf_secret(id, pin) }
+        fn prf_supported(&self) -> bool { false }
+    }
+
+    #[test]
+    fn register_rejects_non_prf_key() {
+        let d = tmp_dir("noprfr");
+        let p = d.join("vault.db");
+        let _ = fs::remove_file(&p);
+        let v = Vault::create(&p, "Pw-12345").unwrap();
+        let mut v = v;
+        let mut bad = NoPrfBackend(MockBackend::new());
+        assert!(matches!(
+            v.register_key(&mut bad, None),
+            Err(VaultError::Fido(FidoError::PrfNotSupported))
+        ));
+        // 金鑰槽數不變
+        assert_eq!(v.keys_meta().len(), 0);
+        let _ = fs::remove_dir_all(&d);
+    }
 
     fn tmp_dir(tag: &str) -> PathBuf {
         let d = env::temp_dir().join(format!("f2v-test-{tag}-{}", std::process::id()));

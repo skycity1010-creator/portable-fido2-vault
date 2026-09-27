@@ -94,6 +94,7 @@ offset   size   field
 ## 5. FIDO2 偵測與登入流程
 
 ### 5.1 註冊（金庫已解鎖時）
+0. **PRF 強制檢查**（產品決策 2026-09-27）：`getInfo.options["hmac-secret"]` 為 false → **拒絕註冊**，UI 顯示明確原因（「此金鑰不支援 hmac-secret/PRF extension，無法用來解鎖離線金庫」）。→ 所有已註冊金鑰皆可單獨解鎖。
 1. `authenticatorGetInfo`：讀 versions / options.clientPin / pinProtocols / aaguid。
 2. 類型判定（依卡 spec 順序）：
    - CTAP2.1 `authenticatorBioEnrollment` getModality 回傳 fingerprint → **指紋型**

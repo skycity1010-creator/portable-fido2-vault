@@ -48,15 +48,15 @@ function renderLoginKeys(keys) {
     const div = document.createElement("div");
     div.className = "key-item";
     div.innerHTML = `<span>🔑 <span class="klabel">${esc(k.label)}</span></span><span class="ktype">${esc(k.key_type)} · ${esc(k.prompt_zh)}</span>`;
-    div.onclick = () => selectLoginKey(k, keys);
+    div.onclick = () => selectLoginKey(k, div);
     box.appendChild(div);
   }
 }
 
-function selectLoginKey(k) {
+function selectLoginKey(k, el) {
   selectedKey = k;
-  document.querySelectorAll("#key-list-login .key-item").forEach((el) => el.classList.remove("selected"));
-  event.currentTarget.classList.add("selected");
+  document.querySelectorAll("#key-list-login .key-item").forEach((x) => x.classList.remove("selected"));
+  el.classList.add("selected");
   if (k.key_type === "pin") show("pin-box"); else hide("pin-box");
   show("btn-login-key");
 }

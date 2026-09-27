@@ -91,6 +91,8 @@ pub enum FidoError {
     NoDevice,
     PinRequired(String),
     PinRejected,
+    /// 金鑰不支援 hmac-secret/PRF → 依產品決策**拒絕註冊**（UI 顯示原因）。
+    PrfNotSupported,
     NotSupported(String),
     Internal(String),
 }
@@ -101,6 +103,10 @@ impl std::fmt::Display for FidoError {
             Self::NoDevice => write!(f, "未偵測到 FIDO2 金鑰（請插入後重試）"),
             Self::PinRequired(hint) => write!(f, "此金鑰需要 PIN：{hint}"),
             Self::PinRejected => write!(f, "PIN 錯誤，請重試"),
+            Self::PrfNotSupported => write!(
+                f,
+                "此金鑰不支援 hmac-secret/PRF extension，無法用來解鎖離線金庫（拒絕註冊）。請改用支援 PRF 的金鑰（例：YubiKey 5+）"
+            ),
             Self::NotSupported(m) => write!(f, "不支援：{m}"),
             Self::Internal(m) => write!(f, "FIDO2 內部錯誤：{m}"),
         }
@@ -125,6 +131,12 @@ pub trait FidoBackend: Send {
     /// 實體後端回目前金鑰類型；mock 回循環中的下一個。
     fn peek_kind(&self) -> KeyKind {
         KeyKind::TouchOnly
+    }
+
+    /// 是否支援 hmac-secret/PRF（CTAP2 getInfo options["hmac-secret"]）。
+    /// **產品決策：不支援 PRF 的金鑰拒絕註冊**（無法解鎖離線金庫）。
+    fn prf_supported(&self) -> bool {
+        false
     }
 }
 
@@ -228,6 +240,11 @@ impl FidoBackend for MockBackend {
     fn peek_kind(&self) -> KeyKind {
         // 與 detect() 的取值邏輯一致（override 優先，否則循環）→ UI 預覽不偏。
         self.next_kind_override.unwrap_or_else(|| KeyKind::from_u8(self.detect_count % 3))
+    }
+
+    fn prf_supported(&self) -> bool {
+        // mock 模擬支援 PRF 的金鑰（YubiKey 5+）。
+        true
     }
 }
 
