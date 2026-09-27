@@ -1,0 +1,141 @@
+:root {
+  --bg: #0f1420;
+  --panel: #171e2e;
+  --panel2: #1d2639;
+  --border: #2a3550;
+  --text: #e8edf7;
+  --muted: #8b98b8;
+  --accent: #4f8cff;
+  --accent-hi: #6ea1ff;
+  --danger: #ff5d6c;
+  --ok: #3ddc84;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: "Microsoft JhengHei", "Segoe UI", system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 14px;
+}
+
+.hidden { display: none !important; }
+.muted { color: var(--muted); }
+.error { color: var(--danger); min-height: 18px; margin-top: 10px; white-space: pre-wrap; }
+.warn {
+  background: rgba(255, 93, 108, 0.12);
+  border: 1px solid rgba(255, 93, 108, 0.4);
+  color: #ffb3ba;
+  padding: 10px 12px;
+  border-radius: 8px;
+  margin: 12px 0;
+  font-size: 13px;
+}
+
+.screen { min-height: 100vh; }
+
+/* ── 登入畫面 ── */
+#screen-login {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: radial-gradient(1200px 600px at 50% -10%, #1a2440, var(--bg));
+}
+.login-card {
+  width: 420px;
+  max-width: calc(100vw - 32px);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 28px;
+  box-shadow: 0 20px 60px rgba(0,0,0,.45);
+}
+.login-card h1 { font-size: 20px; margin: 0 0 4px; }
+.login-card .sub { margin: 0 0 18px; color: var(--muted); }
+.login-card label { display: block; margin: 12px 0 6px; color: var(--muted); font-size: 13px; }
+
+input, textarea {
+  width: 100%;
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 9px 11px;
+  font-size: 14px;
+  font-family: inherit;
+}
+input:focus, textarea:focus { outline: none; border-color: var(--accent); }
+
+button {
+  background: var(--panel2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 9px 14px;
+  font-size: 14px;
+  cursor: pointer;
+  font-family: inherit;
+}
+button:hover { border-color: var(--accent); }
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  width: 100%;
+  margin-top: 16px;
+  font-weight: 600;
+}
+button.primary:hover { background: var(--accent-hi); }
+
+.divider {
+  display: flex; align-items: center; gap: 10px;
+  color: var(--muted); font-size: 12px; margin: 18px 0 10px;
+}
+.divider::before, .divider::after { content: ""; flex: 1; height: 1px; background: var(--border); }
+
+.key-item {
+  display: flex; align-items: center; gap: 10px;
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+  cursor: pointer;
+}
+.key-item.selected { border-color: var(--accent); background: rgba(79,140,255,.12); }
+.key-item .klabel { font-weight: 600; }
+.key-item .ktype { color: var(--muted); font-size: 12px; margin-left: auto; }
+
+/* ── 主畫面 ── */
+.topbar {
+  display: flex; align-items: center; gap: 14px;
+  padding: 10px 18px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+}
+.topbar .brand { font-weight: 700; }
+#lock-status { margin-left: auto; font-size: 12px; }
+
+.tabs { display: flex; gap: 4px; padding: 10px 18px 0; background: var(--panel); border-bottom: 1px solid var(--border); }
+.tabs button { border-radius: 8px 8px 0 0; margin-top: -10px; padding: 9px 16px; background: transparent; }
+.tabs button.active { background: var(--bg); border-bottom: 2px solid var(--accent); font-weight: 600; }
+
+.tab { padding: 18px; }
+.tab h3 { margin: 4px 0 10px; }
+
+.row { display: flex; gap: 10px; align-items: center; margin: 10px 0; }
+.row input { flex: 1; }
+.row button { width: auto; margin-top: 0; }
+
+table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--border); font-size: 13px; }
+th { color: var(--muted); font-weight: 600; }
+td .mono { font-family: Consolas, monospace; color: var(--muted); }
+
+.pw-cell { font-family: Consolas, monospace; letter-spacing: 1px; cursor: pointer; }
+.rowbtns button { padding: 4px 9px; font-size: 12px; margin-left: 6px; width: auto; margin-top: 0; }
+
+#entry-edit { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; margin-top: 14px; }
+#entry-edit label { display: block; color: var(--muted); font-size: 13px; margin: 10px 0 5px; }

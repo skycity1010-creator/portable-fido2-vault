@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>可攜式 FIDO2 密碼金庫</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <!-- ─────────── 登入 / 建立畫面 ─────────── -->
+  <div id="screen-login" class="screen hidden">
+    <div class="login-card">
+      <h1>🔐 可攜式 FIDO2 密碼金庫</h1>
+      <p class="sub" id="login-sub">請輸入主密碼登入</p>
+
+      <!-- 建立帳號（首次執行） -->
+      <div id="setup-panel" class="hidden">
+        <h3>首次執行 — 建立帳號</h3>
+        <label>主密碼（至少 8 字元）</label>
+        <input type="password" id="setup-pw" autocomplete="new-password" />
+        <label>確認主密碼</label>
+        <input type="password" id="setup-pw2" autocomplete="new-password" />
+        <div class="warn">⚠️ <b>無復原機制</b>：主密碼遺忘且所有 FIDO2 金鑰全失時，資料將<b>永久無法取回</b>。請務必記牢。</div>
+        <button id="btn-create" class="primary">建立金庫</button>
+      </div>
+
+      <!-- 登入 -->
+      <div id="login-panel">
+        <label>主密碼</label>
+        <input type="password" id="login-pw" autocomplete="current-password" />
+        <button id="btn-login-pw" class="primary">以主密碼登入</button>
+
+        <div class="divider">或使用 FIDO2 金鑰</div>
+        <div id="key-list-login"></div>
+        <div id="pin-box" class="hidden">
+          <label>金鑰 PIN（此金鑰為 PIN 型）</label>
+          <input type="password" id="login-pin" autocomplete="off" />
+        </div>
+        <button id="btn-login-key" class="primary hidden">以金鑰登入</button>
+      </div>
+
+      <div id="login-error" class="error"></div>
+    </div>
+  </div>
+
+  <!-- ─────────── 主畫面（已解鎖） ─────────── -->
+  <div id="screen-main" class="screen hidden">
+    <header class="topbar">
+      <span class="brand">🔐 密碼金庫</span>
+      <span id="lock-status" class="muted">已解鎖</span>
+      <button id="btn-lock">上鎖</button>
+    </header>
+
+    <nav class="tabs">
+      <button data-tab="entries" class="active">條目</button>
+      <button data-tab="keys">金鑰管理</button>
+      <button data-tab="audit">軌跡紀錄</button>
+      <button data-tab="settings">設定</button>
+    </nav>
+
+    <!-- 條目 -->
+    <section id="tab-entries" class="tab">
+      <div class="row">
+        <input id="e-site" placeholder="網站（例：example.com）" />
+        <input id="e-account" placeholder="帳號 / 使用者名稱" />
+        <button id="btn-add" class="primary">＋ 新增</button>
+      </div>
+      <table id="entries-table">
+        <thead><tr><th>網站</th><th>帳號</th><th>建立時間</th><th>更新時間</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div id="entry-edit" class="hidden">
+        <h3>編輯條目</h3>
+        <label>網站</label><input id="ed-site" />
+        <label>帳號</label><input id="ed-account" />
+        <label>密碼</label><input id="ed-pass" type="text" />
+        <label>備註</label><textarea id="ed-notes" rows="2"></textarea>
+        <div class="row">
+          <button id="btn-save-entry" class="primary">儲存</button>
+          <button id="btn-cancel-entry">取消</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- 金鑰管理 -->
+    <section id="tab-keys" class="tab hidden">
+      <h3>已註冊 FIDO2 金鑰</h3>
+      <p class="muted">任一支已註冊金鑰皆可解鎖金庫。移除後該金鑰<b>無法再解鎖</b>（不可逆）。</p>
+      <div id="keys-list"></div>
+      <div class="row" style="margin-top:12px">
+        <button id="btn-register-key" class="primary">＋ 註冊新金鑰</button>
+      </div>
+      <div id="register-status" class="muted"></div>
+    </section>
+
+    <!-- 軌跡紀錄 -->
+    <section id="tab-audit" class="tab hidden">
+      <h3>軌跡紀錄</h3>
+      <p class="muted">僅記錄非機密資訊（登入成功/失敗、金鑰註冊/移除、條目增刪改＋時間）；<b>絕不含密碼明文</b>。</p>
+      <table id="audit-table">
+        <thead><tr><th>時間</th><th>事件</th><th>方式</th><th>細節</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </section>
+
+    <!-- 設定 -->
+    <section id="tab-settings" class="tab hidden">
+      <h3>設定</h3>
+      <label>閒置自動上鎖（分鐘，1–60）</label>
+      <div class="row">
+        <input id="idle-minutes" type="number" min="1" max="60" style="width:80px" />
+        <button id="btn-set-idle" class="primary">套用</button>
+      </div>
+      <div class="warn" style="margin-top:16px">⚠️ <b>無復原機制</b>：金鑰全失 + 忘記主密碼 = 資料永久無法取回（設計如此）。</div>
+    </section>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

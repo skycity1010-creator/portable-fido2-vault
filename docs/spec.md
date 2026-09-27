@@ -1,0 +1,152 @@
+# 可攜式 FIDO2 密碼金庫 v0.1 — 技術規格書
+
+> 專案：`portable-fido2-vault`｜卡：t_31e9ef5e｜語言介面：繁體中文
+> 目標平台：Windows 10/11 x64（WebView2 內建於 Win11）
+
+## 1. 目標 / 非目標
+
+**目標**
+- Windows 桌面 App，完全離線（零網路呼叫；Tauri 不啟用任何 http 插件）。
+- 可攜：單一資料夾 `exe + vault.db`，複製到別台電腦免安裝即可執行。
+- 首次執行建立帳號（主密碼）；之後**主密碼或任一支已註冊 FIDO2 金鑰**皆可登入（允許多支）。
+- 金鑰類型自動偵測：指紋型 / PIN 型 / touch-only；登入時依類型給正確提示。
+- 加密儲存：Argon2id + AES-256-GCM，整個金庫加密為單一檔案。
+- CRUD（網站/帳號/密碼/備註）＋ created_at/updated_at ＋ 軌跡紀錄（絕不明文記錄密碼）＋ 閒置自動上鎖。
+
+**非目標（v0.1）**
+- TOTP、密碼產生器、雲端同步、多使用者、行動裝置。
+- **無復原機制**（設計如此，UI 明示）。
+
+## 2. 架構
+
+```
+┌─────────────────────────── Tauri v2 (Rust) ───────────────────────────┐
+│  前端 (src/): index.html + app.js + styles.css — 純靜態、無 npm、繁中   │
+│    window.__TAURI__.core.invoke(...) → commands                        │
+├─────────────────────────────────────────────────────────────────────────┤
+│  src-tauri/src/lib.rs      — Tauri commands + VaultState (Mutex)        │
+│  src-tauri/src/vault.rs    — 金庫檔案格式 / 載入 / 建立 / 加密落盤       │
+│  src-tauri/src/crypto.rs   — Argon2id KDF / AES-256-GCM / HKDF          │
+│  src-tauri/src/fido2.rs    — FidoBackend trait + Mock/Real CTAP2        │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+- **狀態**：解鎖後 KEK（32B，`Zeroizing<[u8;32]>`）與金庫資料僅存於記憶體；上鎖即清零。
+- **落盤策略**：任何變更 → 以記憶體 KEK 重新加密整個 payload → 暫存檔 + rename 原子寫入。
+- **FIDO2 後端**：trait `FidoBackend`（detect / register_credential / get_prf_secret）。
+  - `MockBackend`（feature 預設）：軟體金鑰，實作 hmac-secret 語義（HMAC-SHA256），供無硬體環境端到端驗證。
+  - Real CTAP2 後端：CTAP2 `getInfo` + `authenticatorBioEnrollment`(0x09) + `makeCredential`/`getAssertion`（含 hmac-secret extension）。函式庫選型見 §5.4。
+
+## 3. 金庫檔案格式（vault.db，v1）
+
+```
+offset   size   field
+──────── ────── ────────────────────────────────────────────────
+0        6      magic "F2VLT\x01"（version 1）
+6        4      header_len u32 LE
+10       N     header JSON（UTF-8，**明文金鑰包裝區**，不含任何機密值）
+10+N     12    payload nonce（AES-GCM 96-bit）
+22+N     …     AES-256-GCM(KEK, vault_json) — 含 16B tag 於尾端
+```
+
+### header JSON（明文、可攜關鍵：金鑰包裝槽位）
+```json
+{
+  "argon2":        { "t": 3, "m": 19456, "p": 4, "salt": "<b64 32B>" },
+  "password_slot": { "nonce": "<b64 12B>", "ct": "<b64 AES-GCM(KEK)>" },
+  "key_slots": [
+    {
+      "credential_id": "<b64url>", "aaguid": "<hex32>",
+      "label": "YubiKey 5C", "key_type": "fingerprint|pin|touch_only",
+      "nonce": "<b64 12B>", "ct": "<b64 AES-GCM(KEK)>"
+    }
+  ],
+  "created_at": "RFC3339"
+}
+```
+
+### payload（vault_json，加密後不可讀）
+```json
+{
+  "entries": [
+    { "id": "<hex32>", "site": "", "account": "", "password": "",
+      "notes": "", "created_at": "RFC3339", "updated_at": "RFC3339" }
+  ],
+  "audit": [ { "ts": "RFC3339", "event": "", "method": "", "detail": "" } ],
+  "settings": { "idle_lock_minutes": 5 }
+}
+```
+
+**設計要點（仿 LUKS 多槽位）**：KEK 是隨機 256-bit，本身從不明文落盤；每個「解鎖方式」（密碼／每支金鑰）各自用不同金流把同一份 KEK 包裝一次。新增/移除金鑰只改 header、不需重加密 payload。
+
+## 4. 金鑰派生與加密
+
+| 項目 | 演算法 / 參數 |
+|---|---|
+| 主密碼 KDF | Argon2id，t=3, m=19456 KiB (19 MiB), p=4, salt 32B（OWASP 建議下限附近，登入延遲 ~0.5s） |
+| 對稱加密 | AES-256-GCM，nonce 每次隨機 12B |
+| 金鑰槽 KEK 派生 | HKDF-SHA256(ikm=PRF secret 32B, salt=`f2vlt-domain-v1`, info=`f2vlt-kek-wrap-v1`) → 32B |
+| PRF salt（固定） | `f2vlt-prf-salt-v1`（32B，domain separation；非機密，公開於程式碼） |
+
+- **密碼登入**：K=Argon2id(pw, salt) → AES-GCM 解 password_slot.ct → KEK → 解 payload。tag 驗證失敗 = 拒絕並記軌跡。
+- **金鑰登入**：CTAP2 getAssertion(allow=[cred_id], hmac-secret{salt1=PRF_SALT}) → S(32B) → HKDF → AES-GCM 解該槽 ct → KEK → 解 payload。
+
+## 5. FIDO2 偵測與登入流程
+
+### 5.1 註冊（金庫已解鎖時）
+1. `authenticatorGetInfo`：讀 versions / options.clientPin / pinProtocols / aaguid。
+2. 類型判定（依卡 spec 順序）：
+   - CTAP2.1 `authenticatorBioEnrollment` getModality 回傳 fingerprint → **指紋型**
+   - 否則 clientPin=true 且 pinProtocols 非空 → **PIN 型**
+   - 否則 → **touch-only**
+3. `makeCredential(rp_id="f2vlt.local", user, pubKeyCredParams=[ES256], residentKey=required, extensions={hmac-secret})` → 取 credentialId + aaguid。
+4. 以該金鑰的 PRF secret（固定 salt）派生槽位金流，包裝 KEK，寫入 header.key_slots；audit `key_registered`（含 label、type）。
+
+### 5.2 登入提示（依已存 key_type）
+| type | UI 提示 |
+|---|---|
+| fingerprint | 「請插入金鑰並**按指紋**」 |
+| pin | 「請插入金鑰並**輸入 PIN**」（UI 收集 PIN → CTAP2 authenticate） |
+| touch_only | 「請插入金鑰並**觸碰**」 |
+
+### 5.3 多支金鑰
+每支 credential 獨立槽位；登入畫面列出全部已註冊金鑰（label + type），使用者點選一支 → 依類型提示 → getAssertion。任一支成功即解鎖。
+
+### 5.4 CTAP2 函式庫選型（裁決記錄）
+- **選用 mozilla authenticator-rs (ctap2)**：Windows USB HID 走 UWP `HidDevice` API，**免 admin**（符合 portable 雙擊執行）；原生實作 hmac-secret extension（解鎖關鍵）。
+- 棄用 kanidm webauthn-authenticator-rs：其 `USBTransport` 於 Win10 build 1903+ **需 Administrator** 才列得裝置，且 `GetAssertionRequest` 未實作 extensions（無 PRF/hmac-secret）。
+- 若 ctap2 branch 未暴露 `getBioEnrollment`，自行補 CBOR command 0x09（getModality / getFingerprintSensorInfo）。
+
+## 6. 軌跡紀錄（audit）
+
+事件集：`vault_created, login_success, login_failed, key_registered, key_removed, entry_added, entry_updated, entry_deleted, auto_lock, manual_lock`。
+- `method`：`password` / `fido2:<label>` / `setup` / `idle` / `manual`。
+- `detail`：**僅非機密資訊**（如 site 名稱、失敗原因代碼 wrong_password/no_device/decrypt_failed）。**永不記錄密碼、PIN、金流、credentialId 明文值以外的敏感資料。**
+- 儲存於加密 payload 內；UI「軌跡紀錄」頁可查（最新在前，上限 1000 筆，超出丟最舊）。
+
+## 7. 閒置自動上鎖
+
+- `settings.idle_lock_minutes`（預設 5，UI 可改 1–60）。
+- 前端監聽 mousemove/keydown/click 重置計時；逾時 → `invoke('lock', {reason:'idle'})` → Rust 端 audit `auto_lock` + KEK 清零 + 回登入畫面。
+- 手動上鎖鈕 → reason=manual。
+
+## 8. 安全模型 / 威脅說明
+
+- 金庫檔案外洩（無任何解鎖因子）→ payload 為 AES-256-GCM，header 僅含包裝槽位，無法取得 KEK。
+- **無復原**：主密碼遺忘 + 全部 FIDO2 金鑰全失 = 永久無法取回（UI 於建立帳號與設定頁明示）。
+- 移除金鑰 = 刪該槽；該金鑰即無法再解鎖（不可逆，需確認對話框）。
+- 離線：程式不開啟任何 socket；Tauri 未加 http/fs 外部插件。
+- 已知限制（v0.1）：單機單使用者；檔案權限依賴 OS 使用者權限；不防執行中記憶體 dump（與一般密碼管理程式同級）。
+
+## 9. Gate 對應
+
+| Gate | 驗證方式 |
+|---|---|
+| 1 portable + NB 免安裝 | `cargo tauri build` → 資料夾複製至 Win11-NB（WinRM）執行 |
+| 2 建立帳號/密碼登入/錯誤拒絕 | vault_cli E2E + GUI |
+| 3 金鑰註冊+類型偵測+金鑰登入 | 實測（有硬體時）或 MockBackend E2E（F2V_MOCK=1） |
+| 4 第二支金鑰/任一支可登入 | 同上，register 兩支後交叉登入 |
+| 5 CRUD + 時間戳 | vault_cli E2E |
+| 6 軌跡完整/無明文密碼 | vault_cli：解出 audit JSON 檢查 + 檔案 grep 驗證密碼值不出現在 header |
+| 7 閒置自動上鎖 | GUI 計時器（縮短逾時實測）+ lock 命令 |
+| 8 加密檔直拷別機可解密 | vault_cli copy-test：A 建立 → 複製 vault.db 至 B 路徑 → B 同密碼/金鑰登入成功 |
