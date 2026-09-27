@@ -151,6 +151,19 @@ pub trait FidoBackend: Send {
     fn prf_supported(&self) -> bool {
         false
     }
+
+    /// 診斷：已註冊指紋 template 數（getBioEnrollment GetEnrollments）。
+    /// **Ok(0) = 金鑰未 enroll 指紋 → UV=true 的 makeCredential 无法满足（notAllowed）**。
+    /// None = mock / probe 不可用；Some(Err) = probe 失敗原因。
+    fn enrollment_count(&mut self) -> Option<Result<usize, String>> {
+        None
+    }
+
+    /// 診斷：完整 CTAP2 getInfo 關鍵欄位 dump（clientPin/uv/bioEnroll/pin_protocols/fw）。
+    /// mock 回 "mock"；hw 偵測後回實際值。供遠端排程不須使用者互動。
+    fn info_diag(&self) -> String {
+        "mock".to_string()
+    }
 }
 
 // ─────────────────────────── MockBackend ───────────────────────────
@@ -511,6 +524,80 @@ mod real {
             }
         }
 
+        /// getBioEnrollment CBOR 0x09（GetEnrollments）— 讀已註冊指紋 template 清單。
+        /// 診斷用：enrollmentCount=0 → UV=true 的 makeCredential 无法满足（notAllowed 根因①）。
+        /// best-effort：Ok(n) = n 支 template；Err(msg) / None = probe 失敗（如 notAllowed/無 PIN）。
+        fn probe_enrollments(&mut self) -> Option<Result<usize, String>> {
+            use authenticator::{InteractiveRequest, InteractiveUpdate};
+            use std::sync::atomic::{AtomicBool, Ordering};
+
+            let (status_tx, status_rx) = channel::<authenticator::StatusUpdate>();
+            let result: Arc<Mutex<Option<Result<BioEnrollmentResult, authenticator::errors::AuthenticatorError>>>> =
+                Arc::new(Mutex::new(None));
+            let done = Arc::new(AtomicBool::new(false));
+
+            {
+                let (result3, done3) = (result.clone(), done.clone());
+                std::thread::spawn(move || {
+                    for msg in status_rx.iter() {
+                        match msg {
+                            authenticator::StatusUpdate::InteractiveManagement(
+                                InteractiveUpdate::StartManagement((tx, _info)),
+                            ) => {
+                                if tx.send(InteractiveRequest::BioEnrollment(
+                                    BioEnrollmentCmd::GetEnrollments,
+                                    None,
+                                ))
+                                .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            authenticator::StatusUpdate::InteractiveManagement(
+                                InteractiveUpdate::BioEnrollmentUpdate((res, _puat)),
+                            ) => {
+                                *result3.lock().unwrap() = Some(Ok(res));
+                                done3.store(true, Ordering::SeqCst);
+                            }
+                            authenticator::StatusUpdate::PinUvError(ref e) => log_pin_error(e),
+                            _ => {}
+                        }
+                    }
+                });
+            }
+
+            let cb = StateCallback::new(Box::new({
+                let (result2, done2) = (result.clone(), done.clone());
+                move |rv: authenticator::Result<authenticator::ManageResult>| {
+                    match rv {
+                        Ok(authenticator::ManageResult::BioEnrollment(res)) => {
+                            *result2.lock().unwrap() = Some(Ok(res));
+                        }
+                        Err(e) => *result2.lock().unwrap() = Some(Err(e)),
+                        Ok(_) => {}
+                    }
+                    done2.store(true, Ordering::SeqCst);
+                }
+            }));
+
+            if self.service.manage(DETECT_TIMEOUT_MS, status_tx, cb).is_err() {
+                return None; // 無 transport / 非同步錯誤
+            }
+            while !done.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let got = {
+                let mut g = result.lock().unwrap();
+                g.take()
+            };
+            Some(match got {
+                Some(Ok(BioEnrollmentResult::EnrollmentList(v))) => Ok(v.len()),
+                Some(Ok(other)) => Err(format!("unexpected-result: {other:?}")),
+                Some(Err(e)) => Err(format!("{e:?}")),
+                None => Err("no-result（timeout）".to_string()),
+            })
+        }
+
         fn kind_from_info(i: &AuthenticatorInfo) -> KeyKind {
             // 指紋（bioEnrollment）> PIN（clientPin）> touch-only。
             if i.options.bio_enroll == Some(true) {
@@ -674,6 +761,37 @@ mod real {
             match &self.info {
                 Some(i) => i.extensions.iter().any(|e| e == "hmac-secret"),
                 None => false,
+            }
+        }
+
+        fn enrollment_count(&mut self) -> Option<Result<usize, String>> {
+            // 僅對 bioEnroll 金鑰有意義；非指紋型 → None（不發 probe）。
+            let is_bio = matches!(&self.info, Some(i) if i.options.bio_enroll == Some(true));
+            if !is_bio {
+                return None;
+            }
+            self.probe_enrollments()
+        }
+
+        fn info_diag(&self) -> String {
+            match &self.info {
+                Some(i) => format!(
+                    "clientPin={:?} uv={:?} bioEnroll={:?} pin_protocols={:?} fw_version={:?} \
+                     versions={:?} extensions={:?} alwaysUv={:?} makeCredUvNotRqd={:?} \
+                     uvBioEnroll={:?} min_pin_length={:?}",
+                    i.options.client_pin,
+                    i.options.user_verification,
+                    i.options.bio_enroll,
+                    i.pin_protocols,
+                    i.firmware_version,
+                    i.versions,
+                    i.extensions,
+                    i.options.always_uv,
+                    i.options.make_cred_uv_not_rqd,
+                    i.options.uv_bio_enroll,
+                    i.min_pin_length,
+                ),
+                None => "not-detected".to_string(),
             }
         }
     }

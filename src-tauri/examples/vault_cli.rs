@@ -77,6 +77,10 @@ fn next(args: &[String], i: &mut usize) -> String {
     args.get(*i).cloned().unwrap_or_default()
 }
 
+fn hex_bytes(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
 /// 依 --authenticator 建後端（mock 預設；hw = 實體 CTAP2，需 feature real-ctap）。
 fn make_backend(auth: &str, kind: Option<KeyKind>, prf: bool) -> Box<dyn FidoBackend> {
     if auth.eq_ignore_ascii_case("hw") {
@@ -140,6 +144,9 @@ fn run() -> Result<String, String> {
             let cid = h.key_slots[idx].credential_id.clone();
             let label = h.key_slots[idx].label.clone();
             let mut b = make_backend(&o.authenticator, None, true);
+            if o.authenticator.eq_ignore_ascii_case("hw") {
+                eprintln!("[fido2] 即將要求指紋驗證：請將手指放上 YubiKey Bio 金鑰本體上的指紋感測器（銀色外框）");
+            }
             match Vault::open_key(&path, &cid, o.pin.as_deref(), &mut *b) {
                 Ok(v) => Ok(format!("OK login_success key=#{idx}({}) entries={}", label, v.entries().len())),
                 Err(e) => Err(format!("FAIL {e}")),
@@ -149,8 +156,32 @@ fn run() -> Result<String, String> {
             let path = req_path(&o.path);
             let mut v = open_with_pw(&path, o.pw.as_deref().unwrap_or(""))?;
             let mut b = make_backend(&o.authenticator, o.kind, !o.no_prf);
+            if o.authenticator.eq_ignore_ascii_case("hw") {
+                // 硬體 UV 提示：register/login 會進入指紋等待（YubiKey Bio = 金鑰本體銀色外框感測器，
+                // **不是** NB 的 Windows Hello）。UV prompt 有時限，提前按無效、錯過要重試。
+                eprintln!("[fido2] 即將要求指紋驗證：請將手指放上 YubiKey Bio 金鑰本體上的指紋感測器（銀色外框）");
+            }
             let reg = v.register_key(&mut *b, o.pin.as_deref()).map_err(|e| e.to_string())?;
             Ok(format!("OK key_registered idx={} label={} type={}", v.keys_meta().len() - 1, reg.label, reg.kind))
+        }
+        "detect" => {
+            // 純偵測（getInfo + CBOR 0x09 probe；**不需指紋/互動**）→ NB 遠端可跑。
+            let mut b = make_backend(&o.authenticator, None, true);
+            match b.detect() {
+                Ok(d) => {
+                    // 診斷：bioEnroll 金鑰追加 GetEnrollments probe（enrollmentCount=0 → UV notAllowed 根因）。
+                    let enroll = match b.enrollment_count() {
+                        Some(Ok(n)) => format!(" enrollment_count={n}"),
+                        Some(Err(e)) => format!(" enrollment_probe_err={e}"),
+                        None => String::new(),
+                    };
+                    Ok(format!(
+                        "OK detected kind={} label={} aaguid={} prf_supported={}{}\n[INFO] {}",
+                        d.kind, d.label, hex_bytes(&d.aaguid), b.prf_supported(), enroll, b.info_diag()
+                    ))
+                }
+                Err(e) => Err(format!("FAIL detect: {e}")),
+            }
         }
         "add-entry" => {
             let path = req_path(&o.path);
