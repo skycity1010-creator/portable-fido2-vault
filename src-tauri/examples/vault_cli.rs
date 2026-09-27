@@ -20,6 +20,7 @@ use portable_fido_vault::fido2::{FidoBackend, KeyKind, MockBackend};
 use portable_fido_vault::fido2::RealBackend;
 use portable_fido_vault::vault::{failures_path, Vault};
 use std::path::PathBuf;
+use std::time::Instant;
 
 struct Opts {
     path: Option<PathBuf>,
@@ -161,8 +162,16 @@ fn run() -> Result<String, String> {
                 // **不是** NB 的 Windows Hello）。UV prompt 有時限，提前按無效、錯過要重試。
                 eprintln!("[fido2] 即將要求指紋驗證：請將手指放上 YubiKey Bio 金鑰本體上的指紋感測器（銀色外框）");
             }
-            let reg = v.register_key(&mut *b, o.pin.as_deref()).map_err(|e| e.to_string())?;
-            Ok(format!("OK key_registered idx={} label={} type={}", v.keys_meta().len() - 1, reg.label, reg.kind))
+            // 診斷：計時 — U2FToken(NotAllowed) 是 transport 90s timeout fallback；
+            // 若 ~90s = UV 未滿足；若快速失敗 = 別的原因（HID 佔用 / firmware）。
+            let t0 = Instant::now();
+            match v.register_key(&mut *b, o.pin.as_deref()) {
+                Ok(reg) => Ok(format!(
+                    "OK key_registered idx={} label={} type={} elapsed_ms={}",
+                    v.keys_meta().len() - 1, reg.label, reg.kind, t0.elapsed().as_millis()
+                )),
+                Err(e) => Err(format!("FAIL register_key elapsed_ms={} :: {}", t0.elapsed().as_millis(), e)),
+            }
         }
         "detect" => {
             // 純偵測（getInfo + CBOR 0x09 probe；**不需指紋/互動**）→ NB 遠端可跑。
