@@ -134,7 +134,8 @@ pub trait FidoBackend: Send {
     fn detect(&mut self) -> Result<DetectedKey, FidoError>;
 
     /// 註冊新 credential（makeCredential，resident + hmac-secret extension）。
-    fn register_credential(&mut self, detected: &DetectedKey) -> Result<RegisteredCredential, FidoError>;
+    /// PIN 型金鑰需提供 pin（makeCredential 需與 token 建立安全通道）。
+    fn register_credential(&mut self, detected: &DetectedKey, pin: Option<&str>) -> Result<RegisteredCredential, FidoError>;
 
     /// 取 PRF secret（getAssertion + hmac-secret）。PIN 型金鑰需先提供 PIN。
     fn get_prf_secret(&mut self, credential_id: &[u8], pin: Option<&str>) -> Result<[u8; 32], FidoError>;
@@ -249,7 +250,7 @@ impl FidoBackend for MockBackend {
         })
     }
 
-    fn register_credential(&mut self, detected: &DetectedKey) -> Result<RegisteredCredential, FidoError> {
+    fn register_credential(&mut self, detected: &DetectedKey, _pin: Option<&str>) -> Result<RegisteredCredential, FidoError> {
         Ok(RegisteredCredential {
             credential_id: Self::make_credential_id(detected.kind),
             aaguid: detected.aaguid,
@@ -286,6 +287,481 @@ fn mock_aaguid(n: u32) -> [u8; 16] {
     a
 }
 
+// ─────────────────────────── RealBackend（real-ctap）───────────────────────────
+//
+// 實體 CTAP2 金鑰後端（PM 裁決③：mozilla authenticator-rs v0.6.1，vendored）。
+//
+// PRF secret 語義（與 MockBackend 對齊 → vault 格式跨 mock/real 相容）：
+//   getAssertion + hmac-secret extension，salt1 = crate::crypto::prf_salt_bytes()（固定）。
+//   金鑰端回傳 HMAC(authenticator_key, salt1)；函式庫以本 session ECDH shared secret 解密 →
+//   output1: [u8;32]。authenticator_key 對該 resident credential 恆定、salt1 固定 →
+//   output1 跨行程/重啟可重現 → HKDF(kek_from_prf_secret) → KEK。即「金鑰單獨即可解鎖」。
+//
+// UV 策略：user_verification_req = Preferred（**不可用 Discouraged**）——
+//   Discouraged 會令 can_skip_user_verification=true → 不建立 shared secret →
+//   hmac 輸出無法解密 → PRF 抽取失敗。Preferred 下函式庫走 UV/PIN 路徑：
+//     - touch-only（YubiKey 5）：GetPinUvAuthTokenUsingUvWithPermissions → 觸碰一次
+//     - 指紋型：按指紋
+//     - PIN 型：需 pin（呼叫方提供；None 時回 PinRequired）
+//   shared secret 在該路徑內建立 → finalize_result 得以解密 hmac 輸出。
+
+#[cfg(feature = "real-ctap")]
+mod real {
+    use super::*;
+    use authenticator::authenticatorservice::{AuthenticatorService, RegisterArgs, SignArgs};
+    use authenticator::ctap2::commands::client_pin::Pin;
+    use authenticator::ctap2::commands::get_info::AuthenticatorInfo;
+    use authenticator::{BioEnrollmentCmd, BioEnrollmentResult};
+    use authenticator::ctap2::server::{
+        AuthenticationExtensionsClientInputs, HMACGetSecretInput, PublicKeyCredentialDescriptor,
+        PublicKeyCredentialParameters, PublicKeyCredentialUserEntity, RelyingParty,
+        ResidentKeyRequirement, UserVerificationRequirement,
+    };
+    use authenticator::crypto::COSEAlgorithm;
+    use authenticator::statecallback::StateCallback;
+    use sha2::{Digest, Sha256};
+    use std::sync::mpsc::channel;
+    use std::sync::{Arc, Mutex};
+
+    /// RP id / origin（離線工具，固定值；跨行程一致即可）。
+    const RP_ID: &str = "fido-vault.local";
+    /// 偵測（getInfo）超時（ms）：含 Windows HID 列舉 + 裝置選擇。
+    const DETECT_TIMEOUT_MS: u64 = 30_000;
+    /// 註冊 / PRF 操作超時（ms）：需 key-agreement + 觸碰/指紋/PIN 互動，給足時間。
+    const OP_TIMEOUT_MS: u64 = 90_000;
+
+    pub struct RealBackend {
+        service: AuthenticatorService,
+        /// detect() 後快取的 AuthenticatorInfo（供 prf_supported()/peek_kind() 免再碰硬體）。
+        info: Option<AuthenticatorInfo>,
+    }
+
+    impl RealBackend {
+        pub fn new() -> Self {
+            let mut service = AuthenticatorService::new().expect("authenticator service init");
+            // Windows：Win32 HID transport（CreateFile + usage page 檢查，免 admin）。
+            service.add_u2f_usb_hid_platform_transports();
+            Self { service, info: None }
+        }
+
+        /// 以既有 AuthenticatorService 建立（測試用：可注入 mock transport）。
+        pub fn with_service(service: AuthenticatorService) -> Self {
+            Self { service, info: None }
+        }
+
+        /// 同步橋：authenticator-rs 是「callback + status channel」非同步模型；此處以
+        /// StateCallback::wait() 阻塞，並在泵執行緒消化 status（PIN 要求 / 多裝置選擇）。
+        fn run_op<T: Send + 'static>(
+            &mut self,
+            _timeout_ms: u64,
+            submit: impl FnOnce(
+                &mut AuthenticatorService,
+                std::sync::mpsc::Sender<authenticator::StatusUpdate>,
+                StateCallback<authenticator::Result<T>>,
+            ) -> authenticator::Result<()>,
+        ) -> Result<T, FidoError> {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            let (status_tx, status_rx) = channel::<authenticator::StatusUpdate>();
+            // 結果槽 + done flag：callback（另一執行緒）寫入；本執行緒輪詢 done。
+            let slot: Arc<Mutex<Option<Result<T, authenticator::errors::AuthenticatorError>>>> =
+                Arc::new(Mutex::new(None));
+            let done = Arc::new(AtomicBool::new(false));
+
+            // 泵執行緒：消化 status channel（避免塞爆 / 死鎖）。
+            //   - PinUvError(PinRequired/InvalidPin)：把內嵌 Sender drop 掉 → 函式庫收到
+            //     RecvError → CancelledByUser → transaction timeout 收場（不 hang）。
+            //   - SelectResultNotice（多結果）：allow_list 單項 → 實務上不會發生。
+            std::thread::spawn(move || {
+                for msg in status_rx.iter() {
+                    if let authenticator::StatusUpdate::PinUvError(ref e) = msg {
+                        log_pin_error(e);
+                    }
+                }
+            });
+
+            // 自建 callback（與 service 端的 StateCallback 同型別，經 submit 注入）：
+            // 寫 slot + set done。不用 StateCallback::wait()（其 clone/wait 在
+            // generic 情境下的暫時物件生命周期會卡 borrow checker）。
+            let cb = StateCallback::new(Box::new({
+                let (slot2, done2) = (slot.clone(), done.clone());
+                move |rv: authenticator::Result<T>| {
+                    *slot2.lock().unwrap() = Some(rv);
+                    done2.store(true, Ordering::SeqCst);
+                }
+            }));
+
+            if let Err(e) = submit(&mut self.service, status_tx, cb) {
+                return Err(map_auth_error(e));
+            }
+            // 阻塞直到 callback 觸發（成功 / 失敗 / timeout）。輪詢 done flag（避免
+            // wait_while 的 guard 生命周期/lint 問題；5ms 粒度對 30s 超時無影響）。
+            while !done.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let got = {
+                let mut g = slot.lock().unwrap();
+                g.take()
+            };
+            match got {
+                Some(Ok(v)) => Ok(v),
+                Some(Err(e)) => Err(map_auth_error(e)),
+                None => Err(FidoError::Internal("callback 未觸發".into())),
+            }
+        }
+
+        /// detect → AuthenticatorInfo（CTAP2 getInfo，免互動）。
+        fn get_info(&mut self) -> Result<AuthenticatorInfo, FidoError> {
+            self.run_op(DETECT_TIMEOUT_MS, |svc, status, cb| {
+                svc.get_info(DETECT_TIMEOUT_MS, status, cb)?;
+                Ok(())
+            })
+        }
+
+        /// getBioEnrollment CBOR 0x09（GetFingerprintSensorInfo）— 互動式 manage() 流程：
+        /// Phase 1: service.manage() → state machine 經 status 送 StartManagement((tx, info))；
+        ///          泵執行緒回 InteractiveRequest::BioEnrollment(GetFingerprintSensorInfo, None)。
+        /// Phase 2: 結果經 status(BioEnrollmentUpdate) 或 callback(Err/Success) 回來。
+        /// **Best-effort**：任何失敗（不支援 / 無感測器 / 需 PIN 未提供）→ false，呼叫方退回
+        /// getInfo flag 分類（不阻斷註冊）。僅在 bioEnroll 宣告且無 clientPin 時呼叫
+        /// （有 PIN 的金鑰 probe 會要求 UV 互動 → 偵測階段不應阻塞）。
+        fn probe_bio_sensor(&mut self) -> bool {
+            use authenticator::{InteractiveRequest, InteractiveUpdate};
+            use std::sync::atomic::{AtomicBool, Ordering};
+
+            let (status_tx, status_rx) = channel::<authenticator::StatusUpdate>();
+            let result: Arc<Mutex<Option<Result<BioEnrollmentResult, authenticator::errors::AuthenticatorError>>>> =
+                Arc::new(Mutex::new(None));
+            let done = Arc::new(AtomicBool::new(false));
+
+            // 泵執行緒：處理互動兩階段 + PIN 要求（drop sender → 函式庫中止，不 hang）。
+            {
+                let (result3, done3) = (result.clone(), done.clone());
+                std::thread::spawn(move || {
+                    for msg in status_rx.iter() {
+                        match msg {
+                            authenticator::StatusUpdate::InteractiveManagement(
+                                InteractiveUpdate::StartManagement((tx, _info)),
+                            ) => {
+                                // 每個 transport 一個 session → 逐一回覆 probe。
+                                if tx.send(InteractiveRequest::BioEnrollment(
+                                    BioEnrollmentCmd::GetFingerprintSensorInfo,
+                                    None,
+                                ))
+                                .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            authenticator::StatusUpdate::InteractiveManagement(
+                                InteractiveUpdate::BioEnrollmentUpdate((res, _puat)),
+                            ) => {
+                                *result3.lock().unwrap() = Some(Ok(res));
+                                done3.store(true, Ordering::SeqCst);
+                            }
+                            authenticator::StatusUpdate::PinUvError(ref e) => log_pin_error(e),
+                            _ => {}
+                        }
+                    }
+                });
+            }
+
+            let cb = StateCallback::new(Box::new({
+                let (result2, done2) = (result.clone(), done.clone());
+                move |rv: authenticator::Result<authenticator::ManageResult>| {
+                    match rv {
+                        Ok(authenticator::ManageResult::BioEnrollment(res)) => {
+                            *result2.lock().unwrap() = Some(Ok(res));
+                        }
+                        Err(e) => *result2.lock().unwrap() = Some(Err(e)),
+                        Ok(_) => {} // Success（Quit 路徑）等 status 端結果；無則視為失敗
+                    }
+                    done2.store(true, Ordering::SeqCst);
+                }
+            }));
+
+            if self.service.manage(DETECT_TIMEOUT_MS, status_tx, cb).is_err() {
+                return false; // 無 transport / 非同步錯誤
+            }
+            // 阻塞直到結果或 callback（transaction timeout 兜底 → 不超過 DETECT_TIMEOUT_MS）。
+            while !done.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let got = {
+                let mut g = result.lock().unwrap();
+                g.take()
+            };
+            match got {
+                Some(Ok(BioEnrollmentResult::FingerprintSensorInfo(ref s))) => {
+                    eprintln!(
+                        "[fido2] getBioEnrollment 0x09: fingerprint sensor = {:?}（確認指紋感測器）",
+                        s.fingerprint_kind
+                    );
+                    true
+                }
+                other => {
+                    let desc = other.as_ref().map(|r| match r {
+                        Ok(BioEnrollmentResult::FingerprintSensorInfo(_)) => "sensor-info".to_string(),
+                        Ok(BioEnrollmentResult::EnrollmentList(v)) => format!("enroll-list({})", v.len()),
+                        Ok(_) => "other-result".to_string(),
+                        Err(e) => format!("err: {e:?}"),
+                    }).unwrap_or_else(|| "no-result".to_string());
+                    eprintln!("[fido2] getBioEnrollment 0x09 probe 未取得感測器資訊（{desc}）→ 依 getInfo flag 分類");
+                    false
+                }
+            }
+        }
+
+        fn kind_from_info(i: &AuthenticatorInfo) -> KeyKind {
+            // 指紋（bioEnrollment）> PIN（clientPin）> touch-only。
+            if i.options.bio_enroll == Some(true) {
+                KeyKind::Fingerprint
+            } else if i.options.client_pin.is_some() {
+                KeyKind::Pin
+            } else {
+                KeyKind::TouchOnly
+            }
+        }
+
+        fn label_from_info(i: &AuthenticatorInfo, seq: u32) -> String {
+            format!("FIDO2 金鑰 #{}（AAGUID {}）", seq, hex16(&i.aaguid.0))
+        }
+
+        /// makeCredential（resident + hmac-secret create）。PIN 型金鑰需 pin。
+        fn do_register(&mut self, detected: &DetectedKey, pin: Option<&str>) -> Result<RegisteredCredential, FidoError> {
+            let args = RegisterArgs {
+                client_data_hash: Self::op_client_data_hash(b"register"),
+                relying_party: RelyingParty::from(RP_ID),
+                origin: RP_ID.to_string(),
+                user: PublicKeyCredentialUserEntity {
+                    id: random_bytes16(),
+                    name: Some("vault-user".to_string()),
+                    display_name: None,
+                },
+                pub_cred_params: vec![PublicKeyCredentialParameters { alg: COSEAlgorithm::ES256 }],
+                exclude_list: vec![],
+                user_verification_req: UserVerificationRequirement::Preferred,
+                resident_key_req: ResidentKeyRequirement::Preferred,
+                extensions: AuthenticationExtensionsClientInputs {
+                    hmac_create_secret: Some(true), // 註冊即宣告支援 hmac-secret（裁決②）
+                    ..Default::default()
+                },
+                pin: pin.map(|p| Pin::new(p)),
+                use_ctap1_fallback: false,
+            };
+
+            let res = self.run_op(OP_TIMEOUT_MS, |svc, status, cb| {
+                svc.register(OP_TIMEOUT_MS, args, status, cb)?;
+                Ok(())
+            })?;
+
+            // credential_id 來自 att_obj.auth_data.credential_data。
+            let cred = res.att_obj.auth_data.credential_data.as_ref().ok_or_else(|| {
+                FidoError::Internal("makeCredential 未回傳 credential data".into())
+            })?;
+            Ok(RegisteredCredential {
+                credential_id: cred.credential_id.clone(),
+                aaguid: cred.aaguid.0,
+                label: detected.label.clone(),
+                kind: detected.kind,
+            })
+        }
+
+        /// getAssertion + hmac-secret（固定 salt1）→ 解密後 output1 = PRF secret。
+        fn do_get_prf_secret(
+            &mut self,
+            credential_id: &[u8],
+            pin: Option<&str>,
+        ) -> Result<[u8; 32], FidoError> {
+            let args = SignArgs {
+                client_data_hash: Self::op_client_data_hash(b"prf"),
+                origin: RP_ID.to_string(),
+                relying_party_id: RP_ID.to_string(),
+                allow_list: vec![PublicKeyCredentialDescriptor {
+                    id: credential_id.to_vec(),
+                    transports: vec![],
+                }],
+                user_verification_req: UserVerificationRequirement::Preferred,
+                user_presence_req: true,
+                extensions: AuthenticationExtensionsClientInputs {
+                    hmac_get_secret: Some(HMACGetSecretInput {
+                        salt1: crate::crypto::prf_salt_bytes(),
+                        salt2: None,
+                    }),
+                    ..Default::default()
+                },
+                pin: pin.map(|p| Pin::new(p)),
+                use_ctap1_fallback: false,
+            };
+
+            let res = self.run_op(OP_TIMEOUT_MS, |svc, status, cb| {
+                svc.sign(OP_TIMEOUT_MS, args, status, cb)?;
+                Ok(())
+            })?;
+
+            // 函式庫已以 shared secret 解密 hmac 輸出 → extensions.hmac_get_secret.output1。
+            let out = res.extensions.hmac_get_secret.ok_or_else(|| {
+                FidoError::Internal("金鑰未回傳 hmac-secret 輸出（不支援 PRF 或 UV 未完成）".into())
+            })?;
+            Ok(out.output1)
+        }
+
+        /// 固定操作 salt → clientDataHash（32B，跨行程一致）。
+        fn op_client_data_hash(op: &[u8]) -> [u8; 32] {
+            let mut h = Sha256::new();
+            h.update(b"f2vlt-op:");
+            h.update(op);
+            h.update(crate::crypto::PRF_SALT);
+            let d = h.finalize();
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&d);
+            out
+        }
+    }
+
+    impl FidoBackend for RealBackend {
+        fn detect(&mut self) -> Result<DetectedKey, FidoError> {
+            let info = self.get_info()?;
+            // 裁決②/卡內要求：bioEnroll 宣告且無 PIN 的金鑰 → 發 getBioEnrollment CBOR 0x09
+            // 確認指紋感測器實際存在（best-effort；失敗退回 flag 分類，不阻斷註冊）。
+            let bio_confirmed = if info.options.bio_enroll == Some(true) && info.options.client_pin.is_none() {
+                self.probe_bio_sensor()
+            } else {
+                false
+            };
+            let kind = if info.options.bio_enroll == Some(true) && (bio_confirmed || info.options.client_pin.is_some()) {
+                KeyKind::Fingerprint
+            } else if info.options.client_pin.is_some() {
+                KeyKind::Pin
+            } else {
+                KeyKind::TouchOnly
+            };
+            let label = Self::label_from_info(&info, 1);
+            self.info = Some(info.clone());
+            Ok(DetectedKey { kind, label, aaguid: info.aaguid.0 })
+        }
+
+        fn register_credential(&mut self, detected: &DetectedKey, pin: Option<&str>) -> Result<RegisteredCredential, FidoError> {
+            self.do_register(detected, pin)
+        }
+
+        fn get_prf_secret(&mut self, credential_id: &[u8], pin: Option<&str>) -> Result<[u8; 32], FidoError> {
+            if credential_id.is_empty() {
+                return Err(FidoError::Internal("credential_id 為空".into()));
+            }
+            // 登入路徑（open_key）不會先 detect() → 若無快取資訊，先 getInfo 補上。
+            if self.info.is_none() {
+                let _ = self.get_info()?;
+            }
+            self.do_get_prf_secret(credential_id, pin)
+        }
+
+        fn peek_kind(&self) -> KeyKind {
+            // 實體後端：偵測前不確定類型（getInfo 需碰硬體）→ 預設 touch-only 提示。
+            match &self.info {
+                Some(i) => Self::kind_from_info(i),
+                None => KeyKind::TouchOnly,
+            }
+        }
+
+        fn prf_supported(&self) -> bool {
+            // detect() 後依 getInfo：extensions 含 "hmac-secret"。未偵測 → false（保守；
+            // register_key 會先 detect()，故不影響流程）。
+            match &self.info {
+                Some(i) => i.extensions.iter().any(|e| e == "hmac-secret"),
+                None => false,
+            }
+        }
+    }
+
+    fn log_pin_error(e: &authenticator::StatusPinUv) {
+        use authenticator::StatusPinUv as S;
+        match e {
+            S::PinRequired(_) => eprintln!("[fido2] 金鑰要求 PIN（需由呼叫方提供 pin）"),
+            S::InvalidPin(_, r) => eprintln!("[fido2] PIN 錯誤，重試次數={:?}", r),
+            S::PinIsTooShort => eprintln!("[fido2] PIN 過短"),
+            S::PinIsTooLong(_) => eprintln!("[fido2] PIN 過長"),
+            S::InvalidUv(_) => eprintln!("[fido2] UV（指紋）驗證失敗"),
+            S::PinAuthBlocked => eprintln!("[fido2] PIN auth 已鎖定"),
+            S::PinBlocked => eprintln!("[fido2] PIN 已鎖定"),
+            _ => {}
+        }
+    }
+
+    fn map_auth_error(e: authenticator::errors::AuthenticatorError) -> FidoError {
+        use authenticator::errors::AuthenticatorError as AE;
+        match e {
+            AE::NoConfiguredTransports => FidoError::NoDevice,
+            AE::CancelledByUser => FidoError::Internal("使用者取消 / 超時".into()),
+            other => FidoError::Internal(format!("authenticator-rs: {other:?}")),
+        }
+    }
+
+    fn hex16(a: &[u8; 16]) -> String {
+        a.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn random_bytes16() -> Vec<u8> {
+        use rand::RngCore;
+        let mut b = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut b);
+        b.to_vec()
+    }
+
+    #[cfg(test)]
+    mod real_tests {
+        use super::*;
+        use authenticator::ctap2::commands::get_info::{AuthenticatorInfo, AuthenticatorOptions};
+
+        fn info_with(opts: AuthenticatorOptions) -> AuthenticatorInfo {
+            AuthenticatorInfo { options: opts, ..Default::default() }
+        }
+
+        /// YubiKey 5 系列：無 clientPin、無 bioEnroll → touch-only（PM 預先提醒的預期結果）。
+        #[test]
+        fn real_kind_touch_only_yubikey5_profile() {
+            let o = AuthenticatorOptions::default();
+            assert_eq!(RealBackend::kind_from_info(&info_with(o)), KeyKind::TouchOnly);
+        }
+
+        /// 指紋優先於 PIN（YubiKey Bio：兩者皆有）。
+        #[test]
+        fn real_kind_fingerprint_wins_over_pin() {
+            let mut o = AuthenticatorOptions::default();
+            o.bio_enroll = Some(true);
+            o.client_pin = Some(true);
+            assert_eq!(RealBackend::kind_from_info(&info_with(o)), KeyKind::Fingerprint);
+        }
+
+        /// 有 clientPin（含「已支援但未設定」=Some(false)）→ PIN 型。
+        #[test]
+        fn real_kind_pin() {
+            let mut o = AuthenticatorOptions::default();
+            o.client_pin = Some(false);
+            assert_eq!(RealBackend::kind_from_info(&info_with(o)), KeyKind::Pin);
+        }
+
+        /// clientDataHash 固定 salt → 跨行程一致（register / prf 各異）。
+        #[test]
+        fn real_op_client_data_hash_deterministic() {
+            let a = RealBackend::op_client_data_hash(b"register");
+            assert_eq!(a, RealBackend::op_client_data_hash(b"register"));
+            assert_ne!(a, RealBackend::op_client_data_hash(b"prf"));
+        }
+
+        /// PRF salt1 固定 32B（hmac-secret 的 eval input；跨行程一致）。
+        #[test]
+        fn real_prf_salt_fixed_32b() {
+            let s = crate::crypto::prf_salt_bytes();
+            assert_eq!(s.len(), 32);
+            assert_eq!(&s[..17], b"f2vlt-prf-salt-v1");
+            assert_eq!(s, crate::crypto::prf_salt_bytes());
+        }
+    }
+}
+
+#[cfg(feature = "real-ctap")]
+pub use real::RealBackend;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,14 +794,14 @@ mod tests {
     fn mock_pin_flow_roundtrip() {
         let mut b = MockBackend::new();
         let d = b.detect().unwrap(); // fingerprint（不需 PIN）
-        let reg = b.register_credential(&d).unwrap();
+        let reg = b.register_credential(&d, None).unwrap();
         assert!(b.get_prf_secret(&reg.credential_id, None).is_ok());
 
         // 第二支：pin 型 → 註冊後登入需 PIN，且跨「新行程」仍一致
         let mut b2 = MockBackend::new().with_next_kind(KeyKind::Pin);
         let d2 = b2.detect().unwrap();
         assert_eq!(d2.kind, KeyKind::Pin);
-        let reg2 = b2.register_credential(&d2).unwrap();
+        let reg2 = b2.register_credential(&d2, None).unwrap();
         let mut fresh = MockBackend::new(); // 模擬重啟
         assert!(matches!(fresh.get_prf_secret(&reg2.credential_id, None), Err(FidoError::PinRequired(_))));
         assert!(matches!(fresh.get_prf_secret(&reg2.credential_id, Some("12")), Err(FidoError::PinRejected)));

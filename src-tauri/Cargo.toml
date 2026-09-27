@@ -28,13 +28,18 @@ rand = "0.8"
 zeroize = { version = "1", features = ["zeroize_derive"] }
 chrono = { version = "0.4", features = ["serde"] }
 base64 = "0.22"
+# real CTAP2 後端（PM 裁決③核准；v0.6.1 原生支援 PRF + bioEnrollment CBOR 0x09）。
+# crypto_rust = 純 Rust 加密路徑（免 NSS/OpenSSL 系統依賴，portable 可攜性）。
+# vendored（vendor/authenticator-rs）：離線安全工具不該 build 時連 git；且含一處 Windows
+# c_void handle cast 的 vendor patch（Rust 1.98 as_raw_handle 回傳型別差異），見 device.rs。
+authenticator = { path = "../vendor/authenticator-rs", optional = true, default-features = false, features = ["crypto_rust"] }
 
 [features]
 default = ["mock-fido"]
 # mock-fido: 以軟體金鑰（實作 hmac-secret 語義）替代實體 CTAP2，供無硬體環境端到端驗證
 mock-fido = []
 # real-ctap: 實體 FIDO2 金鑰後端（CTAP2 getInfo/bioEnrollment/makeCredential/getAssertion+hmac-secret）
-real-ctap = []
+real-ctap = ["dep:authenticator"]
 
 [profile.release]
 strip = true

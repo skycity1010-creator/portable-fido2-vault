@@ -455,11 +455,14 @@ impl Vault {
     /// PIN 型金鑰註冊時即需提供 PIN（makeCredential 需與 token 建立安全通道）。
     /// **產品決策：不支援 PRF/hmac-secret 的金鑰一律拒絕註冊**（無法解鎖離線金庫）。
     pub fn register_key(&mut self, backend: &mut (dyn FidoBackend + 'static), pin: Option<&str>) -> Result<RegisteredCredential, VaultError> {
+        // 裁決②：不支援 hmac-secret/PRF 的金鑰拒絕註冊。
+        // 順序：先 detect()（real 後端需 getInfo 才能知 PRF 能力；mock 的 detect 為無害循環），
+        // 再 prf_supported()（依 detect 快取的資訊判定）。
+        let detected = backend.detect()?;
         if !backend.prf_supported() {
             return Err(VaultError::Fido(FidoError::PrfNotSupported));
         }
-        let detected = backend.detect()?;
-        let reg = backend.register_credential(&detected)?;
+        let reg = backend.register_credential(&detected, pin)?;
         let secret = backend.get_prf_secret(&reg.credential_id, pin)?;
         let k = kek_from_prf_secret(&secret);
         let nonce = random_nonce();
@@ -576,7 +579,7 @@ mod tests {
     struct NoPrfBackend(MockBackend);
     impl FidoBackend for NoPrfBackend {
         fn detect(&mut self) -> Result<crate::fido2::DetectedKey, FidoError> { self.0.detect() }
-        fn register_credential(&mut self, d: &crate::fido2::DetectedKey) -> Result<crate::fido2::RegisteredCredential, FidoError> { self.0.register_credential(d) }
+        fn register_credential(&mut self, d: &crate::fido2::DetectedKey, pin: Option<&str>) -> Result<crate::fido2::RegisteredCredential, FidoError> { self.0.register_credential(d, pin) }
         fn get_prf_secret(&mut self, id: &[u8], pin: Option<&str>) -> Result<[u8; 32], FidoError> { self.0.get_prf_secret(id, pin) }
         fn prf_supported(&self) -> bool { false }
     }

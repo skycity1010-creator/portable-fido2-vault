@@ -5,6 +5,8 @@ use std::sync::Mutex;
 
 #[cfg(feature = "mock-fido")]
 use crate::fido2::MockBackend;
+#[cfg(feature = "real-ctap")]
+use crate::fido2::RealBackend;
 
 pub mod crypto;
 pub mod fido2;
@@ -42,19 +44,37 @@ pub struct LoginScreenInfo {
     pub idle_lock_minutes: u32,
 }
 
-/// 金鑰後端：mock（預設）或 real-ctap。
+/// 金鑰後端：依 `F2V_AUTHENTICATOR`（或 CLI `--authenticator`）選 mock / hw。
+/// - `hw` → real CTAP2（YubiKey 等實體金鑰，需 feature real-ctap）。
+/// - `mock` / 未設定 → MockBackend（預設；無硬體環境端到端驗證）。
 fn make_backend() -> Box<dyn fido2::FidoBackend> {
-    #[cfg(feature = "mock-fido")]
-    {
-        let kind = std::env::var("F2V_MOCK_KIND")
-            .ok()
-            .and_then(|s| fido2::KeyKind::parse(&s));
-        Box::new(kind.map_or_else(MockBackend::new, |k| MockBackend::new().with_next_kind(k)))
+    let want_hw = std::env::var("F2V_AUTHENTICATOR")
+        .map(|v| v.trim().eq_ignore_ascii_case("hw"))
+        .unwrap_or(false);
+
+    #[cfg(feature = "real-ctap")]
+    if want_hw {
+        return Box::new(RealBackend::new());
     }
+    #[allow(unreachable_code)]
+    {
+        #[cfg(feature = "mock-fido")]
+        {
+            let kind = std::env::var("F2V_MOCK_KIND")
+                .ok()
+                .and_then(|s| fido2::KeyKind::parse(&s));
+            return Box::new(kind.map_or_else(MockBackend::new, |k| MockBackend::new().with_next_kind(k)));
+        }
+        #[cfg(all(feature = "real-ctap", not(feature = "mock-fido")))]
+        {
+            // 只啟用 real-ctap（無 mock）→ hw 是唯一後端。
+            return Box::new(RealBackend::new());
+        }
+    }
+
     #[cfg(not(feature = "mock-fido"))]
     {
-        // real-ctap：待硬體裁決後實作（見 docs/spec.md §5.4）。
-        unimplemented!("real-ctap 後端尚未啟用；請以 default features (mock-fido) 建置")
+        unimplemented!("未啟用任何金鑰後端 feature（需 mock-fido 或 real-ctap）")
     }
 }
 
