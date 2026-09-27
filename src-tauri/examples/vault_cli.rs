@@ -33,13 +33,14 @@ struct Opts {
     minutes: Option<u32>,
     src: Option<PathBuf>,
     dst: Option<PathBuf>,
+    no_prf: bool, // 模擬不支援 hmac-secret/PRF 的金鑰（驗證裁決②拒絕註冊）
 }
 
 fn parse(args: &[String]) -> (String, Opts) {
     let mut o = Opts {
         path: None, pw: None, kind: None, idx: None, pin: None,
         site: None, account: None, pass: None, notes: None, id: None,
-        minutes: None, src: None, dst: None,
+        minutes: None, src: None, dst: None, no_prf: false,
     };
     let mut cmd = String::from("help");
     let mut i = 0;
@@ -59,6 +60,7 @@ fn parse(args: &[String]) -> (String, Opts) {
             "--minutes" => o.minutes = Some(next(args, &mut i).parse().unwrap_or(5)),
             "--src" => o.src = Some(next(args, &mut i)),
             "--dst" => o.dst = Some(next(args, &mut i)),
+            "--no-prf" => o.no_prf = true,
             _ => {}
         }
         i += 1;
@@ -71,11 +73,12 @@ fn next(args: &[String], i: &mut usize) -> String {
     args.get(*i).cloned().unwrap_or_default()
 }
 
-fn backend(kind: Option<KeyKind>) -> MockBackend {
-    match kind {
+fn backend(kind: Option<KeyKind>, prf: bool) -> MockBackend {
+    let b = match kind {
         Some(k) => MockBackend::new().with_next_kind(k),
         None => MockBackend::new(),
-    }
+    };
+    b.with_prf(prf)
 }
 
 fn open_with_pw(path: &PathBuf, pw: &str) -> Result<Vault, String> {
@@ -109,7 +112,7 @@ fn main() {
             if idx >= h.key_slots.len() { return Err(format!("idx {idx} 超出（共 {} 支）", h.key_slots.len())); }
             let cid = h.key_slots[idx].credential_id.clone();
             let label = h.key_slots[idx].label.clone();
-            let mut b = backend(None);
+            let mut b = backend(None, true);
             match Vault::open_key(&path, &cid, o.pin.as_deref(), &mut b) {
                 Ok(v) => Ok(format!("OK login_success key=#{idx}({}) entries={}", label, v.entries().len())),
                 Err(e) => Err(format!("FAIL {e}")),
@@ -118,7 +121,7 @@ fn main() {
         "register-key" => {
             let path = req_path(&o.path);
             let mut v = open_with_pw(&path, o.pw.as_deref().unwrap_or(""))?;
-            let mut b = backend(o.kind);
+            let mut b = backend(o.kind, !o.no_prf);
             let reg = v.register_key(&mut b, o.pin.as_deref()).map_err(|e| e.to_string())?;
             Ok(format!("OK key_registered idx={} label={} type={}", v.keys_meta().len() - 1, reg.label, reg.kind))
         }
@@ -207,7 +210,7 @@ fn main() {
                 let (h, _) = read_header_only(&b)?;
                 if ki >= h.key_slots.len() { return Err("idx 超出".into()); }
                 let cid = h.key_slots[ki].credential_id.clone();
-                let mut bb = backend(None);
+                let mut bb = backend(None, true);
                 Vault::open_key(&b, &cid, o.pin.as_deref(), &mut bb).map_err(|e| e.to_string())?;
                 Ok(format!("OK copy + key-login #{ki} success at {}", b.display()))
             } else {

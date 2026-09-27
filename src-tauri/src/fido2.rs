@@ -148,6 +148,8 @@ pub struct MockBackend {
     detect_count: u32,
     /// CLI/測試可指定「下一支偵測到的金鑰類型」（覆蓋自動循環）。
     next_kind_override: Option<KeyKind>,
+    /// 模擬金鑰是否支援 hmac-secret/PRF（預設 true = YubiKey 5+；--no-prf 驗證裁決②）。
+    prf_enabled: bool,
 }
 
 impl Default for MockBackend {
@@ -161,12 +163,19 @@ impl MockBackend {
         Self {
             detect_count: 0,
             next_kind_override: None,
+            prf_enabled: true,
         }
     }
 
     /// 設定下一支偵測到的金鑰類型（CLI register-key --kind pin 用）。
     pub fn with_next_kind(mut self, kind: KeyKind) -> Self {
         self.next_kind_override = Some(kind);
+        self
+    }
+
+    /// 模擬不支援 hmac-secret/PRF 的金鑰（CLI register-key --no-prf 驗證裁決②）。
+    pub fn with_prf(mut self, enabled: bool) -> Self {
+        self.prf_enabled = enabled;
         self
     }
 
@@ -243,8 +252,8 @@ impl FidoBackend for MockBackend {
     }
 
     fn prf_supported(&self) -> bool {
-        // mock 模擬支援 PRF 的金鑰（YubiKey 5+）。
-        true
+        // mock 預設模擬支援 PRF 的金鑰（YubiKey 5+）；with_prf(false) 模擬不支援者。
+        self.prf_enabled
     }
 }
 

@@ -27,11 +27,16 @@ portable-fido2-vault/
 
 ## 建置（WS2 建置機）
 
-前置：Rust stable（rustup）、WebView2（Win11 內建）。
+前置：
+- Rust stable + **GNU toolchain**（`rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal`；本機無 MSVC/VS，走 GNU 免 UAC）。
+- **dlltool.exe**（Rust GNU toolchain 不自帶 binutils）：下載 [winlibs-mingw](https://github.com/brechtsanders/winlibs_mingw/releases) x86_64-posix-seh zip，把其 `bin/` 加進 PATH。
+- WebView2（Win11 內建）。
 
-```powershell
-cd C:\project\portable-fido2-vault\src-tauri
-cargo tauri build          # 產出 target\release\PortableFidoVault.exe
+```bash
+# bash / git-bash（WS2）
+export PATH="$HOME/.cargo/bin:$HOME/tools/winlibs-x86_64-posix-seh-gcc-14.2.0-mingw-w64ucrt-12.0.0-r2/bin:$PATH"
+cd C:/project/portable-fido2-vault/src-tauri
+cargo +stable-x86_64-pc-windows-gnu build --release   # 產出 target/release/PortableFidoVault.exe
 ```
 
 > portable 部署：將 `target\release\PortableFidoVault.exe` 複製到任意資料夾即完成安裝；
@@ -56,14 +61,24 @@ Copy-Item target\release\PortableFidoVault.exe C:\deploy\fido-vault\
 
 ## 測試 / Gate 驗證
 
-```powershell
-cd src-tauri
-# 核心 E2E（建立→密碼登入→金鑰註冊→金鑰登入→CRUD→軌跡→跨路徑可攜）
-cargo run --example vault_cli -- create --path .\test-vault.db --pw Test1234!
-cargo run --example vault_cli -- register-key --path .\test-vault.db
-cargo run --example vault_cli -- login-key 0    --path .\test-vault.db
-cargo run --example vault_cli -- add-entry example.com alice Secret!234 --path .\test-vault.db
-cargo run --example vault_cli -- audit          --path .\test-vault.db
+**一鍵跑全部 E2E（Gate 2/3/4/5/6/8）**：
+
+```bash
+cd C:/project/portable-fido2-vault/src-tauri
+cargo +stable-x86_64-pc-windows-gnu build --release --example vault_cli
+python ../scripts/gate_e2e.py     # 逐項 PASS/FAIL + 證據；全綠 = exit 0
+```
+
+手動範例（CLI 參數皆為 `--flag value`）：
+
+```bash
+V=./test-vault.db; P=target/release/vault_cli.exe
+$P create       --path $V --pw Test1234!
+$P register-key --path $V --pw Test1234! --kind pin --pin 2468   # 類型：fingerprint|pin|touch_only；--no-prf 模擬不支援 PRF 的金鑰（應被拒絕）
+$P login-key    --path $V --idx 0
+$P add-entry    --path $V --pw Test1234! --site example.com --account alice --pass Secret!234
+$P list         --path $V --pw Test1234!
+$P audit        --path $V --pw Test1234!
 ```
 
 無 FIDO 硬體時，MockBackend（預設）以軟體金鑰實作 hmac-secret 語義，Gate 3/4 仍可端到端驗證；

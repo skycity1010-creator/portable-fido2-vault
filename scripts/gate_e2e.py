@@ -48,8 +48,12 @@ def main():
     rc, out, err = cli("register-key", "--path", V, "--pw", "Gate-Pass-1", "--kind", "fingerprint")
     check("G3.1 註冊金鑰#0（自動偵測=指紋型）", rc == 0 and "type=fingerprint" in out, out or err)
 
-    rc, out, err = cli("register-key", "--path", V, "--pw", "Gate-Pass-1", "--kind", "pin")
+    rc, out, err = cli("register-key", "--path", V, "--pw", "Gate-Pass-1", "--kind", "pin", "--pin", "2468")
     check("G3.2 註冊金鑰#1（自動偵測=PIN型，註冊需 PIN）", rc == 0 and "type=pin" in out, out or err)
+
+    # 附加：PRF 裁決② — 不支援 PRF 的金鑰必須被拒絕註冊
+    rc, out, err = cli("register-key", "--path", V, "--pw", "Gate-Pass-1", "--kind", "fingerprint", "--no-prf")
+    check("G3.6 不支援 PRF 的金鑰 → 拒絕註冊（UI 顯示原因）", rc != 0 and ("PRF" in out or "hmac-secret" in out), out or err)
 
     rc, out, err = cli("login-key", "--path", V, "--idx", "0")
     check("G3.3 指紋型金鑰登入成功（免 PIN，提示『按指紋』）", rc == 0 and "key=#0" in out, out or err)
