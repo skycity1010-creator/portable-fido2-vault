@@ -621,20 +621,25 @@ mod real {
     impl FidoBackend for RealBackend {
         fn detect(&mut self) -> Result<DetectedKey, FidoError> {
             let info = self.get_info()?;
-            // 裁決②/卡內要求：bioEnroll 宣告且無 PIN 的金鑰 → 發 getBioEnrollment CBOR 0x09
-            // 確認指紋感測器實際存在（best-effort；失敗退回 flag 分類，不阻斷註冊）。
-            let bio_confirmed = if info.options.bio_enroll == Some(true) && info.options.client_pin.is_none() {
-                self.probe_bio_sensor()
-            } else {
-                false
-            };
-            let kind = if info.options.bio_enroll == Some(true) && (bio_confirmed || info.options.client_pin.is_some()) {
-                KeyKind::Fingerprint
-            } else if info.options.client_pin.is_some() {
-                KeyKind::Pin
-            } else {
-                KeyKind::TouchOnly
-            };
+            // PRF 能力診斷（PM 預先排程）：若 getInfo 未宣告 hmac-secret → 抓原始
+            // extensions + firmware version 回報（裁決②會拒絕註冊；據此定論是升級
+            // firmware 還是該型號不在支援範圍）。
+            let has_prf = info.extensions.iter().any(|e| e == "hmac-secret");
+            if !has_prf {
+                eprintln!("[fido2][DIAG] getInfo 未宣告 hmac-secret（註冊將被 PrfNotSupported 拒絕）：");
+                eprintln!(
+                    "[fido2][DIAG]   extensions = {:?}\n[fido2][DIAG]   firmware_version = {:?}\n[fido2][DIAG]   versions = {:?}\n[fido2][DIAG]   algorithms = {:?}\n[fido2][DIAG]   aaguid = {}",
+                    info.extensions, info.firmware_version, info.versions, info.algorithms, hex16(&info.aaguid.0)
+                );
+            }
+            // 分類以 getInfo flag 為準（CTAP2 spec：bioEnroll=true = 「已設定至少一個 bio
+            // enrollment」→ 指紋型；clientPin 存在 → PIN 型；皆無 → touch-only）。
+            // getBioEnrollment CBOR 0x09 probe 僅作確認/記錄（best-effort，不影響分類、
+            // 不阻斷註冊）— YubiKey Bio：bioEnroll=true + clientPin=absent → Fingerprint。
+            if info.options.bio_enroll == Some(true) && info.options.client_pin.is_none() {
+                self.probe_bio_sensor();
+            }
+            let kind = Self::kind_from_info(&info);
             let label = Self::label_from_info(&info, 1);
             self.info = Some(info.clone());
             Ok(DetectedKey { kind, label, aaguid: info.aaguid.0 })
@@ -729,6 +734,19 @@ mod real {
             let mut o = AuthenticatorOptions::default();
             o.bio_enroll = Some(true);
             o.client_pin = Some(true);
+            assert_eq!(RealBackend::kind_from_info(&info_with(o)), KeyKind::Fingerprint);
+        }
+
+        /// YubiKey Bio（PM 回報的實際型號）：bioEnroll=true + clientPin=absent → Fingerprint。
+        /// 分類純看 flag，不依賴 0x09 probe 結果（probe 僅確認/記錄）。
+        #[test]
+        fn real_kind_yubikey_bio_profile() {
+            let o = AuthenticatorOptions {
+                bio_enroll: Some(true), // 已設定指紋 enrollment
+                client_pin: None,       // 無 PIN protocol
+                user_verification: Some(true),
+                ..Default::default()
+            };
             assert_eq!(RealBackend::kind_from_info(&info_with(o)), KeyKind::Fingerprint);
         }
 
