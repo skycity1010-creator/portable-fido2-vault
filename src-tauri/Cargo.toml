@@ -28,6 +28,10 @@ rand = "0.8"
 zeroize = { version = "1", features = ["zeroize_derive"] }
 chrono = { version = "0.4", features = ["serde"] }
 base64 = "0.22"
+# 診斷用：vendor authenticator-rs 內建 debug!/info!/warn!（#[macro_use] extern crate log），
+# 但 CLI 未安裝 global logger → 全部被 log null logger 丟棄（blocker #2 零可視性的根因）。
+# 0.4.34 已在 Cargo.lock（authenticator 的既有依賴）→ 離線可建置。
+log = { version = "0.4", features = ["std"] }
 # real CTAP2 後端（PM 裁決③核准；v0.6.1 原生支援 PRF + bioEnrollment CBOR 0x09）。
 # crypto_rust = 純 Rust 加密路徑（免 NSS/OpenSSL 系統依賴，portable 可攜性）。
 # vendored（vendor/authenticator-rs）：離線安全工具不該 build 時連 git；且含一處 Windows

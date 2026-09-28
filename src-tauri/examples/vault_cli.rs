@@ -19,8 +19,77 @@ use portable_fido_vault::fido2::{FidoBackend, KeyKind, MockBackend};
 #[cfg(feature = "real-ctap")]
 use portable_fido_vault::fido2::RealBackend;
 use portable_fido_vault::vault::{failures_path, Vault};
+use std::fs::OpenOptions;
+use std::io::Write as _;
 use std::path::PathBuf;
+use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
+
+// ── 診斷 file logger（blocker #2：vendor authenticator-rs 內建 debug!/info!/warn!，
+//    但 CLI 未安裝 global logger → log null logger 全丟棄 = 零可視性）。
+//    寫 <exe 同目錄>\fido2-diag.log（append；NB=C:\FidoVault、本機=build dir），
+//    同時 eprintln 一份。開檔失敗 → sink（不阻斷執行）。
+static FIDO_LOG: LazyLock<Mutex<Box<dyn std::io::Write + Send>>> = LazyLock::new(|| {
+    let path = diag_log_path();
+    let mut f: Box<dyn std::io::Write + Send> = match &path {
+        Some(p) => OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(p)
+            .map(|f| Box::new(f) as Box<dyn std::io::Write + Send>)
+            .unwrap_or_else(|_| Box::new(std::io::sink()) as Box<dyn std::io::Write + Send>),
+        None => Box::new(std::io::sink()),
+    };
+    writeln!(f, "\n===== session start: diag_log={} =====", path.map(|p| p.display().to_string()).unwrap_or_else(|| "<none>".into())).ok();
+    Mutex::new(f)
+});
+
+struct FileLogger;
+impl log::Log for FileLogger {
+    fn enabled(&self, _m: &log::Metadata) -> bool {
+        true
+    }
+    fn log(&self, record: &log::Record) {
+        let line = format!(
+            "[{}] [{}] {}: {}",
+            record.level(),
+            record.target(),
+            record.file().unwrap_or("?"),
+            record.args()
+        );
+        if let Ok(mut g) = FIDO_LOG.lock() {
+            writeln!(g, "{line}").ok();
+        }
+        eprintln!("{line}");
+    }
+    fn flush(&self) {}
+}
+
+/// 安裝 file logger。失敗（如已安裝）不阻斷執行 — 退化为 null logger。
+/// 解析 fido2-diag.log 路徑：<exe 同目錄> → %USERPROFILE%\fido2-diag.log → %TEMP%。
+/// WinRM session-0（service context）下 std::env::current_exe() 可能失敗（Windows 已知行為：
+/// service account 無 token 時 GetModuleFileNameW 解析不到完整路徑）→ 需 fallback，
+/// 否則 logger 落 sink = 遠端診斷全盲。
+fn diag_log_path() -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::current_exe() {
+        if let Some(d) = p.parent() {
+            return Some(d.join("fido2-diag.log"));
+        }
+    }
+    for var in ["USERPROFILE", "TEMP"] {
+        if let Ok(v) = std::env::var(var) {
+            if !v.is_empty() {
+                return Some(std::path::PathBuf::from(v).join("fido2-diag.log"));
+            }
+        }
+    }
+    None
+}
+
+fn init_diag_logger() {
+    let _ = log::set_boxed_logger(Box::new(FileLogger));
+    log::set_max_level(log::LevelFilter::Debug);
+}
 
 struct Opts {
     path: Option<PathBuf>,
@@ -49,23 +118,32 @@ fn parse(args: &[String]) -> (String, Opts) {
     let mut cmd = String::from("help");
     let mut i = 0;
     while i < args.len() {
-        match args[i].as_str() {
+        // 同時支援 "--flag value" 與 "--flag=value"（PowerShell/WinRM 常以 = 形式傳遞）。
+        let (name, inline_val) = match args[i].split_once('=') {
+            Some((n, v)) if n.starts_with("--") => (n.to_string(), Some(v.to_string())),
+            _ => (args[i].clone(), None),
+        };
+        // 取值：優先 inline（--flag=value），否則吃下一個參數。
+        let take = |i: &mut usize, inline: Option<String>| -> String {
+            if let Some(v) = inline { v } else { next(args, i) }
+        };
+        match name.as_str() {
             a if !a.starts_with("--") => cmd = a.to_string(),
-            "--path" => o.path = Some(PathBuf::from(next(args, &mut i))),
-            "--pw" => o.pw = Some(next(args, &mut i)),
-            "--kind" => o.kind = KeyKind::parse(&next(args, &mut i)),
-            "--idx" => o.idx = Some(next(args, &mut i).parse().unwrap_or(0)),
-            "--pin" => o.pin = Some(next(args, &mut i)),
-            "--site" => o.site = Some(next(args, &mut i)),
-            "--account" => o.account = Some(next(args, &mut i)),
-            "--pass" => o.pass = Some(next(args, &mut i)),
-            "--notes" => o.notes = Some(next(args, &mut i)),
-            "--id" => o.id = Some(next(args, &mut i)),
-            "--minutes" => o.minutes = Some(next(args, &mut i).parse().unwrap_or(5)),
-            "--src" => o.src = Some(PathBuf::from(next(args, &mut i))),
-            "--dst" => o.dst = Some(PathBuf::from(next(args, &mut i))),
+            "--path" => o.path = Some(PathBuf::from(take(&mut i, inline_val))),
+            "--pw" => o.pw = Some(take(&mut i, inline_val)),
+            "--kind" => o.kind = KeyKind::parse(&take(&mut i, inline_val)),
+            "--idx" => o.idx = Some(take(&mut i, inline_val).parse().unwrap_or(0)),
+            "--pin" => o.pin = Some(take(&mut i, inline_val)),
+            "--site" => o.site = Some(take(&mut i, inline_val)),
+            "--account" => o.account = Some(take(&mut i, inline_val)),
+            "--pass" => o.pass = Some(take(&mut i, inline_val)),
+            "--notes" => o.notes = Some(take(&mut i, inline_val)),
+            "--id" => o.id = Some(take(&mut i, inline_val)),
+            "--minutes" => o.minutes = Some(take(&mut i, inline_val).parse().unwrap_or(5)),
+            "--src" => o.src = Some(PathBuf::from(take(&mut i, inline_val))),
+            "--dst" => o.dst = Some(PathBuf::from(take(&mut i, inline_val))),
             "--no-prf" => o.no_prf = true,
-            "--authenticator" => o.authenticator = next(args, &mut i),
+            "--authenticator" => o.authenticator = take(&mut i, inline_val),
             _ => {}
         }
         i += 1;
@@ -106,6 +184,7 @@ fn open_with_pw(path: &PathBuf, pw: &str) -> Result<Vault, String> {
 }
 
 fn main() {
+    init_diag_logger();
     match run() {
         Ok(m) => println!("{m}"),
         Err(m) => { eprintln!("{m}"); std::process::exit(1); }
@@ -162,8 +241,7 @@ fn run() -> Result<String, String> {
                 // **不是** NB 的 Windows Hello）。UV prompt 有時限，提前按無效、錯過要重試。
                 eprintln!("[fido2] 即將要求指紋驗證：請將手指放上 YubiKey Bio 金鑰本體上的指紋感測器（銀色外框）");
             }
-            // 診斷：計時 — U2FToken(NotAllowed) 是 transport 90s timeout fallback；
-            // 若 ~90s = UV 未滿足；若快速失敗 = 別的原因（HID 佔用 / firmware）。
+            // 診斷：計時 + fido2-diag.log（vendor debug!/info! 全量記錄）→ 精確定位失敗點。
             let t0 = Instant::now();
             match v.register_key(&mut *b, o.pin.as_deref()) {
                 Ok(reg) => Ok(format!(

@@ -2659,6 +2659,7 @@ dependencies = [
  "chrono",
  "hkdf",
  "hmac",
+ "log",
  "rand",
  "serde",
  "serde_json",

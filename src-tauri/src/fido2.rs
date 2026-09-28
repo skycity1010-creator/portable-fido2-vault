@@ -408,7 +408,18 @@ mod real {
             }
             // 阻塞直到 callback 觸發（成功 / 失敗 / timeout）。輪詢 done flag（避免
             // wait_while 的 guard 生命周期/lint 問題；5ms 粒度對 30s 超時無影響）。
+            // 看門狗：vendor fallback 在 _timeout_ms 觸發 U2FToken(NotAllowed)；
+            // 若再超 5s 仍無 callback = vendor transaction 卡死（device thread 阻塞
+            // 在非 alive-aware 路徑）→ 回報明確錯誤而非無限 hang（CLI one-shot，exit 即清理）。
+            let deadline = std::time::Instant::now()
+                + std::time::Duration::from_millis(_timeout_ms.saturating_add(5_000));
             while !done.load(Ordering::SeqCst) {
+                if std::time::Instant::now() >= deadline {
+                    return Err(FidoError::Internal(format!(
+                        "run_op 看門狗超時（>{_timeout_ms}ms+5s）：vendor callback 未觸發 — \
+                         見 fido2-diag.log 定位卡死點"
+                    )));
+                }
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
             let got = {
