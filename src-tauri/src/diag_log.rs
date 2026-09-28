@@ -6,9 +6,9 @@
 //! service account 無 token 時 GetModuleFileNameW 解析不到完整路徑）→ 需 fallback，
 //! 否則 logger 落 sink = 遠端診斷全盲。
 //!
-//! contention-aware retry（fido2.rs RealBackend）用 `scan_lines()` 只掃**本 process 本次
-//! op 之後**的 log 行 → 判「FIDO VID open 被拒」signature；`mark_end()` 在 op 成功後
-//! 推進 marker，排除更早 phase 的 stale Ioerror。
+//! contention-aware retry（fido2.rs RealBackend）在**每個 op attempt 前**取行數 checkpoint，
+//! 之後只掃 checkpoint 後且 PID 屬於本 process 的行 → 避免舊 phase / 其他 process 的
+//! stale Ioerror 誤觸發重試。
 
 use std::fs::OpenOptions;
 use std::io::Write as _;
@@ -28,23 +28,13 @@ static FIDO_LOG: LazyLock<Mutex<Box<dyn std::io::Write + Send>>> = LazyLock::new
             .unwrap_or_else(|_| Box::new(std::io::sink()) as Box<dyn std::io::Write + Send>),
         None => Box::new(std::io::sink()),
     };
-    // session marker：多 process 同檔 append → PID 歸因；retry scan 的 offset 基準。
+    // session marker：多 process append 的人工歸因標記。
     writeln!(f, "\n===== session start: pid={} ts={} path={} =====",
         std::process::id(),
         now_stamp(),
         LOG_PATH.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "<none>".into()),
     ).ok();
     Mutex::new(f)
-});
-
-/// 本 process session start 時的行數（scan 起點）。
-/// **先觸發 FIDO_LOG init**（寫入 session marker）再計數 → 確保 marker 在 scan 範圍內；
-/// 否則 LazyLock 初始化順序不確定，marker 可能落在 skip 之後 = contention 偵測全盲。
-static SESSION_START_LINES: LazyLock<Mutex<usize>> = LazyLock::new(|| {
-    let _guard = FIDO_LOG.lock().unwrap_or_else(|e| e.into_inner()); // force marker write
-    drop(_guard);
-    let n = LOG_PATH.as_ref().map(|p| count_lines(p)).unwrap_or(0);
-    Mutex::new(n)
 });
 
 fn resolve_path() -> Option<PathBuf> {
@@ -103,12 +93,22 @@ impl log::Log for FileLogger {
     fn flush(&self) {}
 }
 
-/// 讀 log 檔中「本 process session marker 之後」的所有行（log 未初始化 → 全檔；開檔失敗 → 空）。
+/// 每次 operation attempt 前另取 checkpoint；caller 再以 PID 篩選新追加的 log 行。
 ///
-/// 以**本 process** 的 session start 為起點：同檔 append 的多 process log 不會互相干擾
-/// （NB C:\FidoVault\fido2-diag.log 上 CLI + GUI 共用一檔）；同一 op 鏈（detect→register
-/// 同 process）內前段 phase 的 Ioerror 也屬本 session 證據 → 全掃。
-pub fn scan_lines() -> Vec<String> {
+/// Session marker 供人工檢視多 process log；程式判斷以 checkpoint 與 PID 過濾為準。
+/// CLI 與 GUI 共用 append log，所有 logger event 均帶 PID。
+/// Earlier operation evidence is deliberately excluded from the retry predicate.
+
+/// 行數 checkpoint：先 force FIDO_LOG 初始化（確保 session marker 落檔），再回傳目前行數。
+pub fn checkpoint() -> usize {
+    let guard = FIDO_LOG.lock().unwrap_or_else(|e| e.into_inner());
+    let n = LOG_PATH.as_ref().map(|p| count_lines(p)).unwrap_or(0);
+    drop(guard);
+    n
+}
+
+/// 讀取 checkpoint 之後追加的 log 行。呼叫端須再依 PID 篩選，隔離其他 process 的 append。
+pub fn scan_from(start_line: usize) -> Vec<String> {
     let path = match LOG_PATH.as_ref() {
         Some(p) => p,
         None => return Vec::new(),
@@ -117,6 +117,5 @@ pub fn scan_lines() -> Vec<String> {
         Ok(c) => c,
         Err(_) => return Vec::new(),
     };
-    let start = *SESSION_START_LINES.lock().unwrap_or_else(|e| e.into_inner());
-    content.lines().skip(start).map(str::to_owned).collect()
+    content.lines().skip(start_line).map(str::to_owned).collect()
 }

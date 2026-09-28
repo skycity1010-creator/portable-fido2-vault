@@ -718,44 +718,31 @@ mod real {
             out
         }
 
-        // ── contention-aware retry（blocker #2 root cause：Windows HID exclusive-open）──
+        // ── contention-aware retry（HID open denial：CreateFile ACCESS_DENIED / SHARING_VIOLATION）──
         //
-        // Windows HID 無 FILE_SHARE flag → 任一 process 持有 FIDO interface handle 時，
-        // 其他 process CreateFileW = ACCESS_DENIED (os error 5)（YubiKey Bio 12:01 失敗）。
-        // vendor authenticator-rs：open 一次失敗即放棄（無 retry、reset() 不 re-enumerate）→
-        // 整 op 立即 U2FToken(NotAllowed)。本層補上：op 回「device 不可用」時檢查**我方
-        // fido2-diag.log**（vendor debug! 經 global logger 落檔）：若 FIDO VID 有被 enumerate
-        // 但 open 被拒 = contention → backoff 後整 op 重試；完全沒有 FIDO device → fail fast。
+        // Windows HID interface open 可能因既有 handle 的 incompatible share/access 或 OS policy
+        // 而回 ACCESS_DENIED (os error 5) / SHARING_VIOLATION (os error 32)。NB 15:33 的
+        // YubiKey FIDO interface open = os error 5；同 binary 15:25 又 detect 成功，顯示為間歇性。
+        // authenticator-rs open 一次失敗後該 device 不進 token selector；getInfo 最後 timeout，
+        // 所以錯誤被映射為 CancelledByUser/U2FToken(NotAllowed)，不是直接 open error。
         // 安全性：per-transaction 架構（Manager::new 不開 device、每 op 重新列舉、handle 於
         // transaction 結束釋放、cancel join）→ 重試不 self-contend。
 
-        /// 讀本 process session（diag_log 模組追蹤 marker）的 log，回傳是否出現
-        /// 「FIDO VID open 被拒」signature（statemachine.rs Ioerror + os error 5/32）。
-        fn fido_open_denied_in_diag() -> bool {
-            for line in crate::diag_log::scan_lines() {
-                if !line.contains(FIDO_VID_PID) {
-                    continue;
-                }
-                // statemachine.rs 的 Ioerror 行必含裝置路徑（hid.rs 其他 log 不含 os error N）。
-                if line.contains("Ioerror") && (line.contains("os error 5") || line.contains("os error 32")) {
-                    return true;
-                }
-            }
-            false
+        /// 判斷單行是否為**本 process** 對 YubiKey FIDO HID 的 open-denied signature。
+        fn is_fido_open_denied_line(line: &str, pid: u32) -> bool {
+            let pid_tag = format!("[pid={pid}]");
+            line.contains(&pid_tag)
+                && line.contains(FIDO_VID_PID)
+                && line.contains("Ioerror")
+                && (line.contains("os error 5") || line.contains("os error 32"))
         }
 
-        /// op 失敗是否為「device 不可用」類（值得 contention 重試）：
-        /// NoDevice / U2FToken(NotAllowed)（= vendor zero-CTAP transport fallback）。
-        /// NotAllowed 經 map_auth_error → Internal("authenticator-rs: U2FToken(NotAllowed)")。
-        fn is_device_unavailable(e: &FidoError) -> bool {
-            match e {
-                FidoError::NoDevice => true,
-                FidoError::Internal(m) => {
-                    let l = m.to_ascii_lowercase();
-                    l.contains("notallowed") || l.contains("not allowed")
-                }
-                _ => false,
-            }
+        /// 只掃本次 operation attempt 的 checkpoint 之後，且 PID 屬於本 process 的行。
+        fn fido_open_denied_since(checkpoint: usize) -> bool {
+            let pid = std::process::id();
+            crate::diag_log::scan_from(checkpoint)
+                .iter()
+                .any(|line| Self::is_fido_open_denied_line(line, pid))
         }
 
         /// contention-aware 重試包裝：最多 MAX 次嘗試（首次 + MAX-1 次重試），backoff 2s/4s。
@@ -769,23 +756,31 @@ mod real {
             const MAX_ATTEMPTS: usize = 3;
             let mut last_err = None;
             for attempt in 1..=MAX_ATTEMPTS {
+                // 每個 attempt 單獨 checkpoint：UV timeout 不會因 detect 階段的舊 open error 而誤重試。
+                let checkpoint = crate::diag_log::checkpoint();
                 match op(self) {
                     Ok(v) => return Ok(v),
-                    Err(e) if attempt < MAX_ATTEMPTS && Self::is_device_unavailable(&e) => {
-                        // device 不可用 → 查 diag log 判 contention（open 被拒）vs 真的沒插。
-                        if !Self::fido_open_denied_in_diag() {
-                            return Err(e); // 完全沒有 FIDO device → fail fast
+                    Err(e) => {
+                        // 依實際 open-denied log signature 判 contention，而非依賴上層錯誤映射。
+                        // authenticator-rs 在 CreateFile 失敗後不送 callback，最後只回 timeout /
+                        // CancelledByUser；舊版只認 NoDevice/NotAllowed，漏掉這條 30s 路徑。
+                        let open_denied = Self::fido_open_denied_since(checkpoint);
+                        if !open_denied || attempt == MAX_ATTEMPTS {
+                            return Err(e);
                         }
                         let backoff = 2_000u64 * attempt as u64;
+                        log::warn!(
+                            "[fido2][contention] op={what} attempt={attempt}/{MAX_ATTEMPTS}; \
+                             YubiKey HID open denied in this attempt; retrying after {backoff}ms; \
+                             previous error={e}"
+                        );
                         eprintln!(
-                            "[fido2] {what}：FIDO 金鑰被其他程式暫時占用（open 被拒 / os error 5）— \
-                             請關閉 FIDO Vault GUI、Yubico Authenticator 或任何正使用金鑰的程式；\
+                            "[fido2] {what}：本次操作的 log 確認 YubiKey FIDO HID open 被拒（os error 5/32）；\
                              {backoff}ms 後自動重試（{attempt}/{MAX_ATTEMPTS}）"
                         );
                         std::thread::sleep(std::time::Duration::from_millis(backoff));
                         last_err = Some(e);
                     }
-                    Err(e) => return Err(e), // 非 device 類錯誤 / 最後一次 → 直接回報
                 }
             }
             Err(last_err.unwrap_or_else(|| FidoError::Internal("retry exhausted".into())))
@@ -987,24 +982,17 @@ mod real {
             assert_eq!(s, crate::crypto::prf_salt_bytes());
         }
 
-        /// contention retry 判斷式：NoDevice / U2FToken(NotAllowed) = device 不可用（值得重試）；
-        /// 其他錯誤（PIN/PRF/一般內部錯）不重試。
+        /// Retry signature 必須同時符合 process PID、YubiKey FIDO VID/PID、Ioerror 與 Win32 5/32。
+        /// 這可捕捉被 vendor 映射成 timeout/CancelledByUser 的 CreateFile open failure。
         #[test]
-        fn real_is_device_unavailable_predicate() {
-            assert!(RealBackend::is_device_unavailable(&FidoError::NoDevice));
-            // map_auth_error(U2FToken(NotAllowed)) 的實際字串（12:01 NB 失敗的錯誤路徑）。
-            assert!(RealBackend::is_device_unavailable(&FidoError::Internal(
-                "authenticator-rs: U2FToken(NotAllowed)".into()
-            )));
-            // 非 device 類 → 不重試。
-            assert!(!RealBackend::is_device_unavailable(&FidoError::PinRejected));
-            assert!(!RealBackend::is_device_unavailable(&FidoError::PrfNotSupported));
-            assert!(!RealBackend::is_device_unavailable(&FidoError::Internal(
-                "金鑰未回傳 hmac-secret 輸出（不支援 PRF 或 UV 未完成）".into()
-            )));
-            assert!(!RealBackend::is_device_unavailable(&FidoError::Internal(
-                "使用者取消 / 超時".into()
-            )));
+        fn real_contention_signature_is_pid_scoped() {
+            let denied = r#"[INFO] [pid=42] [ts] authenticator::statemachine: Ioerror(Some("\\\\?\\hid#vid_1050&pid_0402#instance")): access denied (os error 5)"#;
+            let sharing = r#"[INFO] [pid=42] [ts] authenticator::statemachine: Ioerror(Some("\\\\?\\hid#vid_1050&pid_0402#instance")): sharing violation (os error 32)"#;
+            let unrelated = r#"[INFO] [pid=42] [ts] authenticator::statemachine: Ioerror(Some("\\\\?\\hid#vid_045e&pid_079c")): access denied (os error 5)"#;
+            assert!(RealBackend::is_fido_open_denied_line(denied, 42));
+            assert!(RealBackend::is_fido_open_denied_line(sharing, 42));
+            assert!(!RealBackend::is_fido_open_denied_line(denied, 99));
+            assert!(!RealBackend::is_fido_open_denied_line(unrelated, 42));
         }
     }
 }
