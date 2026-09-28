@@ -9,6 +9,8 @@ use crate::fido2::MockBackend;
 use crate::fido2::RealBackend;
 
 pub mod crypto;
+#[cfg(feature = "real-ctap")]
+pub mod diag_log;
 pub mod fido2;
 pub mod vault;
 
@@ -280,6 +282,9 @@ fn detect_key(state: tauri::State<VaultState>) -> Result<fido2::DetectedKey> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // 診斷 file logger（real-ctap）：GUI op 也落 fido2-diag.log → contention retry 可歸因。
+    #[cfg(feature = "real-ctap")]
+    diag_log::init();
     tauri::Builder::default()
         .manage(VaultState(Mutex::new(AppInner::new())))
         .invoke_handler(tauri::generate_handler![

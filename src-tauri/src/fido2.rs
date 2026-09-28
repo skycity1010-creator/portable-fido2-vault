@@ -336,6 +336,9 @@ mod real {
     use std::sync::mpsc::channel;
     use std::sync::{Arc, Mutex};
 
+    /// YubiKey 系列 VID/PID（contention 偵測用：diag log 中該裝置 open 被拒 = handle 被外部持有）。
+    const FIDO_VID_PID: &str = "hid#vid_1050&pid_0402";
+
     /// RP id / origin（離線工具，固定值；跨行程一致即可）。
     const RP_ID: &str = "fido-vault.local";
     /// 偵測（getInfo）超時（ms）：含 Windows HID 列舉 + 裝置選擇。
@@ -714,48 +717,128 @@ mod real {
             out.copy_from_slice(&d);
             out
         }
+
+        // ── contention-aware retry（blocker #2 root cause：Windows HID exclusive-open）──
+        //
+        // Windows HID 無 FILE_SHARE flag → 任一 process 持有 FIDO interface handle 時，
+        // 其他 process CreateFileW = ACCESS_DENIED (os error 5)（YubiKey Bio 12:01 失敗）。
+        // vendor authenticator-rs：open 一次失敗即放棄（無 retry、reset() 不 re-enumerate）→
+        // 整 op 立即 U2FToken(NotAllowed)。本層補上：op 回「device 不可用」時檢查**我方
+        // fido2-diag.log**（vendor debug! 經 global logger 落檔）：若 FIDO VID 有被 enumerate
+        // 但 open 被拒 = contention → backoff 後整 op 重試；完全沒有 FIDO device → fail fast。
+        // 安全性：per-transaction 架構（Manager::new 不開 device、每 op 重新列舉、handle 於
+        // transaction 結束釋放、cancel join）→ 重試不 self-contend。
+
+        /// 讀本 process session（diag_log 模組追蹤 marker）的 log，回傳是否出現
+        /// 「FIDO VID open 被拒」signature（statemachine.rs Ioerror + os error 5/32）。
+        fn fido_open_denied_in_diag() -> bool {
+            for line in crate::diag_log::scan_lines() {
+                if !line.contains(FIDO_VID_PID) {
+                    continue;
+                }
+                // statemachine.rs 的 Ioerror 行必含裝置路徑（hid.rs 其他 log 不含 os error N）。
+                if line.contains("Ioerror") && (line.contains("os error 5") || line.contains("os error 32")) {
+                    return true;
+                }
+            }
+            false
+        }
+
+        /// op 失敗是否為「device 不可用」類（值得 contention 重試）：
+        /// NoDevice / U2FToken(NotAllowed)（= vendor zero-CTAP transport fallback）。
+        /// NotAllowed 經 map_auth_error → Internal("authenticator-rs: U2FToken(NotAllowed)")。
+        fn is_device_unavailable(e: &FidoError) -> bool {
+            match e {
+                FidoError::NoDevice => true,
+                FidoError::Internal(m) => {
+                    let l = m.to_ascii_lowercase();
+                    l.contains("notallowed") || l.contains("not allowed")
+                }
+                _ => false,
+            }
+        }
+
+        /// contention-aware 重試包裝：最多 MAX 次嘗試（首次 + MAX-1 次重試），backoff 2s/4s。
+        /// op 每次嘗試重新執行整個 vendor op（重新列舉裝置）；以 &mut Self 參數傳入
+        /// （非 closure capture）→ 避免 receiver 與 capture 雙重 mut borrow。
+        fn retry_on_contention<T>(
+            &mut self,
+            what: &str,
+            mut op: impl FnMut(&mut Self) -> Result<T, FidoError>,
+        ) -> Result<T, FidoError> {
+            const MAX_ATTEMPTS: usize = 3;
+            let mut last_err = None;
+            for attempt in 1..=MAX_ATTEMPTS {
+                match op(self) {
+                    Ok(v) => return Ok(v),
+                    Err(e) if attempt < MAX_ATTEMPTS && Self::is_device_unavailable(&e) => {
+                        // device 不可用 → 查 diag log 判 contention（open 被拒）vs 真的沒插。
+                        if !Self::fido_open_denied_in_diag() {
+                            return Err(e); // 完全沒有 FIDO device → fail fast
+                        }
+                        let backoff = 2_000u64 * attempt as u64;
+                        eprintln!(
+                            "[fido2] {what}：FIDO 金鑰被其他程式暫時占用（open 被拒 / os error 5）— \
+                             請關閉 FIDO Vault GUI、Yubico Authenticator 或任何正使用金鑰的程式；\
+                             {backoff}ms 後自動重試（{attempt}/{MAX_ATTEMPTS}）"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(backoff));
+                        last_err = Some(e);
+                    }
+                    Err(e) => return Err(e), // 非 device 類錯誤 / 最後一次 → 直接回報
+                }
+            }
+            Err(last_err.unwrap_or_else(|| FidoError::Internal("retry exhausted".into())))
+        }
     }
 
     impl FidoBackend for RealBackend {
         fn detect(&mut self) -> Result<DetectedKey, FidoError> {
-            let info = self.get_info()?;
-            // PRF 能力診斷（PM 預先排程）：若 getInfo 未宣告 hmac-secret → 抓原始
-            // extensions + firmware version 回報（裁決②會拒絕註冊；據此定論是升級
-            // firmware 還是該型號不在支援範圍）。
-            let has_prf = info.extensions.iter().any(|e| e == "hmac-secret");
-            if !has_prf {
-                eprintln!("[fido2][DIAG] getInfo 未宣告 hmac-secret（註冊將被 PrfNotSupported 拒絕）：");
-                eprintln!(
-                    "[fido2][DIAG]   extensions = {:?}\n[fido2][DIAG]   firmware_version = {:?}\n[fido2][DIAG]   versions = {:?}\n[fido2][DIAG]   algorithms = {:?}\n[fido2][DIAG]   aaguid = {}",
-                    info.extensions, info.firmware_version, info.versions, info.algorithms, hex16(&info.aaguid.0)
-                );
-            }
-            // 分類以 getInfo flag 為準（CTAP2 spec：bioEnroll=true = 「已設定至少一個 bio
-            // enrollment」→ 指紋型；clientPin 存在 → PIN 型；皆無 → touch-only）。
-            // getBioEnrollment CBOR 0x09 probe 僅作確認/記錄（best-effort，不影響分類、
-            // 不阻斷註冊）— YubiKey Bio：bioEnroll=true + clientPin=absent → Fingerprint。
-            if info.options.bio_enroll == Some(true) && info.options.client_pin.is_none() {
-                self.probe_bio_sensor();
-            }
-            let kind = Self::kind_from_info(&info);
-            let label = Self::label_from_info(&info, 1);
-            self.info = Some(info.clone());
-            Ok(DetectedKey { kind, label, aaguid: info.aaguid.0 })
+            // contention-aware retry：YubiKey 被其他 process 占用（os error 5）時整 op 重試。
+            self.retry_on_contention("detect", |b: &mut Self| {
+                let info = b.get_info()?;
+                // PRF 能力診斷（PM 預先排程）：若 getInfo 未宣告 hmac-secret → 抓原始
+                // extensions + firmware version 回報（裁決②會拒絕註冊；據此定論是升級
+                // firmware 還是該型號不在支援範圍）。
+                let has_prf = info.extensions.iter().any(|e| e == "hmac-secret");
+                if !has_prf {
+                    eprintln!("[fido2][DIAG] getInfo 未宣告 hmac-secret（註冊將被 PrfNotSupported 拒絕）：");
+                    eprintln!(
+                        "[fido2][DIAG]   extensions = {:?}\n[fido2][DIAG]   firmware_version = {:?}\n[fido2][DIAG]   versions = {:?}\n[fido2][DIAG]   algorithms = {:?}\n[fido2][DIAG]   aaguid = {}",
+                        info.extensions, info.firmware_version, info.versions, info.algorithms, hex16(&info.aaguid.0)
+                    );
+                }
+                // 分類以 getInfo flag 為準（CTAP2 spec：bioEnroll=true = 「已設定至少一個 bio
+                // enrollment」→ 指紋型；clientPin 存在 → PIN 型；皆無 → touch-only）。
+                // getBioEnrollment CBOR 0x09 probe 僅作確認/記錄（best-effort，不影響分類、
+                // 不阻斷註冊）— YubiKey Bio：bioEnroll=true + clientPin=absent → Fingerprint。
+                if info.options.bio_enroll == Some(true) && info.options.client_pin.is_none() {
+                    b.probe_bio_sensor();
+                }
+                let kind = Self::kind_from_info(&info);
+                let label = Self::label_from_info(&info, 1);
+                b.info = Some(info.clone());
+                Ok(DetectedKey { kind, label, aaguid: info.aaguid.0 })
+            })
         }
 
         fn register_credential(&mut self, detected: &DetectedKey, pin: Option<&str>) -> Result<RegisteredCredential, FidoError> {
-            self.do_register(detected, pin)
+            // contention-aware retry：makeCredential 前 device open 被拒 → backoff 重試。
+            self.retry_on_contention("register", |b: &mut Self| b.do_register(detected, pin))
         }
 
         fn get_prf_secret(&mut self, credential_id: &[u8], pin: Option<&str>) -> Result<[u8; 32], FidoError> {
             if credential_id.is_empty() {
                 return Err(FidoError::Internal("credential_id 為空".into()));
             }
-            // 登入路徑（open_key）不會先 detect() → 若無快取資訊，先 getInfo 補上。
-            if self.info.is_none() {
-                let _ = self.get_info()?;
-            }
-            self.do_get_prf_secret(credential_id, pin)
+            // contention-aware retry：getInfo/getAssertion 任一被 device open 拒絕 → backoff 重試。
+            self.retry_on_contention("login", |b: &mut Self| {
+                // 登入路徑（open_key）不會先 detect() → 若無快取資訊，先 getInfo 補上。
+                if b.info.is_none() {
+                    let _ = b.get_info()?;
+                }
+                b.do_get_prf_secret(credential_id, pin)
+            })
         }
 
         fn peek_kind(&self) -> KeyKind {
@@ -902,6 +985,26 @@ mod real {
             assert_eq!(s.len(), 32);
             assert_eq!(&s[..17], b"f2vlt-prf-salt-v1");
             assert_eq!(s, crate::crypto::prf_salt_bytes());
+        }
+
+        /// contention retry 判斷式：NoDevice / U2FToken(NotAllowed) = device 不可用（值得重試）；
+        /// 其他錯誤（PIN/PRF/一般內部錯）不重試。
+        #[test]
+        fn real_is_device_unavailable_predicate() {
+            assert!(RealBackend::is_device_unavailable(&FidoError::NoDevice));
+            // map_auth_error(U2FToken(NotAllowed)) 的實際字串（12:01 NB 失敗的錯誤路徑）。
+            assert!(RealBackend::is_device_unavailable(&FidoError::Internal(
+                "authenticator-rs: U2FToken(NotAllowed)".into()
+            )));
+            // 非 device 類 → 不重試。
+            assert!(!RealBackend::is_device_unavailable(&FidoError::PinRejected));
+            assert!(!RealBackend::is_device_unavailable(&FidoError::PrfNotSupported));
+            assert!(!RealBackend::is_device_unavailable(&FidoError::Internal(
+                "金鑰未回傳 hmac-secret 輸出（不支援 PRF 或 UV 未完成）".into()
+            )));
+            assert!(!RealBackend::is_device_unavailable(&FidoError::Internal(
+                "使用者取消 / 超時".into()
+            )));
         }
     }
 }

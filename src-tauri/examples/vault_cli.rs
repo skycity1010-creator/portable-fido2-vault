@@ -19,77 +19,12 @@ use portable_fido_vault::fido2::{FidoBackend, KeyKind, MockBackend};
 #[cfg(feature = "real-ctap")]
 use portable_fido_vault::fido2::RealBackend;
 use portable_fido_vault::vault::{failures_path, Vault};
-use std::fs::OpenOptions;
-use std::io::Write as _;
 use std::path::PathBuf;
-use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
 
-// ── 診斷 file logger（blocker #2：vendor authenticator-rs 內建 debug!/info!/warn!，
-//    但 CLI 未安裝 global logger → log null logger 全丟棄 = 零可視性）。
-//    寫 <exe 同目錄>\fido2-diag.log（append；NB=C:\FidoVault、本機=build dir），
-//    同時 eprintln 一份。開檔失敗 → sink（不阻斷執行）。
-static FIDO_LOG: LazyLock<Mutex<Box<dyn std::io::Write + Send>>> = LazyLock::new(|| {
-    let path = diag_log_path();
-    let mut f: Box<dyn std::io::Write + Send> = match &path {
-        Some(p) => OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(p)
-            .map(|f| Box::new(f) as Box<dyn std::io::Write + Send>)
-            .unwrap_or_else(|_| Box::new(std::io::sink()) as Box<dyn std::io::Write + Send>),
-        None => Box::new(std::io::sink()),
-    };
-    writeln!(f, "\n===== session start: diag_log={} =====", path.map(|p| p.display().to_string()).unwrap_or_else(|| "<none>".into())).ok();
-    Mutex::new(f)
-});
-
-struct FileLogger;
-impl log::Log for FileLogger {
-    fn enabled(&self, _m: &log::Metadata) -> bool {
-        true
-    }
-    fn log(&self, record: &log::Record) {
-        let line = format!(
-            "[{}] [{}] {}: {}",
-            record.level(),
-            record.target(),
-            record.file().unwrap_or("?"),
-            record.args()
-        );
-        if let Ok(mut g) = FIDO_LOG.lock() {
-            writeln!(g, "{line}").ok();
-        }
-        eprintln!("{line}");
-    }
-    fn flush(&self) {}
-}
-
-/// 安裝 file logger。失敗（如已安裝）不阻斷執行 — 退化为 null logger。
-/// 解析 fido2-diag.log 路徑：<exe 同目錄> → %USERPROFILE%\fido2-diag.log → %TEMP%。
-/// WinRM session-0（service context）下 std::env::current_exe() 可能失敗（Windows 已知行為：
-/// service account 無 token 時 GetModuleFileNameW 解析不到完整路徑）→ 需 fallback，
-/// 否則 logger 落 sink = 遠端診斷全盲。
-fn diag_log_path() -> Option<std::path::PathBuf> {
-    if let Ok(p) = std::env::current_exe() {
-        if let Some(d) = p.parent() {
-            return Some(d.join("fido2-diag.log"));
-        }
-    }
-    for var in ["USERPROFILE", "TEMP"] {
-        if let Ok(v) = std::env::var(var) {
-            if !v.is_empty() {
-                return Some(std::path::PathBuf::from(v).join("fido2-diag.log"));
-            }
-        }
-    }
-    None
-}
-
-fn init_diag_logger() {
-    let _ = log::set_boxed_logger(Box::new(FileLogger));
-    log::set_max_level(log::LevelFilter::Debug);
-}
+// 診斷 file logger（blocker #2）：共用模組 diag_log — vendor authenticator-rs 內建
+// debug!/info!/warn! 全量落檔 <exe 同目錄>\fido2-diag.log（append；NB=C:\FidoVault），
+// 含 PID + 時間戳（CLI/GUI 多 process 歸因）。real-ctap feature 才啟用。
 
 struct Opts {
     path: Option<PathBuf>,
@@ -184,7 +119,9 @@ fn open_with_pw(path: &PathBuf, pw: &str) -> Result<Vault, String> {
 }
 
 fn main() {
-    init_diag_logger();
+    // 診斷 file logger（real-ctap）：vendor debug!/info!/warn! → fido2-diag.log。
+    #[cfg(feature = "real-ctap")]
+    portable_fido_vault::diag_log::init();
     match run() {
         Ok(m) => println!("{m}"),
         Err(m) => { eprintln!("{m}"); std::process::exit(1); }
