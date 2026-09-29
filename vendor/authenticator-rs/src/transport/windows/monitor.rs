@@ -51,6 +51,14 @@ where
             let device_info_set = DeviceInfoSet::new()?;
             previous = current;
             current = HashSet::from_iter(device_info_set.devices());
+            // [vendor patch] Targeted filter: only open the authenticator(s) we
+            // care about (USB VID/PID embedded in the device path). No-op when
+            // no filter is configured, so stock full-scan behavior is kept.
+            // Without this the monitor opens every HID device on the machine
+            // (keyboard/mouse/touchpad), which is what made key detection fail
+            // on a laptop with ~30 HID devices even though the authenticator
+            // itself opens and answers CTAP2 fine.
+            current.retain(|path| crate::device_filter::matches(path));
 
             // Remove devices that are gone.
             for path in previous.difference(&current) {

@@ -60,7 +60,9 @@ def push(local_path, remote_dir=r"C:\FidoVault"):
 if __name__ == "__main__":
     args = sys.argv[1:]
     rd = r"C:\FidoVault"
-    if len(args) > 1 and not os.path.exists(args[-1]):
+    # 末參若為存在但不含 \ 或 . 的目錄字串（remote dir 參數）→ pop 出當 rd。
+    # 規則：只有「非 local 路徑」才算 remote dir。
+    while args and not os.path.exists(args[-1]) and not os.path.exists(args[-1].replace("\\", "/")):
         rd = args.pop()
     ok = True
     for p in args:

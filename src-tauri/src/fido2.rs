@@ -371,6 +371,15 @@ mod real {
             let mut service = AuthenticatorService::new().expect("authenticator service init");
             // Windows：Win32 HID transport（CreateFile + usage page 檢查，免 admin）。
             service.add_u2f_usb_hid_platform_transports();
+            // [vendor patch] Targeted HID filter: open only Yubico (VID 0x1050)
+            // HID interfaces — never the laptop's keyboard/mouse/touchpad.
+            // pid==0 => "any PID for this VID", so the whole Yubico FIDO HID
+            // family is covered while non-FIDO devices are excluded. This is
+            // what makes detect work on a machine with ~30 HID devices:
+            // yk_open_test proved the YubiKey itself opens + answers CTAP2
+            // Init/GetInfo cleanly; the full-scan was the failure. See
+            // vendor authenticator-rs `device_filter`.
+            authenticator::device_filter::set_target_devices(&[(0x1050, 0)]);
             Self { service, info: None }
         }
 

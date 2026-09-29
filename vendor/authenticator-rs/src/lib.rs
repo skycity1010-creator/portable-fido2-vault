@@ -34,6 +34,9 @@ mod status_update;
 mod transport;
 mod u2ftypes;
 
+// [vendor patch] Targeted HID device filter (offline-vault key detection).
+pub mod device_filter;
+
 pub mod authenticatorservice;
 pub mod crypto;
 pub mod ctap2;
