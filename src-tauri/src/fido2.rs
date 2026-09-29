@@ -107,6 +107,14 @@ pub enum FidoError {
     PrfNotSupported,
     NotSupported(String),
     Internal(String),
+    /// 裝置 open 持續被拒（Win32 os error 5/32）：FIDO HID（YubiKey）handle 被外部
+    /// process / USB session 鎖定。contention 重試耗盡後回傳，取代 vendor 的模糊
+    /// timeout fallback（U2FToken(NotAllowed) / CancelledByUser）以點名真正原因。
+    DeviceOpenDenied {
+        what: String,
+        last_err: String,
+        attempts: usize,
+    },
 }
 
 impl std::fmt::Display for FidoError {
@@ -121,6 +129,12 @@ impl std::fmt::Display for FidoError {
             ),
             Self::NotSupported(m) => write!(f, "不支援：{m}"),
             Self::Internal(m) => write!(f, "FIDO2 內部錯誤：{m}"),
+            Self::DeviceOpenDenied { what, last_err, attempts } => write!(
+                f,
+                "YubiKey FIDO HID open 被拒（os error 5/32）：device handle 被其他 process / USB session \
+                 鎖定，重試 {attempts} 次皆被拒（{what}）。最後 vendor 回報：{last_err}。請關閉其他使用 \
+                 該金鑰的程序（FidoVault / 瀏覽器 FIDO / 遠端 session）或拔插後重試。"
+            ),
         }
     }
 }
@@ -765,8 +779,25 @@ mod real {
                         // authenticator-rs 在 CreateFile 失敗後不送 callback，最後只回 timeout /
                         // CancelledByUser；舊版只認 NoDevice/NotAllowed，漏掉這條 30s 路徑。
                         let open_denied = Self::fido_open_denied_since(checkpoint);
-                        if !open_denied || attempt == MAX_ATTEMPTS {
+                        if !open_denied {
                             return Err(e);
+                        }
+                        if attempt == MAX_ATTEMPTS {
+                            // 真實原因已由本次 attempt 的 log 確認（FIDO HID open-denied）→
+                            // 回傳點名原因的 DeviceOpenDenied，取代 vendor 的模糊 timeout
+                            // fallback（U2FToken(NotAllowed) / CancelledByUser）以讓 UI/CLI
+                            // 能直接呈現「handle 被鎖」而非「金鑰拒絕」。
+                            let msg = format!(
+                                "[fido2][contention] op={what} 重試 {MAX_ATTEMPTS}/{MAX_ATTEMPTS} 皆被拒；\
+                                 FIDO HID open 持續被拒（os error 5/32）；vendor 最終={e}"
+                            );
+                            log::error!("{msg}");
+                            eprintln!("{msg}");
+                            return Err(FidoError::DeviceOpenDenied {
+                                what: what.to_string(),
+                                last_err: e.to_string(),
+                                attempts: attempt,
+                            });
                         }
                         let backoff = 2_000u64 * attempt as u64;
                         log::warn!(
