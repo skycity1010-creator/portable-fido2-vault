@@ -45,8 +45,7 @@ portable-fido2-vault/
 
 - **狀態**：解鎖後 KEK（32B，`Zeroizing<[u8;32]>`）與金庫資料僅存於記憶體；上鎖即清零。
 - **落盤策略**：任何變更 → 以記憶體 KEK 重新加密整個 payload → 暫存檔 + rename 原子寫入。
-- **後端選擇**：`make_backend()` 依 `F2V_AUTHENTICATOR=hw`（或 CLI `--authenticator hw`）選
-  RealBackend；未設定走 MockBackend。`real-ctap` feature 控制 RealBackend 是否編入。
+- **後端選擇**：GUI 的 Release build 若編入 `real-ctap`，未設定環境變數時預設選 RealBackend；Debug build 預設 MockBackend。`F2V_AUTHENTICATOR=mock|hw` 可明確覆寫；未設定覆寫值且 Release 未編入 `real-ctap` 時會拒絕啟動；只有明確設定 `F2V_AUTHENTICATOR=mock` 才會在 Release 使用 MockBackend。CLI 仍以 `--authenticator mock|hw` 個別選擇。
 
 ## 3. 金庫格式與加密（vault.db v1）
 
@@ -115,11 +114,12 @@ offset   size   field
 # bash / git-bash（WS2）
 export PATH="$HOME/.cargo/bin:$HOME/tools/winlibs-mingw/mingw64/bin:$PATH"
 cd C:/project/portable-fido2-vault/src-tauri
-cargo +stable-x86_64-pc-windows-gnu build --release --features real-ctap --lib --example vault_cli
+cargo +stable-x86_64-pc-windows-gnu build --release --features real-ctap --bin portable-fido-vault --example vault_cli
 # 產出 target/release/portable-fido-vault.exe + vault_cli.exe
 ```
 
-- `--features real-ctap`：編入實體 YubiKey 後端（**NB 部署必用**；default 為 mock-fido）。
+- `--features real-ctap`：編入實體 YubiKey 後端（**NB 部署必用**；即使同時編入 default `mock-fido`，Release GUI 也會預設選硬體後端）。
+- Release GUI 無需 `F2V_AUTHENTICATOR` 才能使用實體金鑰；Debug 預設 mock，mock demo 可明確設 `F2V_AUTHENTICATOR=mock`。
 - 驗證：`cargo test --features real-ctap --lib`（2026-09-29：23 passed / 0 failed）。
 - 建置檔參數：release `strip + lto`。
 

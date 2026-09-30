@@ -1,8 +1,7 @@
 # 可攜式 FIDO2 密碼金庫 v0.1 — NB 桌面驗證步驟（使用者用）
 
 > 適用：Win11-NB，`C:\FidoVault`（portable 資料夾）。完成約 15–20 分鐘。
-> ⚠️ **本 build 為 mock FIDO2**（PM 裁決 v0.1 收口範圍）：「金鑰」是模擬的 YubiKey 5+，
-> 插不插實體金鑰都能走通流程；實體 YubiKey 實測在後續卡。
+> 硬體版 Release GUI 必須以 `--features real-ctap` 建置，從檔案總管啟動時會直接使用實體 FIDO2 金鑰；不需預設環境變數。Debug build 預設為 MockBackend；若要明確跑 mock 流程，設定 `F2V_AUTHENTICATOR=mock`。
 
 ## 驗證前狀態（Coder 已確認 ✅）
 `C:\FidoVault` 內應**恰好只有這三個檔案**（SHA256 與建置機逐一比對一致，測試殘留已清除）：
@@ -43,6 +42,9 @@
 - [ ] **D5**（對照組，選測）再上鎖一次前點右上「上鎖」手動按鈕 → 回登入畫面 → 軌跡多一列 `lock`
 
 ## E. Gate 3/4 — FIDO2 金鑰流程（mock）
+
+> 此節只測 MockBackend。若由 PowerShell 啟動 mock GUI，僅在該視窗設定 `$env:F2V_AUTHENTICATOR='mock'`；關閉 app 後用 `Remove-Item Env:F2V_AUTHENTICATOR -ErrorAction SilentlyContinue` 清除，勿用 `setx` 持久設定。
+
 - [ ] **E1** 「金鑰管理」分頁 →「＋ 註冊新金鑰」→ **預期**：狀態列顯示已註冊某型別（fingerprint / pin / touch-only 輪流；PIN 型會先問 PIN，任意輸入即可，mock 不驗證真 PIN）
 - [ ] **E2** 再註冊第二支（型別會不同）→「上鎖」→ 登入畫面應列出已註冊金鑰
 - [ ] **E3** 選任一金鑰 →「以金鑰登入」→ **預期**：成功進主畫面（多支金鑰任一支皆可解鎖）
@@ -62,6 +64,19 @@ E: E1 _ / E2 _ / E3 _
 F: F1 _ / F2 _ / F3 _
 （_ 填 ✓ 或 ✗+一句話現象）
 ```
+
+## G. Gate 3/4 — 實體 YubiKey Bio 註冊與登入（Release GUI）
+
+> 本節不需設定 `F2V_AUTHENTICATOR`；請確認 Windows 使用者／系統環境變數沒有殘留 `mock`。若曾持久設定，清除後登出再登入或重啟 Explorer。
+
+- [ ] **G1** 在 Win11-NB 本機互動桌面確認沒有 `vault_cli`、`portable-fido-vault` 或 `yk_open_test` 程序；若有，正常關閉，不要 force-kill。
+- [ ] **G2** 關閉 GUI 後備份 `C:\FidoVault\vault.db`，並記下註冊前金鑰槽位數。
+- [ ] **G3** 直接雙擊 `C:\FidoVault\portable-fido-vault.exe`，以主密碼登入 →「金鑰管理」→「＋ 註冊新金鑰」。
+- [ ] **G4** 在 YubiKey Bio 金鑰本體銀色外框感應區及時按指紋；不要改用 Windows Hello。若提示 PIN，只在本機輸入。
+- [ ] **G5** 確認 UI 顯示「已註冊」、金鑰出現在清單，且槽位數比註冊前增加 1。
+- [ ] **G6** 上鎖後用新金鑰登入，確認 Gate 3 完整通過；如要驗證 Gate 4，再註冊第二支支援 PRF 的實體金鑰並交叉登入。
+
+若視窗未啟動或金鑰未要求互動，保留目前 vault 備份並回報 UI 狀態；不要移除任何無法辨識的槽位。
 
 ## 常見狀況
 | 現象 | 說明 |

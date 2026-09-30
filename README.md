@@ -36,8 +36,11 @@ portable-fido2-vault/
 # bash / git-bash（WS2）
 export PATH="$HOME/.cargo/bin:$HOME/tools/winlibs-x86_64-posix-seh-gcc-14.2.0-mingw-w64ucrt-12.0.0-r2/bin:$PATH"
 cd C:/project/portable-fido2-vault/src-tauri
-cargo +stable-x86_64-pc-windows-gnu build --release   # 產出 target/release/portable-fido-vault.exe
+cargo +stable-x86_64-pc-windows-gnu build --release --features real-ctap --bin portable-fido-vault
+# 產出硬體版 GUI；target/release/portable-fido-vault.exe
 ```
+
+硬體版 Release GUI（`real-ctap`）直接從檔案總管啟動時預設使用實體 FIDO2 金鑰，不需設定環境變數。Debug 建置仍預設 MockBackend；若需在 Release 明確執行 mock 測試，可設定 `F2V_AUTHENTICATOR=mock`。未設定覆寫值且 Release 缺少 `real-ctap` 時會拒絕啟動；只有明確指定 `mock` 才會在 Release 使用模擬金鑰。
 
 > portable 部署：將 `target\release\portable-fido-vault.exe` 複製到任意資料夾即完成安裝；
 > 首次執行後該資料夾會多出 `vault.db`（你的金庫）。整個資料夾＝全部資產。
