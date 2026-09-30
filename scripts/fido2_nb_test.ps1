@@ -1,4 +1,4 @@
-# =====================================================================
+﻿# =====================================================================
 #  portable-fido2-vault - Win11-NB test procedure (post device_filter fix)
 #  commit 8bf2ea2 - targeted HID filter (YubiKey 1050:0402 only)
 #
@@ -63,10 +63,44 @@ function Run($cmd) {
 $hostLabel = if ($Local) { 'LOCAL' } else { $Nb }
 Write-Output "### FIDO2 vault test @ $hostLabel  pw=$Pw"
 
-# --- 0. make sure no stale vault process holds the YubiKey -----------
+# --- 0. fail closed if a known vault process is still running ---------
+# Never force-kill a FIDO client: the authenticator may retain an in-flight UV
+# request and return ChannelBusy to the next command. Ask the user to close it
+# gracefully, then rerun this test.
 if ($Local) {
-    Get-Process | Where-Object { $_.Name -match 'vault_cli|portable-fido-vault' } |
-        ForEach-Object { Write-Output ("KILL stale {0}" -f $_.Id); Stop-Process -Id $_.Id -Force }
+    $activeVaultProcesses = @(Get-Process | Where-Object {
+        $_.Name -match '^(vault_cli|portable-fido-vault|yk_open_test)$'
+    })
+    if ($activeVaultProcesses.Count -gt 0) {
+        Write-Output 'FATAL: close these FIDO vault processes gracefully; none were terminated:'
+        $activeVaultProcesses | ForEach-Object {
+            Write-Output ("ACTIVE {0} PID={1}" -f $_.Name, $_.Id)
+        }
+        exit 3
+    }
+} else {
+    Write-Output "Checking for active vault processes on $Nb (no process will be terminated)..."
+    $remoteProcessLines = @(RunRemote 'tasklist /FO CSV /NH')
+    if ($LASTEXITCODE -ne 0) {
+        Write-Output "FATAL: unable to check active processes on $Nb; aborting without running tests."
+        exit 3
+    }
+    $targetProcessNames = @('vault_cli.exe', 'portable-fido-vault.exe', 'yk_open_test.exe')
+    $activeRemoteProcesses = @()
+    foreach ($line in $remoteProcessLines) {
+        if ($line -match '^"([^"]+)","(\d+)"') {
+            $imageName = $Matches[1]
+            $processId = $Matches[2]
+            if ($targetProcessNames -contains $imageName) {
+                $activeRemoteProcesses += ("ACTIVE {0} PID={1}" -f $imageName, $processId)
+            }
+        }
+    }
+    if ($activeRemoteProcesses.Count -gt 0) {
+        Write-Output 'FATAL: close these FIDO vault processes gracefully; none were terminated:'
+        $activeRemoteProcesses | ForEach-Object { Write-Output $_ }
+        exit 3
+    }
 }
 
 # --- 0.5 make sure the test dir exists on the target ------------------

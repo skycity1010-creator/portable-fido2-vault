@@ -107,9 +107,9 @@ pub enum FidoError {
     PrfNotSupported,
     NotSupported(String),
     Internal(String),
-    /// 裝置 open 持續被拒（Win32 os error 5/32）：FIDO HID（YubiKey）handle 被外部
-    /// process / USB session 鎖定。contention 重試耗盡後回傳，取代 vendor 的模糊
-    /// timeout fallback（U2FToken(NotAllowed) / CancelledByUser）以點名真正原因。
+    /// FIDO HID open 被 Win32 拒絕（os error 5/32）：只證明此次 open 失敗，不代表已識別 holder；
+    /// 錯誤碼本身不能識別 holder 或區分 share lock/access policy；此變體在重試耗盡後取代 vendor 模糊
+    /// timeout fallback（U2FToken(NotAllowed) / CancelledByUser），避免把底層 open denied 誤報為金鑰拒絕。
     DeviceOpenDenied {
         what: String,
         last_err: String,
@@ -131,9 +131,10 @@ impl std::fmt::Display for FidoError {
             Self::Internal(m) => write!(f, "FIDO2 內部錯誤：{m}"),
             Self::DeviceOpenDenied { what, last_err, attempts } => write!(
                 f,
-                "YubiKey FIDO HID open 被拒（os error 5/32）：device handle 被其他 process / USB session \
-                 鎖定，重試 {attempts} 次皆被拒（{what}）。最後 vendor 回報：{last_err}。請關閉其他使用 \
-                 該金鑰的程序（FidoVault / 瀏覽器 FIDO / 遠端 session）或拔插後重試。"
+                "YubiKey FIDO HID open 被 Windows 拒絕（os error 5/32）；重試 {attempts} 次皆失敗（{what}）。 \
+                 此錯誤無法確認 holder 身分或區分 share-lock/access policy；可能是其他 FIDO client、Windows WebAuthN / Windows Hello 正在使用介面，或 Windows access policy 拒絕。最後 vendor 回報：{last_err}。\
+                 請先完成/取消安全金鑰操作並關閉瀏覽器 WebAuthn/Windows Hello 頁面；勿 force-kill svchost / BioEnrollmentHost。 \
+                 本 CLI 目前走 raw HID；非管理員情境需採用 Windows WebAuthN API backend（Yubico sample 的路徑），或在管理員互動 session 執行。"
             ),
         }
     }
@@ -792,13 +793,15 @@ mod real {
                             return Err(e);
                         }
                         if attempt == MAX_ATTEMPTS {
-                            // 真實原因已由本次 attempt 的 log 確認（FIDO HID open-denied）→
+                            // 本次 attempt 的 log 確認本 process 的 FIDO HID open 被拒（不等於已識別 holder）（FIDO HID open-denied）→
                             // 回傳點名原因的 DeviceOpenDenied，取代 vendor 的模糊 timeout
                             // fallback（U2FToken(NotAllowed) / CancelledByUser）以讓 UI/CLI
-                            // 能直接呈現「handle 被鎖」而非「金鑰拒絕」。
+                            // 能呈現 open denied，而非誤報「金鑰拒絕」。
                             let msg = format!(
                                 "[fido2][contention] op={what} 重試 {MAX_ATTEMPTS}/{MAX_ATTEMPTS} 皆被拒；\
-                                 FIDO HID open 持續被拒（os error 5/32）；vendor 最終={e}"
+                                 FIDO HID open 被 Windows 拒絕（os error 5/32）；vendor 最終={e}。\
+                                 → 對照 Windows WebAuthN/Windows Hello 是否正在使用安全金鑰；\
+                                 先完成/取消該操作；勿強制終止 Windows 系統服務。"
                             );
                             log::error!("{msg}");
                             eprintln!("{msg}");
@@ -1085,6 +1088,23 @@ mod tests {
         assert!(matches!(fresh.get_prf_secret(&reg2.credential_id, Some("12")), Err(FidoError::PinRejected)));
         let s = fresh.get_prf_secret(&reg2.credential_id, Some("1234")).unwrap();
         assert_eq!(s, MockBackend::prf_for_credential(&reg2.credential_id));
+    }
+
+    #[test]
+    fn device_open_denied_guidance_names_windows_broker_without_claiming_known_holder() {
+        let message = FidoError::DeviceOpenDenied {
+            what: "detect".into(),
+            last_err: "U2FToken(NotAllowed)".into(),
+            attempts: 3,
+        }
+        .to_string();
+        assert!(message.contains("Windows WebAuthN"), "{message}");
+        assert!(message.contains("Windows Hello"), "{message}");
+        assert!(!message.contains("taskkill"), "{message}");
+        assert!(
+            !message.contains("handle 被其他 process / USB session 鎖定"),
+            "{message}"
+        );
     }
 
     #[test]
