@@ -1,7 +1,7 @@
 # 可攜式 FIDO2 密碼金庫 v0.1 — NB 桌面驗證步驟（使用者用）
 
 > 適用：Win11-NB，`C:\FidoVault`（portable 資料夾）。完成約 15–20 分鐘。
-> 硬體版 Release GUI 必須以 `--features real-ctap` 建置，從檔案總管啟動時會直接使用實體 FIDO2 金鑰；不需預設環境變數。Debug build 預設為 MockBackend；若要明確跑 mock 流程，設定 `F2V_AUTHENTICATOR=mock`。
+> Windows Release GUI 必須以 `--features real-ctap` 建置；一般權限的檔案總管直接啟動時使用 Windows WebAuthn API，無需環境變數或系統管理員提升。Windows 安全性視窗負責 PIN/UV/觸碰；目標系統需 WebAuthn API v4+。Debug build 預設為 MockBackend；明確跑 mock 流程時設定 `F2V_AUTHENTICATOR=mock`。
 
 ## 驗證前狀態（Coder 已確認 ✅）
 `C:\FidoVault` 內應**恰好只有這三個檔案**（SHA256 與建置機逐一比對一致，測試殘留已清除）：
@@ -71,10 +71,10 @@ F: F1 _ / F2 _ / F3 _
 
 - [ ] **G1** 在 Win11-NB 本機互動桌面確認沒有 `vault_cli`、`portable-fido-vault` 或 `yk_open_test` 程序；若有，正常關閉，不要 force-kill。
 - [ ] **G2** 關閉 GUI 後備份 `C:\FidoVault\vault.db`，並記下註冊前金鑰槽位數。
-- [ ] **G3** 直接雙擊 `C:\FidoVault\portable-fido-vault.exe`，以主密碼登入 →「金鑰管理」→「＋ 註冊新金鑰」。
-- [ ] **G4** 在 YubiKey Bio 金鑰本體銀色外框感應區及時按指紋；不要改用 Windows Hello。若提示 PIN，只在本機輸入。
+- [ ] **G3** 用一般權限（非系統管理員）的檔案總管直接啟動 `C:\FidoVault\portable-fido-vault.exe`；不設 `F2V_AUTHENTICATOR`。啟動診斷應顯示 `GUI FIDO backend selected: windows-webauthn`。以主密碼登入。
+- [ ] **G4** 進入「金鑰管理」→「＋ 註冊新金鑰」。依 Windows 安全性視窗選用外接安全金鑰，插入 YubiKey Bio，按視窗提示觸碰／按指紋；PIN 若有要求，只在本機系統視窗輸入，不要改用 Windows Hello。
 - [ ] **G5** 確認 UI 顯示「已註冊」、金鑰出現在清單，且槽位數比註冊前增加 1。
-- [ ] **G6** 上鎖後用新金鑰登入，確認 Gate 3 完整通過；如要驗證 Gate 4，再註冊第二支支援 PRF 的實體金鑰並交叉登入。
+- [ ] **G6** 上鎖後用新金鑰登入，確認 Gate 3 完整通過；若有已知可用的舊 raw-CTAP 金鑰槽，也先用它登入一次以驗證跨 backend 的舊槽相容性。若要驗證 Gate 4，再註冊第二支支援 PRF 的實體金鑰並交叉登入。
 
 若視窗未啟動或金鑰未要求互動，保留目前 vault 備份並回報 UI 狀態；不要移除任何無法辨識的槽位。
 

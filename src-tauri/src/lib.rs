@@ -6,13 +6,17 @@ use tauri::Manager;
 
 #[cfg(feature = "mock-fido")]
 use crate::fido2::MockBackend;
-#[cfg(feature = "real-ctap")]
+#[cfg(all(feature = "real-ctap", not(windows)))]
 use crate::fido2::RealBackend;
+#[cfg(all(feature = "real-ctap", windows))]
+use crate::windows_webauthn::WindowsWebAuthnBackend;
 
 pub mod crypto;
 #[cfg(feature = "real-ctap")]
 pub mod diag_log;
 pub mod fido2;
+#[cfg(all(windows, feature = "real-ctap"))]
+mod windows_webauthn;
 pub mod vault;
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -85,9 +89,9 @@ fn resolve_backend_mode(
     }
 }
 
-/// In release builds, hardware-capable GUIs default to real CTAP so Explorer launches need no env setup.
+/// On Windows, Release hardware GUI uses the brokered WebAuthn API for standard-user launches.
 /// Debug builds retain MockBackend by default; F2V_AUTHENTICATOR=hw/mock remains an explicit override.
-fn make_backend() -> Result<Box<dyn fido2::FidoBackend>> {
+fn make_backend(window_handle: isize) -> Result<Box<dyn fido2::FidoBackend>> {
     let env_override = std::env::var("F2V_AUTHENTICATOR").ok();
     let mode = resolve_backend_mode(
         env_override.as_deref(),
@@ -98,13 +102,22 @@ fn make_backend() -> Result<Box<dyn fido2::FidoBackend>> {
 
     match mode {
         BackendMode::Hardware => {
-            log::info!("GUI FIDO backend selected: real-ctap");
-            #[cfg(feature = "real-ctap")]
+            #[cfg(all(windows, feature = "real-ctap"))]
             {
+                log::info!("GUI FIDO backend selected: windows-webauthn");
+                Ok(Box::new(
+                    WindowsWebAuthnBackend::new(window_handle).map_err(|e| e.to_string())?,
+                ))
+            }
+            #[cfg(all(not(windows), feature = "real-ctap"))]
+            {
+                let _ = window_handle;
+                log::info!("GUI FIDO backend selected: raw-ctap");
                 Ok(Box::new(RealBackend::new()))
             }
             #[cfg(not(feature = "real-ctap"))]
             {
+                let _ = window_handle;
                 Err("Hardware FIDO backend is not compiled (missing real-ctap)".into())
             }
         }
@@ -135,10 +148,10 @@ struct AppInner {
 }
 
 impl AppInner {
-    fn new() -> Result<Self> {
+    fn new(window_handle: isize) -> Result<Self> {
         Ok(Self {
             vault: None,
-            backend: make_backend()?,
+            backend: make_backend(window_handle)?,
         })
     }
 }
@@ -337,7 +350,21 @@ pub fn run() {
     diag_log::init();
     tauri::Builder::default()
         .setup(|app| {
-            let inner = AppInner::new().map_err(std::io::Error::other)?;
+            #[cfg(windows)]
+            let window_handle = app
+                .get_webview_window("main")
+                .and_then(|window| window.hwnd().ok())
+                .map(|handle| handle.0 as isize)
+                .unwrap_or(0);
+            #[cfg(not(windows))]
+            let window_handle = 0;
+            #[cfg(windows)]
+            if window_handle == 0 {
+                log::warn!(
+                    "Main window HWND unavailable; WebAuthn prompt will use a null parent window"
+                );
+            }
+            let inner = AppInner::new(window_handle).map_err(std::io::Error::other)?;
             app.manage(VaultState(Mutex::new(inner)));
             Ok(())
         })

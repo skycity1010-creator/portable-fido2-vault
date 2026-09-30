@@ -1,0 +1,506 @@
+//! Windows GUI FIDO backend based on Microsoft's WebAuthn API.
+//! The raw CTAP backend remains available for the CLI and diagnostics.
+
+use crate::fido2::{DetectedKey, FidoBackend, FidoError, KeyKind, RegisteredCredential};
+use std::{ffi::c_void, ptr, slice};
+use windows_sys::Win32::Foundation::HWND;
+use windows_sys::Win32::Networking::WindowsWebServices::*;
+use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+
+const RP_ID: &str = "fido-vault.local";
+const ORIGIN: &str = "https://fido-vault.local";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientDataOperation {
+    Create,
+    Get,
+}
+
+fn client_data_json(operation: ClientDataOperation, challenge: &[u8]) -> Vec<u8> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+
+    let ceremony = match operation {
+        ClientDataOperation::Create => "webauthn.create",
+        ClientDataOperation::Get => "webauthn.get",
+    };
+    serde_json::json!({
+        "type": ceremony,
+        "challenge": URL_SAFE_NO_PAD.encode(challenge),
+        "origin": ORIGIN,
+    })
+    .to_string()
+    .into_bytes()
+}
+
+fn hmac_secret_api_supported(api_version: u32) -> bool {
+    // API v4 added get-assertion HMAC-secret/PRF salt input and output fields.
+    api_version >= 4
+}
+
+fn raw_hmac_secret_flag() -> u32 {
+    WEBAUTHN_AUTHENTICATOR_HMAC_SECRET_VALUES_FLAG
+}
+
+fn vault_hmac_salt() -> [u8; 32] {
+    crate::crypto::prf_salt_bytes()
+}
+
+const OP_TIMEOUT_MS: u32 = 90_000;
+const MAX_API_BUFFER: usize = 1024 * 1024;
+
+/// Uses Windows' brokered WebAuthn path so standard-user GUI launches do not open raw HID.
+pub struct WindowsWebAuthnBackend {
+    hwnd: isize,
+    api_version: u32,
+}
+
+impl WindowsWebAuthnBackend {
+    pub fn new(hwnd: isize) -> Result<Self, FidoError> {
+        let api_version = unsafe { WebAuthNGetApiVersionNumber() };
+        if !hmac_secret_api_supported(api_version) {
+            return Err(FidoError::NotSupported(format!(
+                "Windows WebAuthn API v{api_version} lacks HMAC-secret assertion support (requires v4+)"
+            )));
+        }
+        Ok(Self { hwnd, api_version })
+    }
+
+    fn hwnd(&self) -> HWND {
+        if self.hwnd == 0 {
+            unsafe { GetForegroundWindow() }
+        } else {
+            self.hwnd as HWND
+        }
+    }
+
+    fn make_credential(&self, detected: &DetectedKey) -> Result<RegisteredCredential, FidoError> {
+        let challenge = random_bytes(32);
+        let mut client_json = client_data_json(ClientDataOperation::Create, &challenge);
+        let client_data = make_client_data(&mut client_json)?;
+
+        let rp_id = wide(RP_ID);
+        let rp_name = wide("FidoVault");
+        let user_name = wide("vault-user");
+        let user_display_name = wide("FidoVault user");
+        let mut user_id = random_bytes(16);
+        let rp = WEBAUTHN_RP_ENTITY_INFORMATION {
+            dwVersion: WEBAUTHN_RP_ENTITY_INFORMATION_CURRENT_VERSION,
+            pwszId: rp_id.as_ptr(),
+            pwszName: rp_name.as_ptr(),
+            pwszIcon: ptr::null(),
+        };
+        let user = WEBAUTHN_USER_ENTITY_INFORMATION {
+            dwVersion: WEBAUTHN_USER_ENTITY_INFORMATION_CURRENT_VERSION,
+            cbId: user_id.len() as u32,
+            pbId: user_id.as_mut_ptr(),
+            pwszName: user_name.as_ptr(),
+            pwszIcon: ptr::null(),
+            pwszDisplayName: user_display_name.as_ptr(),
+        };
+        let mut cose_parameter = WEBAUTHN_COSE_CREDENTIAL_PARAMETER {
+            dwVersion: WEBAUTHN_COSE_CREDENTIAL_PARAMETER_CURRENT_VERSION,
+            pwszCredentialType: WEBAUTHN_CREDENTIAL_TYPE_PUBLIC_KEY,
+            lAlg: WEBAUTHN_COSE_ALGORITHM_ECDSA_P256_WITH_SHA256,
+        };
+        let cose_parameters = WEBAUTHN_COSE_CREDENTIAL_PARAMETERS {
+            cCredentialParameters: 1,
+            pCredentialParameters: &mut cose_parameter,
+        };
+
+        let mut hmac_secret_requested: windows_sys::core::BOOL = 1;
+        let mut hmac_secret_extension = WEBAUTHN_EXTENSION {
+            pwszExtensionIdentifier: WEBAUTHN_EXTENSIONS_IDENTIFIER_HMAC_SECRET,
+            cbExtension: std::mem::size_of::<windows_sys::core::BOOL>() as u32,
+            pvExtension: (&mut hmac_secret_requested as *mut windows_sys::core::BOOL)
+                .cast::<c_void>(),
+        };
+        let extensions = WEBAUTHN_EXTENSIONS {
+            cExtensions: 1,
+            pExtensions: &mut hmac_secret_extension,
+        };
+        let options = WEBAUTHN_AUTHENTICATOR_MAKE_CREDENTIAL_OPTIONS {
+            dwVersion: WEBAUTHN_AUTHENTICATOR_MAKE_CREDENTIAL_OPTIONS_VERSION_5,
+            dwTimeoutMilliseconds: OP_TIMEOUT_MS,
+            Extensions: extensions,
+            dwAuthenticatorAttachment: WEBAUTHN_AUTHENTICATOR_ATTACHMENT_CROSS_PLATFORM,
+            dwUserVerificationRequirement: WEBAUTHN_USER_VERIFICATION_REQUIREMENT_PREFERRED,
+            dwAttestationConveyancePreference: WEBAUTHN_ATTESTATION_CONVEYANCE_PREFERENCE_NONE,
+            bRequireResidentKey: 0,
+            bPreferResidentKey: 1,
+            ..Default::default()
+        };
+
+        let mut attestation = ptr::null_mut();
+        let hr = unsafe {
+            WebAuthNAuthenticatorMakeCredential(
+                self.hwnd(),
+                &rp,
+                &user,
+                &cose_parameters,
+                &client_data,
+                &options,
+                &mut attestation,
+            )
+        };
+        if hr < 0 {
+            if !attestation.is_null() {
+                unsafe { WebAuthNFreeCredentialAttestation(attestation) };
+            }
+            return Err(api_error("makeCredential", hr));
+        }
+        if attestation.is_null() {
+            return Err(FidoError::Internal(
+                "Windows WebAuthn API returned no credential attestation".into(),
+            ));
+        }
+        let attestation = AttestationGuard(attestation);
+        let att = unsafe { &*attestation.0 };
+        if !hmac_secret_enabled(&att.Extensions) {
+            return Err(FidoError::PrfNotConfirmed);
+        }
+        let credential_id =
+            unsafe { copy_api_bytes(att.pbCredentialId, att.cbCredentialId, "credential ID")? };
+        if credential_id.is_empty() {
+            return Err(FidoError::Internal(
+                "Windows WebAuthn API returned an empty credential ID".into(),
+            ));
+        }
+        let authenticator_data = unsafe {
+            copy_api_bytes(
+                att.pbAuthenticatorData,
+                att.cbAuthenticatorData,
+                "authenticator data",
+            )?
+        };
+        let aaguid = aaguid_from_authenticator_data(&authenticator_data);
+
+        Ok(RegisteredCredential {
+            credential_id,
+            aaguid,
+            label: detected.label.clone(),
+            kind: detected.kind,
+        })
+    }
+
+    fn get_hmac_secret(&self, credential_id: &[u8]) -> Result<[u8; 32], FidoError> {
+        if credential_id.is_empty() || credential_id.len() > MAX_API_BUFFER {
+            return Err(FidoError::Internal(
+                "credential ID length is invalid".into(),
+            ));
+        }
+        let challenge = random_bytes(32);
+        let mut client_json = client_data_json(ClientDataOperation::Get, &challenge);
+        let client_data = make_client_data(&mut client_json)?;
+
+        let mut salt = vault_hmac_salt();
+        let mut hmac_salt = WEBAUTHN_HMAC_SECRET_SALT {
+            cbFirst: salt.len() as u32,
+            pbFirst: salt.as_mut_ptr(),
+            cbSecond: 0,
+            pbSecond: ptr::null_mut(),
+        };
+        let mut salt_values = WEBAUTHN_HMAC_SECRET_SALT_VALUES {
+            pGlobalHmacSalt: &mut hmac_salt,
+            cCredWithHmacSecretSaltList: 0,
+            pCredWithHmacSecretSaltList: ptr::null_mut(),
+        };
+        let mut credential = WEBAUTHN_CREDENTIAL {
+            dwVersion: WEBAUTHN_CREDENTIAL_CURRENT_VERSION,
+            cbId: credential_id.len() as u32,
+            pbId: credential_id.as_ptr() as *mut u8,
+            pwszCredentialType: WEBAUTHN_CREDENTIAL_TYPE_PUBLIC_KEY,
+        };
+        let credentials = WEBAUTHN_CREDENTIALS {
+            cCredentials: 1,
+            pCredentials: &mut credential,
+        };
+        let options = WEBAUTHN_AUTHENTICATOR_GET_ASSERTION_OPTIONS {
+            dwVersion: WEBAUTHN_AUTHENTICATOR_GET_ASSERTION_OPTIONS_VERSION_6,
+            dwTimeoutMilliseconds: OP_TIMEOUT_MS,
+            CredentialList: credentials,
+            dwAuthenticatorAttachment: WEBAUTHN_AUTHENTICATOR_ATTACHMENT_CROSS_PLATFORM,
+            dwUserVerificationRequirement: WEBAUTHN_USER_VERIFICATION_REQUIREMENT_PREFERRED,
+            dwFlags: raw_hmac_secret_flag(),
+            pHmacSecretSaltValues: &mut salt_values,
+            ..Default::default()
+        };
+
+        let rp_id = wide(RP_ID);
+        let mut assertion = ptr::null_mut();
+        let hr = unsafe {
+            WebAuthNAuthenticatorGetAssertion(
+                self.hwnd(),
+                rp_id.as_ptr(),
+                &client_data,
+                &options,
+                &mut assertion,
+            )
+        };
+        if hr < 0 {
+            if !assertion.is_null() {
+                unsafe { WebAuthNFreeAssertion(assertion) };
+            }
+            return Err(api_error("getAssertion", hr));
+        }
+        if assertion.is_null() {
+            return Err(FidoError::Internal(
+                "Windows WebAuthn API returned no assertion".into(),
+            ));
+        }
+        let assertion = AssertionGuard(assertion);
+        let result = unsafe { &*assertion.0 };
+        if result.pHmacSecret.is_null() {
+            return Err(FidoError::Internal(
+                "security key returned no hmac-secret output".into(),
+            ));
+        }
+        let output = unsafe { &*result.pHmacSecret };
+        if output.cbFirst != 32 || output.pbFirst.is_null() {
+            return Err(FidoError::Internal(format!(
+                "Windows WebAuthn API returned an invalid hmac-secret length ({})",
+                output.cbFirst
+            )));
+        }
+        let bytes = unsafe { slice::from_raw_parts(output.pbFirst, 32) };
+        let mut secret = [0u8; 32];
+        secret.copy_from_slice(bytes);
+        Ok(secret)
+    }
+}
+
+impl FidoBackend for WindowsWebAuthnBackend {
+    fn detect(&mut self) -> Result<DetectedKey, FidoError> {
+        // The broker owns device selection and prompts during makeCredential/getAssertion.
+        Ok(DetectedKey {
+            kind: KeyKind::WindowsManaged,
+            label: "Windows WebAuthn 安全金鑰".into(),
+            aaguid: [0; 16],
+        })
+    }
+
+    fn register_credential(
+        &mut self,
+        detected: &DetectedKey,
+        _pin: Option<&str>,
+    ) -> Result<RegisteredCredential, FidoError> {
+        self.make_credential(detected)
+    }
+
+    fn get_prf_secret(
+        &mut self,
+        credential_id: &[u8],
+        _pin: Option<&str>,
+    ) -> Result<[u8; 32], FidoError> {
+        self.get_hmac_secret(credential_id)
+    }
+
+    fn peek_kind(&self) -> KeyKind {
+        KeyKind::WindowsManaged
+    }
+
+    fn prf_supported(&self) -> bool {
+        hmac_secret_api_supported(self.api_version)
+    }
+
+    fn enrollment_count(&mut self) -> Option<Result<usize, String>> {
+        // The Windows WebAuthn API intentionally owns the UV flow and does not expose CTAP BioEnrollment.
+        None
+    }
+
+    fn info_diag(&self) -> String {
+        format!(
+            "Windows WebAuthn API version={}; hmac-secret raw-salt",
+            self.api_version
+        )
+    }
+}
+
+struct AttestationGuard(*mut WEBAUTHN_CREDENTIAL_ATTESTATION);
+impl Drop for AttestationGuard {
+    fn drop(&mut self) {
+        unsafe { WebAuthNFreeCredentialAttestation(self.0) };
+    }
+}
+
+struct AssertionGuard(*mut WEBAUTHN_ASSERTION);
+impl Drop for AssertionGuard {
+    fn drop(&mut self) {
+        unsafe { WebAuthNFreeAssertion(self.0) };
+    }
+}
+
+fn make_client_data(json: &mut [u8]) -> Result<WEBAUTHN_CLIENT_DATA, FidoError> {
+    if json.is_empty() || json.len() > MAX_API_BUFFER {
+        return Err(FidoError::Internal(
+            "clientDataJSON length is invalid".into(),
+        ));
+    }
+    Ok(WEBAUTHN_CLIENT_DATA {
+        dwVersion: WEBAUTHN_CLIENT_DATA_CURRENT_VERSION,
+        cbClientDataJSON: json.len() as u32,
+        pbClientDataJSON: json.as_mut_ptr(),
+        pwszHashAlgId: WEBAUTHN_HASH_ALGORITHM_SHA_256,
+    })
+}
+
+fn wide(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+fn random_bytes(len: usize) -> Vec<u8> {
+    use rand::RngCore;
+    let mut bytes = vec![0u8; len];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    bytes
+}
+
+fn aaguid_from_authenticator_data(data: &[u8]) -> [u8; 16] {
+    let mut aaguid = [0u8; 16];
+    // AuthenticatorData: rpIdHash[32], flags[1], signCount[4], then AAGUID[16] if AT=1.
+    if data.len() >= 53 && data[32] & 0x40 != 0 {
+        aaguid.copy_from_slice(&data[37..53]);
+    }
+    aaguid
+}
+
+unsafe fn copy_api_bytes(ptr: *const u8, len: u32, what: &str) -> Result<Vec<u8>, FidoError> {
+    let len = len as usize;
+    if len > MAX_API_BUFFER || (len > 0 && ptr.is_null()) {
+        return Err(FidoError::Internal(format!(
+            "Windows WebAuthn API returned invalid {what}"
+        )));
+    }
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    Ok(slice::from_raw_parts(ptr, len).to_vec())
+}
+
+unsafe fn api_wide_string(ptr: *const u16) -> Option<String> {
+    if ptr.is_null() {
+        return None;
+    }
+    let mut len = 0usize;
+    while len < 512 && *ptr.add(len) != 0 {
+        len += 1;
+    }
+    if len == 512 {
+        return None;
+    }
+    Some(String::from_utf16_lossy(slice::from_raw_parts(ptr, len)))
+}
+
+fn hmac_secret_enabled(extensions: &WEBAUTHN_EXTENSIONS) -> bool {
+    if extensions.cExtensions == 0
+        || extensions.cExtensions > 32
+        || extensions.pExtensions.is_null()
+    {
+        return false;
+    }
+    for index in 0..extensions.cExtensions as usize {
+        let extension = unsafe { &*extensions.pExtensions.add(index) };
+        let identifier = unsafe { api_wide_string(extension.pwszExtensionIdentifier) };
+        if identifier.as_deref() == Some("hmac-secret")
+            && extension.cbExtension >= std::mem::size_of::<windows_sys::core::BOOL>() as u32
+            && !extension.pvExtension.is_null()
+        {
+            return unsafe { *extension.pvExtension.cast::<windows_sys::core::BOOL>() != 0 };
+        }
+    }
+    false
+}
+
+fn api_error(operation: &str, hr: windows_sys::core::HRESULT) -> FidoError {
+    let name = unsafe { api_wide_string(WebAuthNGetErrorName(hr)) }
+        .unwrap_or_else(|| "unknown WebAuthn error".into());
+    FidoError::Internal(format!(
+        "Windows WebAuthn {operation} failed: {name} (HRESULT 0x{:08X})",
+        hr as u32
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use serde_json::Value;
+
+    #[test]
+    fn create_client_data_uses_stable_rp_origin_and_challenge() {
+        let challenge = [0x5a; 32];
+        let value: Value =
+            serde_json::from_slice(&client_data_json(ClientDataOperation::Create, &challenge))
+                .unwrap();
+        assert_eq!(value["type"], "webauthn.create");
+        assert_eq!(value["challenge"], URL_SAFE_NO_PAD.encode(challenge));
+        assert_eq!(value["origin"], ORIGIN);
+        assert_eq!(ORIGIN, format!("https://{RP_ID}"));
+    }
+
+    #[test]
+    fn get_client_data_uses_authentication_type() {
+        let value: Value =
+            serde_json::from_slice(&client_data_json(ClientDataOperation::Get, &[1, 2, 3]))
+                .unwrap();
+        assert_eq!(value["type"], "webauthn.get");
+        assert_eq!(value["challenge"], URL_SAFE_NO_PAD.encode([1, 2, 3]));
+    }
+
+    #[test]
+    fn prf_hmac_secret_requires_windows_api_version_four() {
+        assert!(!hmac_secret_api_supported(0));
+        assert!(!hmac_secret_api_supported(3));
+        assert!(hmac_secret_api_supported(4));
+        assert!(hmac_secret_api_supported(9));
+    }
+
+    #[test]
+    fn hmac_secret_uses_the_existing_raw_vault_salt() {
+        assert_eq!(vault_hmac_salt(), crate::crypto::prf_salt_bytes());
+        assert_eq!(vault_hmac_salt().len(), 32);
+        assert_eq!(
+            raw_hmac_secret_flag(),
+            WEBAUTHN_AUTHENTICATOR_HMAC_SECRET_VALUES_FLAG
+        );
+    }
+
+    #[test]
+    fn aaguid_is_read_only_when_attested_credential_data_is_present() {
+        let mut auth_data = vec![0u8; 53];
+        auth_data[32] = 0x40;
+        auth_data[37..53].copy_from_slice(&[0xA5; 16]);
+        assert_eq!(aaguid_from_authenticator_data(&auth_data), [0xA5; 16]);
+
+        auth_data[32] = 0;
+        assert_eq!(aaguid_from_authenticator_data(&auth_data), [0; 16]);
+    }
+
+    #[test]
+    fn registration_requires_positive_hmac_secret_extension_output() {
+        let id = wide("hmac-secret");
+        let mut enabled: windows_sys::core::BOOL = 1;
+        let mut extension = WEBAUTHN_EXTENSION {
+            pwszExtensionIdentifier: id.as_ptr(),
+            cbExtension: std::mem::size_of::<windows_sys::core::BOOL>() as u32,
+            pvExtension: (&mut enabled as *mut windows_sys::core::BOOL).cast::<c_void>(),
+        };
+        let extensions = WEBAUTHN_EXTENSIONS {
+            cExtensions: 1,
+            pExtensions: &mut extension,
+        };
+        assert!(hmac_secret_enabled(&extensions));
+        let mut disabled: windows_sys::core::BOOL = 0;
+        let mut disabled_extension = WEBAUTHN_EXTENSION {
+            pwszExtensionIdentifier: id.as_ptr(),
+            cbExtension: std::mem::size_of::<windows_sys::core::BOOL>() as u32,
+            pvExtension: (&mut disabled as *mut windows_sys::core::BOOL).cast::<c_void>(),
+        };
+        let disabled_extensions = WEBAUTHN_EXTENSIONS {
+            cExtensions: 1,
+            pExtensions: &mut disabled_extension,
+        };
+        assert!(!hmac_secret_enabled(&disabled_extensions));
+    }
+}

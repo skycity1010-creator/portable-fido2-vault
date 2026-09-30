@@ -210,6 +210,9 @@ async function registerKey() {
   try {
     const det = await invoke("detect_key");
     let pin = null;
+    if (det.key_type === "windows_managed") {
+      $("register-status").textContent = "請依 Windows 安全性視窗提示完成金鑰驗證";
+    }
     if (det.key_type === "pin") {
       pin = prompt(`「${det.label}」為 PIN 型金鑰 — 請輸入 PIN：`);
       if (pin === null) return; // 取消
