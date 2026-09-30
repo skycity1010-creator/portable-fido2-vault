@@ -38,11 +38,14 @@ log = { version = "0.4", features = ["std"] }
 # c_void handle cast 的 vendor patch（Rust 1.98 as_raw_handle 回傳型別差異），見 device.rs。
 authenticator = { path = "../vendor/authenticator-rs", optional = true, default-features = false, features = ["crypto_rust"] }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Networking_WindowsWebServices", "Win32_UI_WindowsAndMessaging"] }
+
 [features]
 default = ["mock-fido"]
 # mock-fido: 以軟體金鑰（實作 hmac-secret 語義）替代實體 CTAP2，供無硬體環境端到端驗證
 mock-fido = []
-# real-ctap: 實體 FIDO2 金鑰後端（CTAP2 getInfo/bioEnrollment/makeCredential/getAssertion+hmac-secret）
+# real-ctap: 實體 FIDO2 後端；CLI/診斷用 raw CTAP，Windows GUI 走系統 WebAuthn API
 real-ctap = ["dep:authenticator"]
 
 [profile.release]

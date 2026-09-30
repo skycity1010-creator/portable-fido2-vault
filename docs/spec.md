@@ -57,7 +57,7 @@ offset   size   field
   "key_slots": [
     {
       "credential_id": "<b64url>", "aaguid": "<hex32>",
-      "label": "YubiKey 5C", "key_type": "fingerprint|pin|touch_only",
+      "label": "YubiKey 5C", "key_type": "fingerprint|pin|touch_only|windows_managed",
       "nonce": "<b64 12B>", "ct": "<b64 AES-GCM(KEK)>"
     }
   ],
@@ -94,14 +94,12 @@ offset   size   field
 ## 5. FIDO2 偵測與登入流程
 
 ### 5.1 註冊（金庫已解鎖時）
-0. **PRF 強制檢查**（產品決策 2026-09-27）：`getInfo.options["hmac-secret"]` 為 false → **拒絕註冊**，UI 顯示明確原因（「此金鑰不支援 hmac-secret/PRF extension，無法用來解鎖離線金庫」）。→ 所有已註冊金鑰皆可單獨解鎖。
-1. `authenticatorGetInfo`：讀 versions / options.clientPin / pinProtocols / aaguid。
-2. 類型判定（依卡 spec 順序）：
-   - CTAP2.1 `authenticatorBioEnrollment` getModality 回傳 fingerprint → **指紋型**
-   - 否則 clientPin=true 且 pinProtocols 非空 → **PIN 型**
-   - 否則 → **touch-only**
-3. `makeCredential(rp_id="f2vlt.local", user, pubKeyCredParams=[ES256], residentKey=required, extensions={hmac-secret})` → 取 credentialId + aaguid。
-4. 以該金鑰的 PRF secret（固定 salt）派生槽位金流，包裝 KEK，寫入 header.key_slots；audit `key_registered`（含 label、type）。
+0. **PRF 強制檢查**：CLI raw-CTAP backend 可由 `getInfo.extensions` 預先判定；Windows GUI 的 WebAuthn API 不提供 CTAP `getInfo`，因此在建立 credential 時要求 `hmac-secret`，並檢查 authenticator 的正向 extension output。若未回報支援，拒絕建立 vault slot；因 API 無預查能力，authenticator 端可能留下未被金庫採用的 credential。
+1. **Windows GUI**：使用 WebAuthn API v4+，RP ID 固定 `fido-vault.local`，限制 cross-platform authenticator；Windows broker 顯示 PIN/UV/觸碰 UI。
+2. **CLI/診斷**：raw CTAP2 `getInfo` 取得 AAGUID、hmac-secret 能力與 pin/bio flags；用 flags 分類 fingerprint / pin / touch-only。
+3. `makeCredential(rp_id="fido-vault.local", user, pubKeyCredParams=[ES256], residentKey=preferred, extensions={hmac-secret})` → 取 credentialId + aaguid。
+4. Windows GUI assertion 傳遞 vault 固定 salt 並設定 `WEBAUTHN_AUTHENTICATOR_HMAC_SECRET_VALUES_FLAG`，要求 Windows API 使用 raw hmac-secret salt；不套用 WebAuthn PRF 的 salt transform。此點維持既有 raw-CTAP vault slot 相容。
+5. 以 PRF secret 包裝 KEK，寫入 header.key_slots；audit `key_registered`（含 label、type）。
 
 ### 5.2 登入提示（依已存 key_type）
 | type | UI 提示 |
@@ -109,14 +107,15 @@ offset   size   field
 | fingerprint | 「請插入金鑰並**按指紋**」 |
 | pin | 「請插入金鑰並**輸入 PIN**」（UI 收集 PIN → CTAP2 authenticate） |
 | touch_only | 「請插入金鑰並**觸碰**」 |
+| windows_managed | 「請依 Windows 安全性提示完成驗證」 |
 
 ### 5.3 多支金鑰
 每支 credential 獨立槽位；登入畫面列出全部已註冊金鑰（label + type），使用者點選一支 → 依類型提示 → getAssertion。任一支成功即解鎖。
 
-### 5.4 CTAP2 函式庫選型（裁決記錄）
-- **選用 mozilla authenticator-rs (ctap2)**：Windows USB HID 走 UWP `HidDevice` API，**免 admin**（符合 portable 雙擊執行）；原生實作 hmac-secret extension（解鎖關鍵）。
-- 棄用 kanidm webauthn-authenticator-rs：其 `USBTransport` 於 Win10 build 1903+ **需 Administrator** 才列得裝置，且 `GetAssertionRequest` 未實作 extensions（無 PRF/hmac-secret）。
-- 若 ctap2 branch 未暴露 `getBioEnrollment`，自行補 CBOR command 0x09（getModality / getFingerprintSensorInfo）。
+### 5.4 Windows backend 選型
+- **Windows GUI 使用 Microsoft Windows WebAuthn API**：一般使用者權限可透過 Windows broker 執行 MakeCredential/GetAssertion，PIN/UV/觸碰提示由系統 UI 負責；需要 API v4+ 才能取得 HMAC-secret assertion output。
+- **raw CTAP/HID 保留給 CLI 與診斷**：`authenticator-rs` 提供 getInfo、BioEnrollment 和 hmac-secret；但 Windows 對一般程式的 FIDO HID 存取會受權限/使用中裝置限制，不能把此路徑當成一般權限 GUI 的預設。
+- Windows API assertion 設定 `WEBAUTHN_AUTHENTICATOR_HMAC_SECRET_VALUES_FLAG`，明確傳入原始 32-byte vault salt，避免 WebAuthn PRF 的 domain-separated transform 造成既有槽位無法解鎖。
 
 ## 6. 軌跡紀錄（audit）
 

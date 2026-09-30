@@ -2,16 +2,21 @@
 //! 前端純靜態（src/），透過 window.__TAURI__.core.invoke 呼叫。
 
 use std::sync::Mutex;
+use tauri::Manager;
 
 #[cfg(feature = "mock-fido")]
 use crate::fido2::MockBackend;
-#[cfg(feature = "real-ctap")]
+#[cfg(all(feature = "real-ctap", not(windows)))]
 use crate::fido2::RealBackend;
+#[cfg(all(feature = "real-ctap", windows))]
+use crate::windows_webauthn::WindowsWebAuthnBackend;
 
 pub mod crypto;
 #[cfg(feature = "real-ctap")]
 pub mod diag_log;
 pub mod fido2;
+#[cfg(all(windows, feature = "real-ctap"))]
+mod windows_webauthn;
 pub mod vault;
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -46,37 +51,92 @@ pub struct LoginScreenInfo {
     pub idle_lock_minutes: u32,
 }
 
-/// 金鑰後端：依 `F2V_AUTHENTICATOR`（或 CLI `--authenticator`）選 mock / hw。
-/// - `hw` → real CTAP2（YubiKey 等實體金鑰，需 feature real-ctap）。
-/// - `mock` / 未設定 → MockBackend（預設；無硬體環境端到端驗證）。
-fn make_backend() -> Box<dyn fido2::FidoBackend> {
-    let want_hw = std::env::var("F2V_AUTHENTICATOR")
-        .map(|v| v.trim().eq_ignore_ascii_case("hw"))
-        .unwrap_or(false);
+/// Backend policy for the GUI. Keeping this pure makes the release/debug policy testable without hardware.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackendMode {
+    Hardware,
+    Mock,
+}
 
-    #[cfg(feature = "real-ctap")]
-    if want_hw {
-        return Box::new(RealBackend::new());
-    }
-    #[allow(unreachable_code)]
-    {
-        #[cfg(feature = "mock-fido")]
-        {
-            let kind = std::env::var("F2V_MOCK_KIND")
-                .ok()
-                .and_then(|s| fido2::KeyKind::parse(&s));
-            return Box::new(kind.map_or_else(MockBackend::new, |k| MockBackend::new().with_next_kind(k)));
-        }
-        #[cfg(all(feature = "real-ctap", not(feature = "mock-fido")))]
-        {
-            // 只啟用 real-ctap（無 mock）→ hw 是唯一後端。
-            return Box::new(RealBackend::new());
-        }
-    }
+fn resolve_backend_mode(
+    env_override: Option<&str>,
+    debug_build: bool,
+    real_ctap_compiled: bool,
+    mock_compiled: bool,
+) -> Result<BackendMode> {
+    let requested = env_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase);
 
-    #[cfg(not(feature = "mock-fido"))]
-    {
-        unimplemented!("未啟用任何金鑰後端 feature（需 mock-fido 或 real-ctap）")
+    match requested.as_deref() {
+        Some("hw") if real_ctap_compiled => Ok(BackendMode::Hardware),
+        Some("hw") => {
+            Err("F2V_AUTHENTICATOR=hw requires a build with the real-ctap feature".into())
+        }
+        Some("mock") if mock_compiled => Ok(BackendMode::Mock),
+        Some("mock") => {
+            Err("F2V_AUTHENTICATOR=mock requires a build with the mock-fido feature".into())
+        }
+        Some(_) => Err("Unknown F2V_AUTHENTICATOR value; use 'hw' or 'mock'".into()),
+        None if debug_build && mock_compiled => Ok(BackendMode::Mock),
+        None if real_ctap_compiled => Ok(BackendMode::Hardware),
+        None if !debug_build => Err(
+            "Release GUI build is missing the real-ctap feature; refusing to use MockBackend".into(),
+        ),
+        None if mock_compiled => Ok(BackendMode::Mock),
+        None => Err("No FIDO backend is compiled; enable real-ctap or mock-fido".into()),
+    }
+}
+
+/// On Windows, Release hardware GUI uses the brokered WebAuthn API for standard-user launches.
+/// Debug builds retain MockBackend by default; F2V_AUTHENTICATOR=hw/mock remains an explicit override.
+fn make_backend(window_handle: isize) -> Result<Box<dyn fido2::FidoBackend>> {
+    let env_override = std::env::var("F2V_AUTHENTICATOR").ok();
+    let mode = resolve_backend_mode(
+        env_override.as_deref(),
+        cfg!(debug_assertions),
+        cfg!(feature = "real-ctap"),
+        cfg!(feature = "mock-fido"),
+    )?;
+
+    match mode {
+        BackendMode::Hardware => {
+            #[cfg(all(windows, feature = "real-ctap"))]
+            {
+                log::info!("GUI FIDO backend selected: windows-webauthn");
+                Ok(Box::new(
+                    WindowsWebAuthnBackend::new(window_handle).map_err(|e| e.to_string())?,
+                ))
+            }
+            #[cfg(all(not(windows), feature = "real-ctap"))]
+            {
+                let _ = window_handle;
+                log::info!("GUI FIDO backend selected: raw-ctap");
+                Ok(Box::new(RealBackend::new()))
+            }
+            #[cfg(not(feature = "real-ctap"))]
+            {
+                let _ = window_handle;
+                Err("Hardware FIDO backend is not compiled (missing real-ctap)".into())
+            }
+        }
+        BackendMode::Mock => {
+            log::info!("GUI FIDO backend selected: mock-fido");
+            #[cfg(feature = "mock-fido")]
+            {
+                let kind = std::env::var("F2V_MOCK_KIND")
+                    .ok()
+                    .and_then(|value| fido2::KeyKind::parse(&value));
+                Ok(Box::new(kind.map_or_else(MockBackend::new, |kind| {
+                    MockBackend::new().with_next_kind(kind)
+                })))
+            }
+            #[cfg(not(feature = "mock-fido"))]
+            {
+                Err("Mock FIDO backend is not compiled (missing mock-fido)".into())
+            }
+        }
     }
 }
 
@@ -88,8 +148,11 @@ struct AppInner {
 }
 
 impl AppInner {
-    fn new() -> Self {
-        Self { vault: None, backend: make_backend() }
+    fn new(window_handle: isize) -> Result<Self> {
+        Ok(Self {
+            vault: None,
+            backend: make_backend(window_handle)?,
+        })
     }
 }
 
@@ -286,7 +349,25 @@ pub fn run() {
     #[cfg(feature = "real-ctap")]
     diag_log::init();
     tauri::Builder::default()
-        .manage(VaultState(Mutex::new(AppInner::new())))
+        .setup(|app| {
+            #[cfg(windows)]
+            let window_handle = app
+                .get_webview_window("main")
+                .and_then(|window| window.hwnd().ok())
+                .map(|handle| handle.0 as isize)
+                .unwrap_or(0);
+            #[cfg(not(windows))]
+            let window_handle = 0;
+            #[cfg(windows)]
+            if window_handle == 0 {
+                log::warn!(
+                    "Main window HWND unavailable; WebAuthn prompt will use a null parent window"
+                );
+            }
+            let inner = AppInner::new(window_handle).map_err(std::io::Error::other)?;
+            app.manage(VaultState(Mutex::new(inner)));
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             boot_info,
             create_vault,
@@ -305,4 +386,70 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod backend_mode_tests {
+    use super::{resolve_backend_mode, BackendMode};
+
+    #[test]
+    fn unset_uses_current_build_profile_default() {
+        let actual = resolve_backend_mode(
+            None,
+            cfg!(debug_assertions),
+            cfg!(feature = "real-ctap"),
+            cfg!(feature = "mock-fido"),
+        );
+        if cfg!(debug_assertions) && cfg!(feature = "mock-fido") {
+            assert_eq!(actual, Ok(BackendMode::Mock));
+        } else if cfg!(feature = "real-ctap") {
+            assert_eq!(actual, Ok(BackendMode::Hardware));
+        } else {
+            assert!(actual.is_err());
+        }
+    }
+
+    #[test]
+    fn unset_debug_build_defaults_to_mock() {
+        assert_eq!(
+            resolve_backend_mode(None, true, true, true),
+            Ok(BackendMode::Mock)
+        );
+    }
+
+    #[test]
+    fn unset_release_with_real_ctap_defaults_to_hardware() {
+        assert_eq!(
+            resolve_backend_mode(None, false, true, true),
+            Ok(BackendMode::Hardware)
+        );
+    }
+
+    #[test]
+    fn explicit_mock_overrides_release_hardware_default() {
+        assert_eq!(
+            resolve_backend_mode(Some("mock"), false, true, true),
+            Ok(BackendMode::Mock)
+        );
+    }
+
+    #[test]
+    fn explicit_hardware_requires_real_ctap() {
+        assert_eq!(
+            resolve_backend_mode(Some(" HW "), true, true, true),
+            Ok(BackendMode::Hardware)
+        );
+        assert!(resolve_backend_mode(Some("hw"), false, false, true).is_err());
+    }
+
+    #[test]
+    fn unavailable_mock_and_unknown_modes_are_rejected() {
+        assert!(resolve_backend_mode(Some("mock"), true, true, false).is_err());
+        assert!(resolve_backend_mode(Some("typo"), false, true, true).is_err());
+    }
+
+    #[test]
+    fn release_without_real_ctap_does_not_silently_select_mock() {
+        assert!(resolve_backend_mode(None, false, false, true).is_err());
+    }
 }

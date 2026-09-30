@@ -2666,6 +2666,7 @@ dependencies = [
  "sha2",
  "tauri",
  "tauri-build",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 

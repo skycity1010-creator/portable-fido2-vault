@@ -4,8 +4,9 @@
 //!   hmac-secret 語義（PRF secret = HMAC-SHA256(credential_id ‖ PRF_SALT)），
 //!   無硬體環境下 Gate 3/4 仍可端到端驗證；跨行程/重啟結果一致。
 //!   credential_id[0] 為保留位元組，編碼金鑰類型 → 登入時可還原「是否需要 PIN」。
-//! - Real CTAP2 後端：待硬體裁決後接入（CTAP2 getInfo / authenticatorBioEnrollment
-//!   0x09 / makeCredential / getAssertion+hmac-secret）。選型見 docs/spec.md §5.4。
+//! - RealBackend（CLI/診斷）：authenticator-rs raw CTAP2 over HID。
+//! - Windows GUI hardware backend: Windows WebAuthn API broker owns device selection and PIN/UV/touch UI.
+//!   Both paths use the same RP ID and raw hmac-secret salt so existing vault slots remain usable.
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -20,6 +21,8 @@ pub enum KeyKind {
     Pin,
     /// 其他：提示「觸碰金鑰」
     TouchOnly,
+    /// Windows WebAuthn API 管理互動提示（PIN/UV/觸碰由 Windows 安全性 UI 處理）。
+    WindowsManaged,
 }
 
 impl KeyKind {
@@ -38,6 +41,7 @@ impl KeyKind {
             KeyKind::Fingerprint => 0,
             KeyKind::Pin => 1,
             KeyKind::TouchOnly => 2,
+            KeyKind::WindowsManaged => 2,
         }
     }
 
@@ -46,6 +50,7 @@ impl KeyKind {
             KeyKind::Fingerprint => "指紋型",
             KeyKind::Pin => "PIN 型",
             KeyKind::TouchOnly => "觸碰型 (touch-only)",
+            KeyKind::WindowsManaged => "Windows 安全金鑰",
         }
     }
 
@@ -55,6 +60,7 @@ impl KeyKind {
             KeyKind::Fingerprint => "請插入金鑰並按指紋",
             KeyKind::Pin => "請插入金鑰並輸入 PIN",
             KeyKind::TouchOnly => "請插入金鑰並觸碰金屬面",
+            KeyKind::WindowsManaged => "請依 Windows 安全性提示完成驗證",
         }
     }
 
@@ -64,6 +70,7 @@ impl KeyKind {
             "fingerprint" | "fp" => Some(KeyKind::Fingerprint),
             "pin" => Some(KeyKind::Pin),
             "touch_only" | "touch" | "touch-only" => Some(KeyKind::TouchOnly),
+            "windows_managed" | "windows" => Some(KeyKind::WindowsManaged),
             _ => None,
         }
     }
@@ -76,6 +83,7 @@ impl std::fmt::Display for KeyKind {
             KeyKind::Fingerprint => "fingerprint",
             KeyKind::Pin => "pin",
             KeyKind::TouchOnly => "touch_only",
+            KeyKind::WindowsManaged => "windows_managed",
         };
         f.write_str(s)
     }
@@ -103,8 +111,10 @@ pub enum FidoError {
     NoDevice,
     PinRequired(String),
     PinRejected,
-    /// 金鑰不支援 hmac-secret/PRF → 依產品決策**拒絕註冊**（UI 顯示原因）。
+    /// 金鑰不支援 hmac-secret/PRF → 依產品決策拒絕寫入 vault slot。
     PrfNotSupported,
+    /// Windows WebAuthn 未回報 hmac-secret 建立成功；系統端可能已留下一個無 vault slot 的 credential。
+    PrfNotConfirmed,
     NotSupported(String),
     Internal(String),
     /// FIDO HID open 被 Win32 拒絕（os error 5/32）：只證明此次 open 失敗，不代表已識別 holder；
@@ -125,7 +135,11 @@ impl std::fmt::Display for FidoError {
             Self::PinRejected => write!(f, "PIN 錯誤，請重試"),
             Self::PrfNotSupported => write!(
                 f,
-                "此金鑰不支援 hmac-secret/PRF extension，無法用來解鎖離線金庫（拒絕註冊）。請改用支援 PRF 的金鑰（例：YubiKey 5+）"
+                "此金鑰不支援 hmac-secret/PRF extension，無法用來解鎖離線金庫（未建立 vault slot）。請改用支援 PRF 的金鑰（例：YubiKey 5+）"
+            ),
+            Self::PrfNotConfirmed => write!(
+                f,
+                "Windows WebAuthn 未確認此金鑰支援 hmac-secret/PRF；vault 未新增金鑰槽，但金鑰端可能已建立一筆未被金庫使用的 credential。"
             ),
             Self::NotSupported(m) => write!(f, "不支援：{m}"),
             Self::Internal(m) => write!(f, "FIDO2 內部錯誤：{m}"),
@@ -145,15 +159,22 @@ impl std::error::Error for FidoError {}
 /// FIDO2 後端 trait。`get_prf_secret` 對應 CTAP2 getAssertion + hmac-secret extension
 /// （固定 salt = crate::crypto::PRF_SALT），回傳 32-byte secret → HKDF → KEK。
 pub trait FidoBackend: Send {
-    /// 偵測目前金鑰類型（CTAP2 getInfo / getBioEnrollment）。
+    /// 偵測/分類金鑰；raw CTAP 後端用 getInfo/bioEnroll，Windows WebAuthn 由系統 broker 延後選擇裝置。
     fn detect(&mut self) -> Result<DetectedKey, FidoError>;
 
-    /// 註冊新 credential（makeCredential，resident + hmac-secret extension）。
-    /// PIN 型金鑰需提供 pin（makeCredential 需與 token 建立安全通道）。
-    fn register_credential(&mut self, detected: &DetectedKey, pin: Option<&str>) -> Result<RegisteredCredential, FidoError>;
+    /// 註冊新 credential（makeCredential + hmac-secret）。Windows backend 的 PIN/UV/觸碰由系統 UI 處理。
+    fn register_credential(
+        &mut self,
+        detected: &DetectedKey,
+        pin: Option<&str>,
+    ) -> Result<RegisteredCredential, FidoError>;
 
-    /// 取 PRF secret（getAssertion + hmac-secret）。PIN 型金鑰需先提供 PIN。
-    fn get_prf_secret(&mut self, credential_id: &[u8], pin: Option<&str>) -> Result<[u8; 32], FidoError>;
+    /// 取 PRF secret（getAssertion + hmac-secret）；Windows backend 忽略 app PIN，交由系統 UI 處理。
+    fn get_prf_secret(
+        &mut self,
+        credential_id: &[u8],
+        pin: Option<&str>,
+    ) -> Result<[u8; 32], FidoError>;
 
     /// 預覽「下一支」偵測到的金鑰類型（**不消耗狀態**，供 UI 決定要不要收 PIN）。
     /// 實體後端回目前金鑰類型；mock 回循環中的下一個。
@@ -161,8 +182,8 @@ pub trait FidoBackend: Send {
         KeyKind::TouchOnly
     }
 
-    /// 是否支援 hmac-secret/PRF（CTAP2 getInfo options["hmac-secret"]）。
-    /// **產品決策：不支援 PRF 的金鑰拒絕註冊**（無法解鎖離線金庫）。
+    /// 目前 backend 是否能執行 hmac-secret/PRF：raw CTAP 依 getInfo，Windows WebAuthn 依 OS API 版本。
+    /// Windows WebAuthn 對實際 authenticator 的能力仍須由註冊結果確認。
     fn prf_supported(&self) -> bool {
         false
     }
@@ -370,7 +391,8 @@ mod real {
     impl RealBackend {
         pub fn new() -> Self {
             let mut service = AuthenticatorService::new().expect("authenticator service init");
-            // Windows：Win32 HID transport（CreateFile + usage page 檢查，免 admin）。
+            // Windows raw HID transport（CLI/診斷用；一般權限會受 Windows FIDO access policy 限制）。
+            // Windows GUI 改走 WebAuthn broker，不由這個 backend 開 HID。
             service.add_u2f_usb_hid_platform_transports();
             // [vendor patch] Targeted HID filter: open only Yubico (VID 0x1050)
             // HID interfaces — never the laptop's keyboard/mouse/touchpad.
@@ -1114,5 +1136,10 @@ mod tests {
         assert!(KeyKind::Fingerprint.prompt_zh().contains("指紋"));
         assert!(KeyKind::Pin.prompt_zh().contains("PIN"));
         assert!(KeyKind::TouchOnly.prompt_zh().contains("觸碰"));
+        assert_eq!(
+            KeyKind::parse("windows_managed"),
+            Some(KeyKind::WindowsManaged)
+        );
+        assert!(KeyKind::WindowsManaged.prompt_zh().contains("Windows"));
     }
 }

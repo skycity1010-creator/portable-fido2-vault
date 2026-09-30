@@ -1,6 +1,6 @@
 # 可攜式 FIDO2 密碼金庫（portable-fido2-vault）— 專案彙整文件
 
-> 彙整日期：2026-09-29｜建置機：WS2｜部署/驗證機：Win11-NB（`C:\FidoVault`）
+> 彙整日期：2026-10-01｜建置機：WS2｜部署/驗證機：Win11-NB（`C:\FidoVault`）
 > 本檔彙整 README.md、docs/spec.md、docs/user-verification-steps.md 與近期修復紀錄（§9），
 > 作為單一入口文件；細節以各原始文件為準。
 
@@ -11,7 +11,7 @@ Windows 桌面、**完全離線**、**portable 免安裝**的 FIDO2 密碼金庫
 
 - 首次執行建立帳號：主密碼經 **Argon2id** 派生金鑰
 - 之後**主密碼或任一支已註冊 FIDO2 金鑰**皆可登入（允許多支）
-- 金鑰類型自動偵測：**指紋型 / PIN 型 / touch-only**，登入時依類型給提示
+- 金鑰類型：raw CTAP 可辨識指紋型 / PIN 型 / touch-only；Windows GUI 使用 `windows_managed`，由 Windows broker 提示驗證。
 - **僅接受支援 CTAP2 hmac-secret/PRF 的金鑰**（如 YubiKey 5+）；不支援者拒絕註冊並顯示原因
 - 加密：Argon2id + **AES-256-GCM**，整個金庫加密為單一檔案 `vault.db`
 - CRUD ＋ created_at/updated_at ＋ 軌跡紀錄（絕不明文記錄密碼）＋ 閒置自動上鎖
@@ -33,7 +33,8 @@ portable-fido2-vault/
 │  ├─ src/lib.rs              Tauri commands + VaultState（Mutex）+ make_backend
 │  ├─ src/vault.rs            金庫格式 / 載入 / 建立 / 加密落盤
 │  ├─ src/crypto.rs           Argon2id / AES-256-GCM / HKDF
-│  ├─ src/fido2.rs            FidoBackend trait + MockBackend / RealBackend（CTAP2）
+│  ├─ src/fido2.rs            FidoBackend trait + MockBackend / RealBackend（CLI raw CTAP）
+│  ├─ src/windows_webauthn.rs  Windows GUI broker backend + raw-salt hmac-secret
 │  ├─ src/diag_log.rs         診斷 log（real-ctap feature）
 │  └─ examples/vault_cli.rs   E2E 測試 CLI（Gate 驗證用）
 ├─ scripts/
@@ -45,8 +46,7 @@ portable-fido2-vault/
 
 - **狀態**：解鎖後 KEK（32B，`Zeroizing<[u8;32]>`）與金庫資料僅存於記憶體；上鎖即清零。
 - **落盤策略**：任何變更 → 以記憶體 KEK 重新加密整個 payload → 暫存檔 + rename 原子寫入。
-- **後端選擇**：`make_backend()` 依 `F2V_AUTHENTICATOR=hw`（或 CLI `--authenticator hw`）選
-  RealBackend；未設定走 MockBackend。`real-ctap` feature 控制 RealBackend 是否編入。
+- **後端選擇**：Windows GUI Release 若編入 `real-ctap`，未設定環境變數時預設使用 Windows WebAuthn API；Windows 安全性視窗管理金鑰選擇與 PIN/UV/觸碰。此路徑供一般權限的 Explorer 啟動；要求 WebAuthn API v4+。Debug 預設 MockBackend。`F2V_AUTHENTICATOR=mock|hw` 可明確覆寫；Release 缺少 `real-ctap` 時拒絕啟動。`vault_cli --authenticator hw` 仍走 authenticator-rs raw CTAP/HID，不等同 GUI backend。
 
 ## 3. 金庫格式與加密（vault.db v1）
 
@@ -67,18 +67,18 @@ offset   size   field
 | PRF salt（固定） | `f2vlt-prf-salt-v1`（32B domain separation，非機密） |
 
 - **密碼登入**：Argon2id → AES-GCM 解 password_slot.ct → KEK → 解 payload。
-- **金鑰登入**：CTAP2 getAssertion(allow=[cred_id], hmac-secret) → S(32B) → HKDF → 解該槽 → KEK。
+- **金鑰登入**：Windows GUI 透過 Windows WebAuthn API `GetAssertion` 取得 hmac-secret，明確要求 raw salt 以保持 vault slot 相容；CLI 直接執行 CTAP2 `getAssertion(allow=[cred_id], hmac-secret)`。兩者回傳 S(32B) → HKDF → 解該槽 ct → KEK。
 - **設計要點（仿 LUKS 多槽位）**：KEK 從不明文落盤；每個解鎖方式各自包裝同一份 KEK；
   增刪金鑰只改 header、不需重加密 payload。
 
 ## 4. FIDO2 流程
 
 ### 註冊（金庫已解鎖）
-0. **PRF 強制檢查**：`getInfo.options["hmac-secret"]` 為 false → 拒絕註冊（UI 明示原因）。
-1. `authenticatorGetInfo`：versions / clientPin / pinProtocols / aaguid。
-2. 類型判定：bioEnrollment getModality 回 fingerprint → 指紋型；clientPin+pinProtocols → PIN 型；否則 touch-only。
-3. `makeCredential(rp_id="f2vlt.local", residentKey=required, extensions={hmac-secret})` → credentialId + aaguid。
-4. PRF secret（固定 salt）派生槽位金流 → 包裝 KEK → 寫 header.key_slots；audit `key_registered`。
+0. CLI raw-CTAP 以 `getInfo.extensions` 預查 hmac-secret；Windows GUI 的 WebAuthn API 無 CTAP `getInfo`，註冊時要求 hmac-secret 並檢查 extension output。若 Windows 未確認支援，vault 不寫入槽位，但 authenticator 端可能已留下未採用的 credential。
+1. Windows GUI 使用 WebAuthn API v4+、RP ID `fido-vault.local`、cross-platform attachment；Windows broker 負責選擇外接金鑰及 PIN/UV/觸碰提示。CLI/診斷保留 raw CTAP getInfo / BioEnrollment。
+2. `makeCredential(rp_id="fido-vault.local", residentKey=preferred, extensions={hmac-secret})` → credentialId + AAGUID。
+3. Windows GUI assertion 設 raw HMAC-secret values flag，使用既有 32-byte vault salt，不採用 PRF domain transform；CLI 使用相同 salt 的 CTAP hmac-secret。兩條路徑共用既有 slot 格式。
+4. PRF secret 派生槽位金流 → 包裝 KEK → 寫 header.key_slots；audit `key_registered`。
 
 ### 登入提示
 | type | UI 提示 |
@@ -86,14 +86,14 @@ offset   size   field
 | fingerprint | 「請插入金鑰並**按指紋**」 |
 | pin | 「請插入金鑰並**輸入 PIN**」 |
 | touch_only | 「請插入金鑰並**觸碰**」 |
+| windows_managed | 「請依 Windows 安全性提示完成驗證」 |
 
 多支金鑰：每支獨立槽位，任一支成功即解鎖。
 
-### CTAP2 函式庫選型（裁決）
-選用 **mozilla authenticator-rs (ctap2)**：Windows USB HID 走 UWP HidDevice API **免 admin**
-（portable 雙擊執行）；原生實作 hmac-secret extension。棄用 kanidm webauthn-authenticator-rs
-（Win10 1903+ 列裝置需 admin，且 GetAssertion 未實作 extensions）。已 vendored v0.6.1 +
-一處 Windows c_void handle cast vendor patch（device.rs）。
+### Windows backend 選型
+- Windows GUI Release 使用 Microsoft Windows WebAuthn API，預期支援一般權限直接啟動，不自行開啟 raw HID。
+- `vault_cli --authenticator hw` 及底層診斷保留 mozilla `authenticator-rs` raw CTAP/HID；Windows 對此路徑可能套用存取限制，不能代表 GUI 的一般使用者體驗。
+- WebAuthn API v4+ 可回傳 HMAC-secret assertion；`WEBAUTHN_AUTHENTICATOR_HMAC_SECRET_VALUES_FLAG` 讓 Windows 傳入原始 vault salt，保留舊槽相容性。
 
 ## 5. 安全模型
 
@@ -115,12 +115,14 @@ offset   size   field
 # bash / git-bash（WS2）
 export PATH="$HOME/.cargo/bin:$HOME/tools/winlibs-mingw/mingw64/bin:$PATH"
 cd C:/project/portable-fido2-vault/src-tauri
-cargo +stable-x86_64-pc-windows-gnu build --release --features real-ctap --lib --example vault_cli
+cargo +stable-x86_64-pc-windows-gnu build --release --features real-ctap --bin portable-fido-vault --example vault_cli
 # 產出 target/release/portable-fido-vault.exe + vault_cli.exe
 ```
 
-- `--features real-ctap`：編入實體 YubiKey 後端（**NB 部署必用**；default 為 mock-fido）。
-- 驗證：`cargo test --features real-ctap --lib`（2026-09-29：23 passed / 0 failed）。
+- `--features real-ctap`：編入實體 FIDO2 支援；Windows GUI 使用系統 WebAuthn API，CLI `--authenticator hw` 使用 raw CTAP/HID。
+- Windows Release GUI 無需 `F2V_AUTHENTICATOR` 或系統管理員權限即可走 brokered backend；Debug 預設 mock，mock demo 可明確設 `F2V_AUTHENTICATOR=mock`。
+- 驗證（2026-10-01）：`cargo test --locked --features real-ctap --lib` 37/37；Release backend-mode 7/7；vendor `device_filter` 6/6；Gate E2E 20/20；Windows Release GUI + CLI build 成功。
+- 實體 YubiKey 透過一般權限檔案總管使用 Windows WebAuthn API 的註冊/登入仍待 Win11-NB 互動桌面驗收。
 - 建置檔參數：release `strip + lto`。
 
 ## 7. 部署（Win11-NB，WinRM）
@@ -135,17 +137,17 @@ cargo +stable-x86_64-pc-windows-gnu build --release --features real-ctap --lib -
 - 注意：PS 5.1 讀無 BOM 腳本會當 ANSI(950) 解碼 → 所有遠端 PS 腳本純 ASCII（nb_push.py 已用 base64 內層迴避）。
 - **實體 FIDO2 驗證需互動 session**（WinRM session-0 下 HID 存取行為不同，見 §9 根因）。
 
-## 8. Gate 狀態（截至 2026-09-29）
+## 8. Gate 狀態（截至 2026-10-01）
 
 | Gate | 內容 | 狀態 |
 |---|---|---|
-| 1 | portable + NB 免安裝執行 | ✅（09-27，gate1_screenshot.png） |
-| 2 | 建立帳號/密碼登入/錯誤拒絕 | ✅（mock E2E） |
-| 3 | 金鑰註冊+類型偵測+金鑰登入（實體） | ⚠️ 註冊失敗 → §9 已修，待重測 |
-| 4 | 第二支金鑰/任一支可登入 | ⚠️ 待 §9 重測後進行 |
+| 1 | portable + NB 一般權限直接啟動 | ⚠️ 新 Windows WebAuthn build 尚未部署/互動驗收 |
+| 2 | 建立帳號/密碼登入/錯誤拒絕 | ✅（mock E2E，20/20） |
+| 3 | 金鑰註冊+登入（實體） | ⚠️ Windows WebAuthn backend 已建置，待 Win11-NB 實體驗收 |
+| 4 | 第二支金鑰/任一支可登入 | ⚠️ 待 Gate 3 實體驗收 |
 | 5 | CRUD + 時間戳 | ✅（mock E2E） |
-| 6 | 軌跡完整/無明文密碼 | ✅（mock E2E + grep） |
-| 7 | 閒置自動上鎖 | ✅（GUI 實測） |
+| 6 | 軌跡完整/無明文密碼 | ✅（mock E2E） |
+| 7 | 閒置自動上鎖 | ✅（先前 GUI 實測；新 build 未重測） |
 | 8 | 加密檔直拷別機可解密 | ✅（mock E2E copy-test） |
 
 ## 9. 2026-09-29 Win11-NB log 問題：根因與修復

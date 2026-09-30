@@ -36,8 +36,11 @@ portable-fido2-vault/
 # bash / git-bash（WS2）
 export PATH="$HOME/.cargo/bin:$HOME/tools/winlibs-x86_64-posix-seh-gcc-14.2.0-mingw-w64ucrt-12.0.0-r2/bin:$PATH"
 cd C:/project/portable-fido2-vault/src-tauri
-cargo +stable-x86_64-pc-windows-gnu build --release   # 產出 target/release/portable-fido-vault.exe
+cargo +stable-x86_64-pc-windows-gnu build --release --features real-ctap --bin portable-fido-vault
+# 產出硬體版 GUI；target/release/portable-fido-vault.exe
 ```
+
+Windows Release GUI（`real-ctap`）從檔案總管啟動時使用 Windows WebAuthn API；PIN、指紋與觸碰提示由 Windows 安全性視窗處理，無需設定 `F2V_AUTHENTICATOR` 或以系統管理員身分啟動。目標系統需提供 WebAuthn API v4 或更新版本。Debug 建置仍預設 MockBackend；若需在 Release 明確執行 mock 測試，可設定 `F2V_AUTHENTICATOR=mock`。未設定覆寫值且 Release 缺少 `real-ctap` 時會拒絕啟動。`vault_cli --authenticator hw` 保留 raw CTAP/HID 診斷路徑，與 GUI 使用的 Windows API 不同。
 
 > portable 部署：將 `target\release\portable-fido-vault.exe` 複製到任意資料夾即完成安裝；
 > 首次執行後該資料夾會多出 `vault.db`（你的金庫）。整個資料夾＝全部資產。
@@ -45,7 +48,7 @@ cargo +stable-x86_64-pc-windows-gnu build --release   # 產出 target/release/po
 ## 使用流程
 
 1. **首次執行**：輸入主密碼（兩次）→ 建立 `vault.db` → 可順手註冊 FIDO2 金鑰。
-2. **登入**：主密碼，或點選任一支已註冊金鑰（依類型提示：按指紋 / 輸入 PIN / 觸碰）。
+2. **登入**：主密碼，或選擇已註冊的 FIDO2 金鑰；Windows GUI 依提示開啟 Windows 安全性視窗，由系統處理觸碰／指紋／PIN。
 3. **條目**：新增/編輯/刪除（網站、帳號、密碼、備註），自動記 created_at/updated_at。
 4. **金鑰管理**：註冊新金鑰（自動偵測類型）／移除金鑰（不可逆，需確認）。
 5. **軌跡紀錄**：登入成功/失敗、金鑰註冊/移除、條目增刪改＋時間（不含任何密碼明文）。
