@@ -2,10 +2,31 @@
 //! The raw CTAP backend remains available for the CLI and diagnostics.
 
 use crate::fido2::{DetectedKey, FidoBackend, FidoError, KeyKind, RegisteredCredential};
-use std::{ffi::c_void, ptr, slice};
-use windows_sys::Win32::Foundation::HWND;
+use std::{
+    collections::HashSet,
+    ffi::c_void,
+    ptr, slice,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
+};
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM};
 use windows_sys::Win32::Networking::WindowsWebServices::*;
-use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+};
+use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+use windows_sys::Win32::System::Threading::{
+    GetCurrentProcessId, OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    EnumWindows, GetClassNameW, GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId,
+    IsWindowVisible, SetForegroundWindow,
+};
 
 const RP_ID: &str = "fido-vault.local";
 const ORIGIN: &str = "https://fido-vault.local";
@@ -53,6 +74,409 @@ fn validate_owner_foreground(owner: HWND, foreground: HWND) -> Result<HWND, Fido
         Err(FidoError::Internal(
             "Windows WebAuthn was not started because its owner window is not foreground. Bring FidoVault to the foreground and retry.".into(),
         ))
+    }
+}
+
+fn is_new_windows_security_dialog(
+    title: &str,
+    class_name: &str,
+    process_path: &str,
+    system_directory: &str,
+    visible: bool,
+    current_session: u32,
+    window_session: u32,
+    is_new_window: bool,
+    is_new_process: bool,
+) -> bool {
+    let title_matches = title.trim().eq_ignore_ascii_case("Windows Security")
+        || title.trim().eq_ignore_ascii_case("Windows 安全性");
+    let normalize_path = |path: &str| path.replace('/', "\\").trim_end_matches('\\').to_owned();
+    let expected_path = format!(
+        "{}\\CredentialUIBroker.exe",
+        normalize_path(system_directory)
+    );
+
+    visible
+        && current_session == window_session
+        && is_new_window
+        && is_new_process
+        && title_matches
+        && class_name.eq_ignore_ascii_case("Credential Dialog Xaml Host")
+        && normalize_path(process_path).eq_ignore_ascii_case(&expected_path)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct WindowIdentity {
+    hwnd: isize,
+    process_id: u32,
+    thread_id: u32,
+}
+
+fn is_new_window_identity(identity: WindowIdentity, baseline: &HashSet<WindowIdentity>) -> bool {
+    !baseline.contains(&identity)
+}
+
+fn select_unique_candidate(candidates: &[WindowIdentity]) -> Option<WindowIdentity> {
+    if candidates.len() == 1 {
+        Some(candidates[0])
+    } else {
+        None
+    }
+}
+
+fn should_attempt_dialog_activation(
+    owner: isize,
+    dialog: isize,
+    foreground: isize,
+    cancelled: bool,
+) -> bool {
+    !cancelled && dialog != owner && foreground == owner
+}
+
+fn focus_monitor_timeout() -> Duration {
+    Duration::from_millis(OP_TIMEOUT_MS as u64 + 2_000)
+}
+
+unsafe extern "system" fn collect_top_level_window(
+    hwnd: HWND,
+    lparam: LPARAM,
+) -> windows_sys::core::BOOL {
+    if lparam == 0 {
+        return 0;
+    }
+    let windows = &mut *(lparam as *mut Vec<HWND>);
+    windows.push(hwnd);
+    1
+}
+
+fn top_level_windows() -> Vec<HWND> {
+    let mut windows = Vec::new();
+    unsafe {
+        EnumWindows(
+            Some(collect_top_level_window),
+            (&mut windows as *mut Vec<HWND>) as LPARAM,
+        );
+    }
+    windows
+}
+
+fn window_identity(hwnd: HWND) -> Option<WindowIdentity> {
+    let mut process_id = 0;
+    let thread_id = unsafe { GetWindowThreadProcessId(hwnd, &mut process_id) };
+    (thread_id != 0 && process_id != 0).then_some(WindowIdentity {
+        hwnd: hwnd as isize,
+        process_id,
+        thread_id,
+    })
+}
+
+fn top_level_window_identities() -> HashSet<WindowIdentity> {
+    top_level_windows()
+        .into_iter()
+        .filter_map(window_identity)
+        .collect()
+}
+
+fn credential_broker_process_ids() -> Option<HashSet<u32>> {
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot.is_null() || snapshot as isize == -1 {
+        return None;
+    }
+    let _snapshot = ProcessHandle(snapshot);
+    let mut entry = PROCESSENTRY32W::default();
+    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+    if unsafe { Process32FirstW(snapshot, &mut entry) } == 0 {
+        return None;
+    }
+
+    let mut process_ids = HashSet::new();
+    loop {
+        let name_length = entry
+            .szExeFile
+            .iter()
+            .position(|character| *character == 0)
+            .unwrap_or(entry.szExeFile.len());
+        if String::from_utf16_lossy(&entry.szExeFile[..name_length])
+            .eq_ignore_ascii_case("CredentialUIBroker.exe")
+        {
+            process_ids.insert(entry.th32ProcessID);
+        }
+        if unsafe { Process32NextW(snapshot, &mut entry) } == 0 {
+            break;
+        }
+    }
+    Some(process_ids)
+}
+
+fn system_directory() -> Option<String> {
+    let mut buffer = vec![0u16; 32_768];
+    let length = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
+    if length == 0 || length >= buffer.len() {
+        return None;
+    }
+    Some(String::from_utf16_lossy(&buffer[..length]))
+}
+
+fn process_session(process_id: u32) -> Option<u32> {
+    let mut session_id = 0;
+    (unsafe { ProcessIdToSessionId(process_id, &mut session_id) } != 0).then_some(session_id)
+}
+
+struct ProcessHandle(HANDLE);
+
+impl Drop for ProcessHandle {
+    fn drop(&mut self) {
+        unsafe { CloseHandle(self.0) };
+    }
+}
+
+fn process_image_path(process_id: u32) -> Option<String> {
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
+    if handle.is_null() {
+        return None;
+    }
+    let _handle = ProcessHandle(handle);
+    let mut buffer = vec![0u16; 32_768];
+    let mut length = buffer.len() as u32;
+    if unsafe { QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut length) } == 0
+        || length == 0
+        || length as usize > buffer.len()
+    {
+        return None;
+    }
+    Some(String::from_utf16_lossy(&buffer[..length as usize]))
+}
+
+fn window_text(hwnd: HWND) -> String {
+    let mut buffer = [0u16; 256];
+    let length = unsafe { GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32) };
+    if length <= 0 {
+        String::new()
+    } else {
+        String::from_utf16_lossy(&buffer[..length as usize])
+    }
+}
+
+fn window_class(hwnd: HWND) -> String {
+    let mut buffer = [0u16; 256];
+    let length = unsafe { GetClassNameW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32) };
+    if length <= 0 {
+        String::new()
+    } else {
+        String::from_utf16_lossy(&buffer[..length as usize])
+    }
+}
+
+fn visible_windows_security_dialogs(
+    system_directory: &str,
+    current_session: u32,
+    baseline_windows: &HashSet<WindowIdentity>,
+    baseline_broker_processes: &HashSet<u32>,
+) -> Vec<WindowIdentity> {
+    top_level_windows()
+        .into_iter()
+        .filter(|hwnd| unsafe { IsWindowVisible(*hwnd) } != 0)
+        .filter_map(|hwnd| {
+            let identity = window_identity(hwnd)?;
+            let is_new_window = is_new_window_identity(identity, baseline_windows);
+            let is_new_process = !baseline_broker_processes.contains(&identity.process_id);
+            if !is_new_window || !is_new_process {
+                return None;
+            }
+
+            let title = window_text(hwnd);
+            let class_name = window_class(hwnd);
+            let window_session = process_session(identity.process_id)?;
+            let process_path = process_image_path(identity.process_id)?;
+            is_new_windows_security_dialog(
+                &title,
+                &class_name,
+                &process_path,
+                system_directory,
+                true,
+                current_session,
+                window_session,
+                is_new_window,
+                is_new_process,
+            )
+            .then_some(identity)
+        })
+        .collect()
+}
+
+struct WebAuthnForegroundMonitor {
+    cancelled: Arc<AtomicBool>,
+    armed: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl WebAuthnForegroundMonitor {
+    fn prepare(owner_hwnd: HWND, operation: &'static str) -> Option<Self> {
+        let system_directory = system_directory().or_else(|| {
+            log::warn!("[WebAuthN-focus] could not determine the Windows system directory");
+            None
+        })?;
+        let current_session = process_session(unsafe { GetCurrentProcessId() }).or_else(|| {
+            log::warn!("[WebAuthN-focus] could not determine the current Windows session");
+            None
+        })?;
+        let baseline_windows = top_level_window_identities();
+        let baseline_broker_processes = credential_broker_process_ids().or_else(|| {
+            log::warn!("[WebAuthN-focus] could not snapshot existing broker processes");
+            None
+        })?;
+        log::info!(
+            "[WebAuthN-focus] prepared operation={} session={} baseline_windows={} baseline_broker_processes={}",
+            operation,
+            current_session,
+            baseline_windows.len(),
+            baseline_broker_processes.len(),
+        );
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let armed = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let worker_armed = Arc::clone(&armed);
+        let owner_hwnd_value = owner_hwnd as isize;
+        let worker = match thread::Builder::new()
+            .name("webauthn-security-dialog-focus".into())
+            .spawn(move || {
+                while !worker_armed.load(Ordering::Acquire) {
+                    if worker_cancelled.load(Ordering::Acquire) {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+
+                let deadline = Instant::now() + focus_monitor_timeout();
+                while !worker_cancelled.load(Ordering::Acquire) && Instant::now() < deadline {
+                    let candidates = visible_windows_security_dialogs(
+                        &system_directory,
+                        current_session,
+                        &baseline_windows,
+                        &baseline_broker_processes,
+                    );
+                    if candidates.len() > 1 {
+                        log::warn!(
+                            "[WebAuthN-focus] operation={} found multiple new broker dialogs; leaving them untouched",
+                            operation,
+                        );
+                        return;
+                    }
+                    if let Some(candidate) = select_unique_candidate(&candidates) {
+                        if worker_cancelled.load(Ordering::Acquire) {
+                            return;
+                        }
+                        let hwnd = candidate.hwnd as HWND;
+                        let foreground = unsafe { GetForegroundWindow() } as isize;
+                        if foreground == candidate.hwnd {
+                            log::info!(
+                                "[WebAuthN-focus] operation={} new broker dialog already foreground: hwnd={:#x}",
+                                operation,
+                                candidate.hwnd,
+                            );
+                            return;
+                        }
+                        if !should_attempt_dialog_activation(
+                            owner_hwnd_value,
+                            candidate.hwnd,
+                            foreground,
+                            worker_cancelled.load(Ordering::Acquire),
+                        ) {
+                            log::info!(
+                                "[WebAuthN-focus] operation={} left broker dialog untouched after focus changed: hwnd={:#x} foreground={:#x}",
+                                operation,
+                                candidate.hwnd,
+                                foreground,
+                            );
+                            return;
+                        }
+                        let current_candidates = visible_windows_security_dialogs(
+                            &system_directory,
+                            current_session,
+                            &baseline_windows,
+                            &baseline_broker_processes,
+                        );
+                        if select_unique_candidate(&current_candidates) != Some(candidate)
+                            || window_identity(hwnd) != Some(candidate)
+                            || unsafe { IsWindowVisible(hwnd) } == 0
+                            || worker_cancelled.load(Ordering::Acquire)
+                        {
+                            log::debug!(
+                                "[WebAuthN-focus] operation={} skipped a broker window that changed during validation",
+                                operation,
+                            );
+                            return;
+                        }
+                        let foreground_before = unsafe { GetForegroundWindow() } as isize;
+                        if !should_attempt_dialog_activation(
+                            owner_hwnd_value,
+                            candidate.hwnd,
+                            foreground_before,
+                            worker_cancelled.load(Ordering::Acquire),
+                        ) {
+                            log::info!(
+                                "[WebAuthN-focus] operation={} canceled broker activation because foreground changed: hwnd={:#x} foreground={:#x}",
+                                operation,
+                                candidate.hwnd,
+                                foreground_before,
+                            );
+                            return;
+                        }
+
+                        // Best-effort only: Windows can still change focus after this sample.
+                        let activated = unsafe { SetForegroundWindow(hwnd) } != 0;
+                        let foreground_after = unsafe { GetForegroundWindow() } as isize;
+                        log::info!(
+                            "[WebAuthN-focus] operation={} broker dialog activation attempt: hwnd={:#x} set_foreground={} foreground_after={:#x}",
+                            operation,
+                            candidate.hwnd,
+                            activated,
+                            foreground_after,
+                        );
+                        return;
+                    }
+
+                    if unsafe { GetForegroundWindow() } as isize != owner_hwnd_value {
+                        log::debug!(
+                            "[WebAuthN-focus] operation={} stopped monitoring after FidoVault lost foreground",
+                            operation,
+                        );
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+                log::debug!(
+                    "[WebAuthN-focus] operation={} monitor ended without finding a new trusted dialog",
+                    operation,
+                );
+            })
+        {
+            Ok(worker) => worker,
+            Err(error) => {
+                log::warn!("[WebAuthN-focus] failed to start dialog monitor: {error}");
+                return None;
+            }
+        };
+
+        Some(Self {
+            cancelled,
+            armed,
+            worker: Some(worker),
+        })
+    }
+
+    fn arm(&self) {
+        self.armed.store(true, Ordering::Release);
+    }
+}
+
+impl Drop for WebAuthnForegroundMonitor {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -166,7 +590,12 @@ impl WindowsWebAuthnBackend {
         };
 
         let mut attestation = ptr::null_mut();
+        let owner_for_prepare = self.hwnd()?;
+        let focus_monitor = WebAuthnForegroundMonitor::prepare(owner_for_prepare, "MakeCredential");
         let (owner_hwnd, foreground_before_api) = self.foreground_owner_hwnd()?;
+        if let Some(monitor) = focus_monitor.as_ref() {
+            monitor.arm();
+        }
         let hr = unsafe {
             WebAuthNAuthenticatorMakeCredential(
                 owner_hwnd,
@@ -178,6 +607,7 @@ impl WindowsWebAuthnBackend {
                 &mut attestation,
             )
         };
+        drop(focus_monitor);
         log::info!(
             "Windows WebAuthn MakeCredential owner snapshot captured immediately before API: owner={:p} foreground={:p}",
             owner_hwnd,
@@ -275,7 +705,12 @@ impl WindowsWebAuthnBackend {
 
         let rp_id = wide(RP_ID);
         let mut assertion = ptr::null_mut();
+        let owner_for_prepare = self.hwnd()?;
+        let focus_monitor = WebAuthnForegroundMonitor::prepare(owner_for_prepare, "GetAssertion");
         let (owner_hwnd, foreground_before_api) = self.foreground_owner_hwnd()?;
+        if let Some(monitor) = focus_monitor.as_ref() {
+            monitor.arm();
+        }
         let hr = unsafe {
             WebAuthNAuthenticatorGetAssertion(
                 owner_hwnd,
@@ -285,6 +720,7 @@ impl WindowsWebAuthnBackend {
                 &mut assertion,
             )
         };
+        drop(focus_monitor);
         log::info!(
             "Windows WebAuthn GetAssertion owner snapshot captured immediately before API: owner={:p} foreground={:p}",
             owner_hwnd,
@@ -548,6 +984,177 @@ mod tests {
         let foreground = 2usize as HWND;
         assert!(validate_owner_foreground(owner, owner).is_ok());
         assert!(validate_owner_foreground(owner, foreground).is_err());
+    }
+
+    #[test]
+    fn only_a_new_same_session_system_windows_security_dialog_is_selected() {
+        assert!(is_new_windows_security_dialog(
+            "Windows 安全性",
+            "Credential Dialog Xaml Host",
+            r"C:\Windows\System32\CredentialUIBroker.exe",
+            r"C:\Windows\System32",
+            true,
+            2,
+            2,
+            true,
+            true,
+        ));
+
+        let non_candidates = [
+            (
+                "Windows 安全性",
+                "Credential Dialog Xaml Host",
+                r"C:\Temp\CredentialUIBroker.exe",
+                true,
+                2,
+                2,
+                true,
+            ),
+            (
+                "Other prompt",
+                "Credential Dialog Xaml Host",
+                r"C:\Windows\System32\CredentialUIBroker.exe",
+                true,
+                2,
+                2,
+                true,
+            ),
+            (
+                "Windows 安全性",
+                "Other Window",
+                r"C:\Windows\System32\CredentialUIBroker.exe",
+                true,
+                2,
+                2,
+                true,
+            ),
+            (
+                "Windows 安全性",
+                "Credential Dialog Xaml Host",
+                r"C:\Windows\System32\CredentialUIBroker.exe",
+                false,
+                2,
+                2,
+                true,
+            ),
+            (
+                "Windows 安全性",
+                "Credential Dialog Xaml Host",
+                r"C:\Windows\System32\CredentialUIBroker.exe",
+                true,
+                2,
+                3,
+                true,
+            ),
+            (
+                "Windows 安全性",
+                "Credential Dialog Xaml Host",
+                r"C:\Windows\System32\CredentialUIBroker.exe",
+                true,
+                2,
+                2,
+                false,
+            ),
+        ];
+        for (title, class_name, path, visible, current_session, window_session, is_new) in
+            non_candidates
+        {
+            assert!(!is_new_windows_security_dialog(
+                title,
+                class_name,
+                path,
+                r"C:\Windows\System32",
+                visible,
+                current_session,
+                window_session,
+                is_new,
+                true,
+            ));
+        }
+    }
+
+    #[test]
+    fn broker_dialog_requires_new_process_and_new_window_identity() {
+        let trusted = (
+            "Windows 安全性",
+            "Credential Dialog Xaml Host",
+            r"C:\Windows\System32\CredentialUIBroker.exe",
+            r"C:\Windows\System32",
+            true,
+            2,
+            2,
+        );
+        assert!(is_new_windows_security_dialog(
+            trusted.0, trusted.1, trusted.2, trusted.3, trusted.4, trusted.5, trusted.6, true,
+            true,
+        ));
+        assert!(!is_new_windows_security_dialog(
+            trusted.0, trusted.1, trusted.2, trusted.3, trusted.4, trusted.5, trusted.6, true,
+            false,
+        ));
+        assert!(!is_new_windows_security_dialog(
+            trusted.0, trusted.1, trusted.2, trusted.3, trusted.4, trusted.5, trusted.6, false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn hidden_or_reused_window_identity_is_not_new() {
+        let existing = WindowIdentity {
+            hwnd: 0x1203ce,
+            process_id: 1492,
+            thread_id: 2844,
+        };
+        let baseline = HashSet::from([existing]);
+        assert!(!is_new_window_identity(existing, &baseline));
+        assert!(is_new_window_identity(
+            WindowIdentity {
+                hwnd: existing.hwnd,
+                process_id: 2000,
+                thread_id: 3000,
+            },
+            &baseline,
+        ));
+    }
+
+    #[test]
+    fn ambiguous_broker_candidates_are_not_activated() {
+        let first = WindowIdentity {
+            hwnd: 0x1203ce,
+            process_id: 1492,
+            thread_id: 2844,
+        };
+        let second = WindowIdentity {
+            hwnd: 0xf03fc,
+            process_id: 11064,
+            thread_id: 9552,
+        };
+        assert_eq!(select_unique_candidate(&[first]), Some(first));
+        assert_eq!(select_unique_candidate(&[first, second]), None);
+        assert_eq!(select_unique_candidate(&[]), None);
+    }
+
+    #[test]
+    fn activation_is_skipped_after_focus_changes_or_monitor_cancels() {
+        let owner = 0x1d056c;
+        let dialog = 0x1203ce;
+        assert!(should_attempt_dialog_activation(
+            owner, dialog, owner, false
+        ));
+        assert!(!should_attempt_dialog_activation(
+            owner, dialog, 0xabc, false
+        ));
+        assert!(!should_attempt_dialog_activation(
+            owner, dialog, dialog, false
+        ));
+        assert!(!should_attempt_dialog_activation(
+            owner, dialog, owner, true
+        ));
+    }
+
+    #[test]
+    fn focus_monitor_lifetime_covers_webauthn_timeout() {
+        assert!(focus_monitor_timeout() >= Duration::from_millis(OP_TIMEOUT_MS as u64));
     }
 
     #[test]
