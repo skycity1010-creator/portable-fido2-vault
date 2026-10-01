@@ -158,6 +158,24 @@ button.primary:hover { background: var(--accent-hi); }
   stroke-linejoin: round;
 }
 
+.password-history { margin-top: 10px; }
+.password-history label { display: block; color: var(--muted); font-size: 13px; margin: 10px 0 5px; }
+.password-history-list { display: grid; gap: 6px; }
+.password-history-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 9px;
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.password-history-item button { width: auto; margin: 0; padding: 4px 9px; font-size: 12px; }
+.password-history-list:empty { display: none; }
+
 table { width: 100%; border-collapse: collapse; margin-top: 12px; }
 th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--border); font-size: 13px; }
 th { color: var(--muted); font-weight: 600; }

@@ -14,7 +14,7 @@ Windows 桌面、**完全離線**、**portable 免安裝**的 FIDO2 密碼金庫
 - 金鑰類型：raw CTAP 可辨識指紋型 / PIN 型 / touch-only；Windows GUI 使用 `windows_managed`，由 Windows broker 提示驗證。
 - **僅接受支援 CTAP2 hmac-secret/PRF 的金鑰**（如 YubiKey 5+）；不支援者拒絕註冊並顯示原因
 - 加密：Argon2id + **AES-256-GCM**，整個金庫加密為單一檔案 `vault.db`
-- CRUD ＋ created_at/updated_at ＋ 軌跡紀錄（絕不明文記錄密碼）＋ 閒置自動上鎖
+- CRUD ＋ created_at/updated_at ＋ 每筆條目舊密碼歷史（預設 3 代，可設 1–20）＋ 軌跡紀錄（絕不明文記錄密碼）＋ 閒置自動上鎖
 - ⚠️ **無復原機制**：主密碼遺忘且所有 FIDO2 金鑰全失 = 資料永久無法取回（設計如此，UI 明示）
 
 **非目標（v0.1）**：TOTP、密碼產生器、雲端同步、多使用者、行動裝置。
@@ -121,7 +121,7 @@ cargo +stable-x86_64-pc-windows-gnu build --release --features real-ctap --bin p
 
 - `--features real-ctap`：編入實體 FIDO2 支援；Windows GUI 使用系統 WebAuthn API，CLI `--authenticator hw` 使用 raw CTAP/HID。
 - Windows Release GUI 無需 `F2V_AUTHENTICATOR` 或系統管理員權限即可走 brokered backend；Debug 預設 mock，mock demo 可明確設 `F2V_AUTHENTICATOR=mock`。
-- 驗證（2026-10-01）：`cargo test --locked --features real-ctap --lib` 53/53；Release backend-mode 7/7；vendor `device_filter` 6/6；Gate E2E 20/20；login UI Node tests 4/4；Windows GNU Release GUI + CLI build 成功。
+- 驗證（2026-10-01）：MSVC `cargo test --lib --locked --features real-ctap` 57/57；Release backend-mode 7/7；vendor `device_filter` 6/6；Gate E2E 20/20；login UI Node tests 12/12；password-history defaults/archive/trim/restore tests pass；Windows GNU Release GUI + CLI build 成功。
 - 實體驗收已由使用者在 Win11-NB 互動桌面通過：舊 raw-CTAP 槽可由 Windows WebAuthn 解鎖、新金鑰註冊與登入成功，第二支 YubiKey NFC 交叉登入亦通過；不再執行原 Kanban 規劃的 raw-CTAP CLI 實體路線。
 - 本次單一登入入口/提示前景修改：使用者確認 Console 啟動正常；H1、H3、H4、H5 通過。H2 通用按鈕免選金鑰通過；上一候選的安全性視窗仍在背景。Console 唯讀 EnumWindows 探測確認 FidoVault 前景 z-order 17，獨立 `CredentialUIBroker`「Windows 安全性」視窗 z-order 18、`OWNER=0`。新增窄範圍 best-effort broker-window monitor：baseline 所有 top-level HWND 與既有 broker PID，只針對唯一的新同-session System32 CredentialUIBroker 視窗，在 FidoVault 仍為 foreground 時嘗試一次 SetForegroundWindow；不設 topmost、不用 ASFW_ANY。程式碼獨立審查通過；commit `45d3aa6` 已推至 PR #3 branch；Rust 53/53、UI 4/4、Windows GNU Release build 成功。該 commit 的新 GUI 已部署至 Win11-NB，SHA256 `59BBAB25C21A419702D02FA7E97242392C388149432BAF733AC0C715F06085D8`，6,140,928 bytes；舊 exe 備份 `C:\FidoVault\portable-fido-vault.exe.pre-H2focus-20261001-223428-2985cea4.bak`。vault 備份 `C:\FidoVault\vault.db.pre-H2focus-20261001-223428-2985cea4.bak`；部署前後均為 3 slots、SHA256 `58A1D4877C2274B3D403E1D87CD1E9BA7C5404D450C3F69E1D9486501F02D780`。本機 Console H2 測試已由使用者確認 OK：通用登入免選金鑰，Windows 安全性操作提示置前；H2 驗收通過並結案。前景交接仍是 best-effort。RDP-Tcp#0 Session 2 曾回報 WebAuthn API v1，維持 v4+ fail-closed；RDP redirection 未驗收。
 - 建置檔參數：release `strip + lto`。
@@ -150,6 +150,7 @@ cargo +stable-x86_64-pc-windows-gnu build --release --features real-ctap --bin p
 | 6 | 軌跡完整/無明文密碼 | ✅（mock E2E） |
 | 7 | 閒置自動上鎖 | ✅（先前 GUI 實測；新 build 未重測） |
 | 8 | 加密檔直拷別機可解密 | ✅（mock E2E copy-test） |
+| 9 | 每筆條目舊密碼歷史（預設 3，可設 1–20） | 🟡 Rust/UI/E2E 測試與建置通過；待 Win11-NB 本機 Console 實機驗收 |
 
 ## 9. 2026-09-29 Win11-NB log 問題：根因與修復
 

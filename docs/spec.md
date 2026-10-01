@@ -11,7 +11,7 @@
 - 首次執行建立帳號（主密碼）；之後**主密碼或任一支已註冊 FIDO2 金鑰**皆可登入（允許多支）。
 - 金鑰類型自動偵測：指紋型 / PIN 型 / touch-only；登入時依類型給正確提示。
 - 加密儲存：Argon2id + AES-256-GCM，整個金庫加密為單一檔案。
-- CRUD（網站/帳號/密碼/備註）＋ created_at/updated_at ＋ 軌跡紀錄（絕不明文記錄密碼）＋ 閒置自動上鎖。
+- CRUD（網站/帳號/密碼/備註）＋ created_at/updated_at ＋ 每筆條目舊密碼歷史（預設 3 代，可設 1–20）＋ 軌跡紀錄（絕不明文記錄密碼）＋ 閒置自動上鎖。
 
 **非目標（v0.1）**
 - TOTP、密碼產生器、雲端同步、多使用者、行動裝置。
@@ -70,12 +70,17 @@ offset   size   field
 {
   "entries": [
     { "id": "<hex32>", "site": "", "account": "", "password": "",
+      "password_history": [
+        { "id": "<hex32>", "password": "<prior password>", "archived_at": "RFC3339" }
+      ],
       "notes": "", "created_at": "RFC3339", "updated_at": "RFC3339" }
   ],
   "audit": [ { "ts": "RFC3339", "event": "", "method": "", "detail": "" } ],
-  "settings": { "idle_lock_minutes": 5 }
+  "settings": { "idle_lock_minutes": 5, "password_history_limit": 3 }
 }
 ```
+
+`password_history` 與 `password_history_limit` 位於 AES-GCM 加密 payload，不寫入明文 header 或 audit。向後相容：舊 payload 缺少條目歷史欄位時讀為空清單，缺少保留設定時預設為 3；vault 格式版本仍為 v1。功能啟用前已被覆寫的密碼無法回復。
 
 **設計要點（仿 LUKS 多槽位）**：KEK 是隨機 256-bit，本身從不明文落盤；每個「解鎖方式」（密碼／每支金鑰）各自用不同金流把同一份 KEK 包裝一次。新增/移除金鑰只改 header、不需重加密 payload。
 
@@ -131,6 +136,13 @@ offset   size   field
 - 前端監聽 mousemove/keydown/click 重置計時；逾時 → `invoke('lock', {reason:'idle'})` → Rust 端 audit `auto_lock` + KEK 清零 + 回登入畫面。
 - 手動上鎖鈕 → reason=manual。
 
+### 7.1 舊密碼歷史
+
+- `settings.password_history_limit` 預設 3，範圍 1–20；此上限計算每筆條目的舊密碼數，不含目前密碼。
+- 僅密碼值實際變更時，才把原目前密碼與封存時間加入該條目歷史；網站、帳號、備註修改或相同密碼不新增版本。
+- 降低上限時立即移除最舊超額版本。歷史值仍保存在加密 payload。
+- 編輯畫面列出歷史日期並提供「還原」；使用者按儲存才套用，原目前密碼進入歷史，已還原的版本自歷史移除。
+
 ## 8. 安全模型 / 威脅說明
 
 - 金庫檔案外洩（無任何解鎖因子）→ payload 為 AES-256-GCM，header 僅含包裝槽位，無法取得 KEK。
@@ -151,3 +163,4 @@ offset   size   field
 | 6 軌跡完整/無明文密碼 | vault_cli：解出 audit JSON 檢查 + 檔案 grep 驗證密碼值不出現在 header |
 | 7 閒置自動上鎖 | GUI 計時器（縮短逾時實測）+ lock 命令 |
 | 8 加密檔直拷別機可解密 | vault_cli copy-test：A 建立 → 複製 vault.db 至 B 路徑 → B 同密碼/金鑰登入成功 |
+| 9 舊密碼歷史 | 修改密碼時封存；N=1–20（預設3）；調低立即裁剪；查看日期並還原；舊 payload 預設相容 |
