@@ -97,6 +97,20 @@ $P audit        --path $V --pw Test1234!
 無 FIDO 硬體時，MockBackend（預設）以軟體金鑰實作 hmac-secret 語義，Gate 3/4 仍可端到端驗證；
 有實體 YubiKey 5+ 時切換 real CTAP2 後端實測。
 
+## 加密機制（KEK 與多槽位設計）
+
+仿 LUKS 的「隨機 master key + 多槽位包裝」架構，核心事實如下：
+
+- **KEK（master key）是純隨機數**：`Vault::create()` 首次建立金庫時以 `OsRng`（OS CSPRNG）抽取 256-bit 隨機 KEK，與主密碼無關；之後所有登入都只「解包」同一把 KEK，不會重新產生。
+- **KEK 從不明文落盤**：僅存在於記憶體（`Zeroizing<[u8;32]>`），上鎖／閒置自動上鎖時立即清零。
+- **多槽位包裝（header 明文區）**：每個解鎖方式各自把同一份 KEK 用 AES-256-GCM 包一次，存於 header JSON：
+  - 密碼槽：`Argon2id(pw, salt32B)`（t=3 / m=19456 KiB / p=4）→ 包裝金流 → 解出 KEK
+  - FIDO2 槽：CTAP2 hmac-secret PRF（固定 salt `f2vlt-prf-salt-v1`）→ 32B secret → `HKDF-SHA256(salt="f2vlt-domain-v1", info="f2vlt-kek-wrap-v1")` → 包裝金流 → 解出 KEK
+  - 增刪金鑰只改 header，不需重加密 payload。
+- **payload（機密區）**：整個 vault JSON（entries/audit/settings）以 KEK 做 AES-256-GCM；每次寫入重新抽 12B nonce，tmp + rename 原子落盤。
+- **全有或全無的存取模型**：主密碼或任一支已註冊 FIDO2 金鑰登入後，可取得所有條目的明文密碼（payload 是單一大塊 blob，無欄位級別名）。因此任何一支金鑰洩露 = 整個金庫失守；金鑰丟失或轉讓前務必先「移除金鑰」（不可逆）。
+- **錯誤判別與失敗軌跡**：GCM tag 驗證失敗即視為密碼／金鑰錯誤（不洩漏 timing）；未解鎖狀態的登入失敗寫入 sidecar `vault.db.failures`（僅時間戳＋method，上限 10 筆），成功解鎖後合併進加密 audit 並刪除 sidecar。
+
 ## 安全聲明
 
 - 離線：程式不開啟任何網路連線。
