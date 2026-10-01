@@ -123,7 +123,7 @@ cargo +stable-x86_64-pc-windows-gnu build --release --features real-ctap --bin p
 - Windows Release GUI 無需 `F2V_AUTHENTICATOR` 或系統管理員權限即可走 brokered backend；Debug 預設 mock，mock demo 可明確設 `F2V_AUTHENTICATOR=mock`。
 - 驗證（2026-10-01）：`cargo test --locked --features real-ctap --lib` 42/42；Release backend-mode 7/7；vendor `device_filter` 6/6；Gate E2E 20/20；login UI Node tests 4/4；Windows GNU Release GUI + CLI build 成功。
 - 實體驗收已由使用者在 Win11-NB 互動桌面通過：舊 raw-CTAP 槽可由 Windows WebAuthn 解鎖、新金鑰註冊與登入成功，第二支 YubiKey NFC 交叉登入亦通過；不再執行原 Kanban 規劃的 raw-CTAP CLI 實體路線。
-- 本次單一登入入口/提示前景修改尚待 Win11-NB Console session 驗收，依 `docs/user-verification-steps.md` §H 執行；不得以 mock/CLI 結果代替 Windows broker 前景驗收。已確認 `RDP-Tcp#0` Session 2 的 WebAuthn API 回報 v1，程式依 v4+ fail-closed 而退出；使用者由 Console 啟動可正常開啟。RDP redirection 尚未驗收，不可移除此安全檢查。
+- 本次單一登入入口/提示前景修改：使用者確認 Win11-NB Console 啟動正常；H1、H3、H4、H5 通過。H2 部分通過（通用按鈕免選金鑰已確認；Windows 安全性操作畫面未出現在前景，前景行為仍待釐清與重驗），依 `docs/user-verification-steps.md` §H 繼續驗收。RDP-Tcp#0 Session 2 曾回報 WebAuthn API v1 並依 v4+ fail-closed；RDP redirection 未驗收，不可移除安全檢查。
 - 建置檔參數：release `strip + lto`。
 
 ## 7. 部署（Win11-NB，WinRM）
