@@ -49,6 +49,7 @@ pub struct LoginScreenInfo {
     pub has_vault: bool,
     pub keys: Vec<KeyInfo>,
     pub idle_lock_minutes: u32,
+    pub brokered_key_login: bool,
 }
 
 /// Backend policy for the GUI. Keeping this pure makes the release/debug policy testable without hardware.
@@ -170,6 +171,19 @@ fn path_from_state_or_default() -> std::path::PathBuf {
     dir.join("vault.db")
 }
 
+/// Restore and focus the HWND that owns the Windows WebAuthn security UI.
+fn raise_key_operation_window(window: &tauri::WebviewWindow) {
+    if let Err(error) = window.unminimize() {
+        log::warn!("Could not unminimize the WebAuthn parent window: {error}");
+    }
+    if let Err(error) = window.show() {
+        log::warn!("Could not show the WebAuthn parent window: {error}");
+    }
+    if let Err(error) = window.set_focus() {
+        log::warn!("Could not focus the WebAuthn parent window: {error}");
+    }
+}
+
 // ─────────────────────────── commands ───────────────────────────
 
 /// 啟動畫面資訊：是否有金庫、已註冊金鑰清單（供登入畫面）。
@@ -177,9 +191,18 @@ fn path_from_state_or_default() -> std::path::PathBuf {
 fn boot_info(state: tauri::State<VaultState>) -> Result<LoginScreenInfo> {
     let path = path_from_state_or_default();
     let has_vault = path.exists();
-    let keys = if has_vault { read_keys_from_file(&path)? } else { Vec::new() };
-    let _ = state; // idle 設定需解鎖後才有意義；boot 時回預設 5
-    Ok(LoginScreenInfo { has_vault, keys, idle_lock_minutes: 5 })
+    let keys = if has_vault {
+        read_keys_from_file(&path)?
+    } else {
+        Vec::new()
+    };
+    let brokered_key_login = state.with_lock(|g| Ok(g.backend.uses_brokered_key_selection()))?;
+    Ok(LoginScreenInfo {
+        has_vault,
+        keys,
+        idle_lock_minutes: 5,
+        brokered_key_login,
+    })
 }
 
 /// 讀取 vault.db 的 header（不需 KEK）→ 金鑰清單。
@@ -226,33 +249,77 @@ fn login_password(state: tauri::State<VaultState>, password: String) -> Result<V
     let path = path_from_state_or_default();
     let v = vault::Vault::open_password(&path, &password).map_err(|e| e.to_string())?;
     let entries = v.entries().to_vec();
-    state.with_lock(|g| { g.vault = Some(v); Ok(()) })?;
+    state.with_lock(|g| {
+        g.vault = Some(v);
+        Ok(())
+    })?;
     Ok(entries)
 }
 
 /// FIDO2 金鑰登入。pin：PIN 型金鑰必填；其他類型忽略。
 #[tauri::command]
-fn login_key(state: tauri::State<VaultState>, credential_id: String, pin: Option<String>) -> Result<Vec<vault::Entry>> {
+fn login_key(
+    window: tauri::WebviewWindow,
+    state: tauri::State<VaultState>,
+    credential_id: String,
+    pin: Option<String>,
+) -> Result<Vec<vault::Entry>> {
+    raise_key_operation_window(&window);
     let path = path_from_state_or_default();
     let v = state.with_lock(|g| {
         vault::Vault::open_key(&path, &credential_id, pin.as_deref(), g.backend.as_mut())
             .map_err(|e| e.to_string())
     })?;
     let entries = v.entries().to_vec();
-    state.with_lock(|g| { g.vault = Some(v); Ok(()) })?;
+    state.with_lock(|g| {
+        g.vault = Some(v);
+        Ok(())
+    })?;
+    Ok(entries)
+}
+
+/// FIDO2 key login without a UI-selected key; let the active backend select from every vault slot.
+#[tauri::command]
+fn login_any_key(
+    window: tauri::WebviewWindow,
+    state: tauri::State<VaultState>,
+) -> Result<Vec<vault::Entry>> {
+    raise_key_operation_window(&window);
+    let path = path_from_state_or_default();
+    let v = state.with_lock(|g| {
+        vault::Vault::open_any_key(&path, None, g.backend.as_mut()).map_err(|e| e.to_string())
+    })?;
+    let entries = v.entries().to_vec();
+    state.with_lock(|g| {
+        g.vault = Some(v);
+        Ok(())
+    })?;
     Ok(entries)
 }
 
 /// 上鎖（手動或閒置）。回傳登入畫面資訊。
 #[tauri::command]
 fn lock(state: tauri::State<VaultState>, reason: Option<String>) -> Result<LoginScreenInfo> {
-    let header = state.with_lock(|g| {
+    let (header, brokered_key_login) = state.with_lock(|g| {
+        let brokered_key_login = g.backend.uses_brokered_key_selection();
         match g.vault.take() {
-            Some(v) => Ok(if reason.as_deref() == Some("idle") { v.auto_lock() } else { v.lock() }),
+            Some(v) => Ok((
+                if reason.as_deref() == Some("idle") {
+                    v.auto_lock()
+                } else {
+                    v.lock()
+                },
+                brokered_key_login,
+            )),
             None => Err("尚未解鎖".to_string()),
         }
     })?;
-    Ok(LoginScreenInfo { has_vault: true, keys: (&header).into(), idle_lock_minutes: 5 })
+    Ok(LoginScreenInfo {
+        has_vault: true,
+        keys: (&header).into(),
+        idle_lock_minutes: 5,
+        brokered_key_login,
+    })
 }
 
 fn with_unlocked<R>(state: &VaultState, f: impl FnOnce(&mut vault::Vault) -> Result<R>) -> Result<R> {
@@ -308,13 +375,18 @@ fn list_audit(state: tauri::State<VaultState>) -> Result<Vec<vault::AuditEvent>>
 }
 
 #[tauri::command]
-fn register_key(state: tauri::State<VaultState>, pin: Option<String>) -> Result<fido2::RegisteredCredential> {
+fn register_key(
+    window: tauri::WebviewWindow,
+    state: tauri::State<VaultState>,
+    pin: Option<String>,
+) -> Result<fido2::RegisteredCredential> {
+    raise_key_operation_window(&window);
     // 同一後端實例內 detect+register → 類型一致。
-    state.with_lock(|g| {
-        match g.vault.as_mut() {
-            Some(v) => v.register_key(g.backend.as_mut(), pin.as_deref()).map_err(|e| e.to_string()),
-            None => Err("金庫未解鎖".to_string()),
-        }
+    state.with_lock(|g| match g.vault.as_mut() {
+        Some(v) => v
+            .register_key(g.backend.as_mut(), pin.as_deref())
+            .map_err(|e| e.to_string()),
+        None => Err("金庫未解鎖".to_string()),
     })
 }
 
@@ -373,6 +445,7 @@ pub fn run() {
             create_vault,
             login_password,
             login_key,
+            login_any_key,
             lock,
             list_entries,
             add_entry,

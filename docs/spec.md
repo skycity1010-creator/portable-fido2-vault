@@ -89,7 +89,7 @@ offset   size   field
 | PRF salt（固定） | `f2vlt-prf-salt-v1`（32B，domain separation；非機密，公開於程式碼） |
 
 - **密碼登入**：K=Argon2id(pw, salt) → AES-GCM 解 password_slot.ct → KEK → 解 payload。tag 驗證失敗 = 拒絕並記軌跡。
-- **金鑰登入**：CTAP2 getAssertion(allow=[cred_id], hmac-secret{salt1=PRF_SALT}) → S(32B) → HKDF → AES-GCM 解該槽 ct → KEK → 解 payload。
+- **金鑰登入（raw CTAP per-slot 路徑）**：CTAP2 getAssertion(allow=[cred_id], hmac-secret{salt1=PRF_SALT}) → S(32B) → HKDF → AES-GCM 解該槽 ct → KEK → 解 payload。Windows WebAuthn GUI 則一次提交全部已註冊 credential IDs，由 broker 選擇後以回傳的 credential ID 對應槽位。
 
 ## 5. FIDO2 偵測與登入流程
 
@@ -110,12 +110,13 @@ offset   size   field
 | windows_managed | 「請依 Windows 安全性提示完成驗證」 |
 
 ### 5.3 多支金鑰
-每支 credential 獨立槽位；登入畫面列出全部已註冊金鑰（label + type），使用者點選一支 → 依類型提示 → getAssertion。任一支成功即解鎖。
+每支 credential 維持獨立槽位。Windows GUI 登入畫面保留主密碼備援，金鑰登入只顯示一個通用入口；啟動後以單次 WebAuthn `GetAssertion` 將全部已註冊 credential IDs 放入 allow-list，由 Windows broker 處理金鑰選擇及 PIN/UV/觸碰提示。回傳的 credential ID 必須對應既有 vault slot，再以該槽 PRF secret 解鎖。使用者不需先在應用程式點選特定金鑰。非 brokered 的 Mock/raw-CTAP GUI 模式維持原逐支選擇與 app PIN 流程。
 
 ### 5.4 Windows backend 選型
 - **Windows GUI 使用 Microsoft Windows WebAuthn API**：一般使用者權限可透過 Windows broker 執行 MakeCredential/GetAssertion，PIN/UV/觸碰提示由系統 UI 負責；需要 API v4+ 才能取得 HMAC-secret assertion output。
 - **raw CTAP/HID 保留給 CLI 與診斷**：`authenticator-rs` 提供 getInfo、BioEnrollment 和 hmac-secret；但 Windows 對一般程式的 FIDO HID 存取會受權限/使用中裝置限制，不能把此路徑當成一般權限 GUI 的預設。
 - Windows API assertion 設定 `WEBAUTHN_AUTHENTICATOR_HMAC_SECRET_VALUES_FLAG`，明確傳入原始 32-byte vault salt，避免 WebAuthn PRF 的 domain-separated transform 造成既有槽位無法解鎖。
+- 呼叫註冊或登入前，GUI 先還原/顯示並聚焦 Tauri 主視窗，並以該視窗 HWND 作為 WebAuthn parent，讓系統金鑰 UI 由前景應用程式觸發；視窗聚焦失敗只記錄警告，仍不提升權限或切換 backend。
 
 ## 6. 軌跡紀錄（audit）
 

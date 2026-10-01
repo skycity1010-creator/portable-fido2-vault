@@ -11,7 +11,7 @@
   <div id="screen-login" class="screen hidden">
     <div class="login-card">
       <h1>🔐 可攜式 FIDO2 密碼金庫</h1>
-      <p class="sub" id="login-sub">請輸入主密碼登入</p>
+      <p class="sub" id="login-sub">可使用主密碼或任一支已註冊金鑰登入</p>
 
       <!-- 建立帳號（首次執行） -->
       <div id="setup-panel" class="hidden">
@@ -37,6 +37,7 @@
           <input type="password" id="login-pin" autocomplete="off" />
         </div>
         <button id="btn-login-key" class="primary hidden">以金鑰登入</button>
+        <div id="key-login-status" class="muted" aria-live="polite"></div>
       </div>
 
       <div id="login-error" class="error"></div>

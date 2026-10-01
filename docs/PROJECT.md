@@ -121,8 +121,9 @@ cargo +stable-x86_64-pc-windows-gnu build --release --features real-ctap --bin p
 
 - `--features real-ctap`：編入實體 FIDO2 支援；Windows GUI 使用系統 WebAuthn API，CLI `--authenticator hw` 使用 raw CTAP/HID。
 - Windows Release GUI 無需 `F2V_AUTHENTICATOR` 或系統管理員權限即可走 brokered backend；Debug 預設 mock，mock demo 可明確設 `F2V_AUTHENTICATOR=mock`。
-- 驗證（2026-10-01）：`cargo test --locked --features real-ctap --lib` 37/37；Release backend-mode 7/7；vendor `device_filter` 6/6；Gate E2E 20/20；Windows Release GUI + CLI build 成功。
-- 實體 YubiKey 透過一般權限檔案總管使用 Windows WebAuthn API 的註冊/登入仍待 Win11-NB 互動桌面驗收。
+- 驗證（2026-10-01）：`cargo test --locked --features real-ctap --lib` 42/42；Release backend-mode 7/7；vendor `device_filter` 6/6；Gate E2E 20/20；login UI Node tests 4/4；Windows GNU Release GUI + CLI build 成功。
+- 實體驗收已由使用者在 Win11-NB 互動桌面通過：舊 raw-CTAP 槽可由 Windows WebAuthn 解鎖、新金鑰註冊與登入成功，第二支 YubiKey NFC 交叉登入亦通過；不再執行原 Kanban 規劃的 raw-CTAP CLI 實體路線。
+- 本次單一登入入口/提示前景修改尚待 Win11-NB 互動驗收，依 `docs/user-verification-steps.md` §H 執行；不得以 mock/CLI 結果代替 Windows broker 前景驗收。
 - 建置檔參數：release `strip + lto`。
 
 ## 7. 部署（Win11-NB，WinRM）
@@ -141,10 +142,10 @@ cargo +stable-x86_64-pc-windows-gnu build --release --features real-ctap --bin p
 
 | Gate | 內容 | 狀態 |
 |---|---|---|
-| 1 | portable + NB 一般權限直接啟動 | ⚠️ 新 Windows WebAuthn build 尚未部署/互動驗收 |
+| 1 | portable + NB 一般權限直接啟動 | ⚠️ WebAuthn build 已部署且互動驗收；一般權限/Explorer 啟動條件未單獨確認 |
 | 2 | 建立帳號/密碼登入/錯誤拒絕 | ✅（mock E2E，20/20） |
-| 3 | 金鑰註冊+登入（實體） | ⚠️ Windows WebAuthn backend 已建置，待 Win11-NB 實體驗收 |
-| 4 | 第二支金鑰/任一支可登入 | ⚠️ 待 Gate 3 實體驗收 |
+| 3 | 金鑰註冊+登入（實體） | ✅ Win11-NB Windows WebAuthn：註冊與登入通過 |
+| 4 | 第二支金鑰/任一支可登入 | ✅ 第二支 YubiKey NFC 交叉登入通過 |
 | 5 | CRUD + 時間戳 | ✅（mock E2E） |
 | 6 | 軌跡完整/無明文密碼 | ✅（mock E2E） |
 | 7 | 閒置自動上鎖 | ✅（先前 GUI 實測；新 build 未重測） |

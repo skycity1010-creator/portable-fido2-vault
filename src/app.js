@@ -3,7 +3,8 @@ const { invoke } = window.__TAURI__.core;
 
 const $ = (id) => document.getElementById(id);
 
-let selectedKey = null;      // { credential_id, label, key_type, prompt_zh }
+let selectedKey = null;
+let brokeredKeyLogin = false;
 let idleTimer = null;
 let idleMinutes = 5;
 
@@ -24,8 +25,8 @@ async function boot() {
       show("screen-login");
       hide("setup-panel");
       show("login-panel");
-      $("login-sub").textContent = "請輸入主密碼，或選擇 FIDO2 金鑰登入";
-      renderLoginKeys(info.keys);
+      $("login-sub").textContent = "可使用主密碼或任一支已註冊金鑰登入";
+      renderLoginKeys(info.keys, info.brokered_key_login);
     } else {
       show("screen-login");
       show("setup-panel");
@@ -37,27 +38,39 @@ async function boot() {
   }
 }
 
-function renderLoginKeys(keys) {
+function renderLoginKeys(keys, useBrokeredKeyLogin) {
   const box = $("key-list-login");
+  const button = $("btn-login-key");
+  selectedKey = null;
+  brokeredKeyLogin = Boolean(useBrokeredKeyLogin);
   box.innerHTML = "";
+  hide("btn-login-key");
+  hide("pin-box");
   if (!keys.length) {
-    box.innerHTML = '<div class="muted" style="font-size:12px">（尚無已註冊金鑰 — 登入後可於「金鑰管理」註冊）</div>';
+    box.textContent = "（尚無已註冊金鑰 — 登入後可於「金鑰管理」註冊）";
     return;
   }
-  for (const k of keys) {
-    const div = document.createElement("div");
-    div.className = "key-item";
-    div.innerHTML = `<span>🔑 <span class="klabel">${esc(k.label)}</span></span><span class="ktype">${esc(k.key_type)} · ${esc(k.prompt_zh)}</span>`;
-    div.onclick = () => selectLoginKey(k, div);
-    box.appendChild(div);
+
+  if (brokeredKeyLogin) {
+    button.textContent = "以金鑰登入";
+    show("btn-login-key");
+    return;
+  }
+
+  for (const key of keys) {
+    const item = document.createElement("div");
+    item.className = "key-item";
+    item.innerHTML = `<span>🔑 <span class="klabel">${esc(key.label)}</span></span><span class="ktype">${esc(key.key_type)} · ${esc(key.prompt_zh)}</span>`;
+    item.onclick = () => selectLoginKey(key, item);
+    box.appendChild(item);
   }
 }
 
-function selectLoginKey(k, el) {
-  selectedKey = k;
-  document.querySelectorAll("#key-list-login .key-item").forEach((x) => x.classList.remove("selected"));
-  el.classList.add("selected");
-  if (k.key_type === "pin") show("pin-box"); else hide("pin-box");
+function selectLoginKey(key, item) {
+  selectedKey = key;
+  document.querySelectorAll("#key-list-login .key-item").forEach((entry) => entry.classList.remove("selected"));
+  item.classList.add("selected");
+  if (key.key_type === "pin") show("pin-box"); else hide("pin-box");
   show("btn-login-key");
 }
 
@@ -83,12 +96,26 @@ async function doLoginPw() {
 
 async function doLoginKey() {
   errBox("");
-  if (!selectedKey) return errBox("請先選擇一支金鑰");
+  if (!brokeredKeyLogin && !selectedKey) return errBox("請先選擇一支金鑰");
+  const button = $("btn-login-key");
+  button.disabled = true;
+  $("key-login-status").textContent = brokeredKeyLogin
+    ? "請依 Windows 安全性視窗提示操作金鑰"
+    : selectedKey.prompt_zh;
   try {
-    const pin = selectedKey.key_type === "pin" ? $("login-pin").value : null;
-    const entries = await invoke("login_key", { credentialId: selectedKey.credential_id, pin });
+    const entries = brokeredKeyLogin
+      ? await invoke("login_any_key")
+      : await invoke("login_key", {
+          credentialId: selectedKey.credential_id,
+          pin: selectedKey.key_type === "pin" ? $("login-pin").value : null,
+        });
     await enterMain(entries);
-  } catch (e) { errBox(String(e)); }
+  } catch (e) {
+    errBox(String(e));
+  } finally {
+    button.disabled = false;
+    $("key-login-status").textContent = "";
+  }
 }
 
 async function enterMain(entries) {

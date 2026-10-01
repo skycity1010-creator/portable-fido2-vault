@@ -184,11 +184,15 @@ impl WindowsWebAuthnBackend {
     }
 
     fn get_hmac_secret(&self, credential_id: &[u8]) -> Result<[u8; 32], FidoError> {
-        if credential_id.is_empty() || credential_id.len() > MAX_API_BUFFER {
-            return Err(FidoError::Internal(
-                "credential ID length is invalid".into(),
-            ));
-        }
+        self.get_hmac_secret_for_any(&[credential_id.to_vec()])
+            .map(|(_, secret)| secret)
+    }
+
+    fn get_hmac_secret_for_any(
+        &self,
+        credential_ids: &[Vec<u8>],
+    ) -> Result<(Vec<u8>, [u8; 32]), FidoError> {
+        validate_credential_ids(credential_ids)?;
         let challenge = random_bytes(32);
         let mut client_json = client_data_json(ClientDataOperation::Get, &challenge);
         let client_data = make_client_data(&mut client_json)?;
@@ -205,20 +209,23 @@ impl WindowsWebAuthnBackend {
             cCredWithHmacSecretSaltList: 0,
             pCredWithHmacSecretSaltList: ptr::null_mut(),
         };
-        let mut credential = WEBAUTHN_CREDENTIAL {
-            dwVersion: WEBAUTHN_CREDENTIAL_CURRENT_VERSION,
-            cbId: credential_id.len() as u32,
-            pbId: credential_id.as_ptr() as *mut u8,
-            pwszCredentialType: WEBAUTHN_CREDENTIAL_TYPE_PUBLIC_KEY,
-        };
-        let credentials = WEBAUTHN_CREDENTIALS {
-            cCredentials: 1,
-            pCredentials: &mut credential,
+        let mut credential_entries: Vec<WEBAUTHN_CREDENTIAL> = credential_ids
+            .iter()
+            .map(|credential_id| WEBAUTHN_CREDENTIAL {
+                dwVersion: WEBAUTHN_CREDENTIAL_CURRENT_VERSION,
+                cbId: credential_id.len() as u32,
+                pbId: credential_id.as_ptr() as *mut u8,
+                pwszCredentialType: WEBAUTHN_CREDENTIAL_TYPE_PUBLIC_KEY,
+            })
+            .collect();
+        let credential_list = WEBAUTHN_CREDENTIALS {
+            cCredentials: credential_entries.len() as u32,
+            pCredentials: credential_entries.as_mut_ptr(),
         };
         let options = WEBAUTHN_AUTHENTICATOR_GET_ASSERTION_OPTIONS {
             dwVersion: WEBAUTHN_AUTHENTICATOR_GET_ASSERTION_OPTIONS_VERSION_6,
             dwTimeoutMilliseconds: OP_TIMEOUT_MS,
-            CredentialList: credentials,
+            CredentialList: credential_list,
             dwAuthenticatorAttachment: WEBAUTHN_AUTHENTICATOR_ATTACHMENT_CROSS_PLATFORM,
             dwUserVerificationRequirement: WEBAUTHN_USER_VERIFICATION_REQUIREMENT_PREFERRED,
             dwFlags: raw_hmac_secret_flag(),
@@ -255,6 +262,14 @@ impl WindowsWebAuthnBackend {
                 "security key returned no hmac-secret output".into(),
             ));
         }
+        let selected_id = unsafe {
+            copy_api_bytes(
+                result.Credential.pbId as *const u8,
+                result.Credential.cbId,
+                "selected credential ID",
+            )?
+        };
+        let selected_id = validate_selected_credential_id(credential_ids, &selected_id)?;
         let output = unsafe { &*result.pHmacSecret };
         if output.cbFirst != 32 || output.pbFirst.is_null() {
             return Err(FidoError::Internal(format!(
@@ -265,7 +280,7 @@ impl WindowsWebAuthnBackend {
         let bytes = unsafe { slice::from_raw_parts(output.pbFirst, 32) };
         let mut secret = [0u8; 32];
         secret.copy_from_slice(bytes);
-        Ok(secret)
+        Ok((selected_id, secret))
     }
 }
 
@@ -293,6 +308,18 @@ impl FidoBackend for WindowsWebAuthnBackend {
         _pin: Option<&str>,
     ) -> Result<[u8; 32], FidoError> {
         self.get_hmac_secret(credential_id)
+    }
+
+    fn get_prf_secret_for_any(
+        &mut self,
+        credential_ids: &[Vec<u8>],
+        _pin: Option<&str>,
+    ) -> Result<(Vec<u8>, [u8; 32]), FidoError> {
+        self.get_hmac_secret_for_any(credential_ids)
+    }
+
+    fn uses_brokered_key_selection(&self) -> bool {
+        true
     }
 
     fn peek_kind(&self) -> KeyKind {
@@ -391,6 +418,35 @@ unsafe fn api_wide_string(ptr: *const u16) -> Option<String> {
     Some(String::from_utf16_lossy(slice::from_raw_parts(ptr, len)))
 }
 
+fn validate_credential_ids(credential_ids: &[Vec<u8>]) -> Result<(), FidoError> {
+    if credential_ids.is_empty() {
+        return Err(FidoError::NoDevice);
+    }
+    if credential_ids.len() > u32::MAX as usize
+        || credential_ids
+            .iter()
+            .any(|id| id.is_empty() || id.len() > MAX_API_BUFFER || id.len() > u32::MAX as usize)
+    {
+        return Err(FidoError::Internal(
+            "credential allow-list contains an invalid ID or count".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_selected_credential_id(
+    requested_ids: &[Vec<u8>],
+    selected_id: &[u8],
+) -> Result<Vec<u8>, FidoError> {
+    validate_credential_ids(requested_ids)?;
+    if selected_id.is_empty() || !requested_ids.iter().any(|id| id.as_slice() == selected_id) {
+        return Err(FidoError::Internal(
+            "Windows WebAuthn returned a credential outside the requested allow-list".into(),
+        ));
+    }
+    Ok(selected_id.to_vec())
+}
+
 fn hmac_secret_enabled(extensions: &WEBAUTHN_EXTENSIONS) -> bool {
     if extensions.cExtensions == 0
         || extensions.cExtensions > 32
@@ -426,6 +482,26 @@ mod tests {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
     use serde_json::Value;
+
+    #[test]
+    fn windows_backend_advertises_brokered_key_selection_ui() {
+        let backend = WindowsWebAuthnBackend {
+            hwnd: 0,
+            api_version: 4,
+        };
+        assert!(backend.uses_brokered_key_selection());
+    }
+
+    #[test]
+    fn multi_credential_assertion_returns_the_selected_registered_id() {
+        let candidates = vec![vec![1, 2, 3], vec![4, 5, 6]];
+        assert_eq!(
+            validate_selected_credential_id(&candidates, &[4, 5, 6]).unwrap(),
+            vec![4, 5, 6]
+        );
+        assert!(validate_selected_credential_id(&candidates, &[9]).is_err());
+        assert!(validate_selected_credential_id(&[], &[1]).is_err());
+    }
 
     #[test]
     fn create_client_data_uses_stable_rp_origin_and_challenge() {
