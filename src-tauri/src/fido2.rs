@@ -189,6 +189,9 @@ pub trait FidoBackend: Send {
         Ok((credential_id.clone(), secret))
     }
 
+    /// Update the native owner HWND before a Windows broker interaction; other backends ignore it.
+    fn set_webauthn_parent_hwnd(&mut self, _handle: isize) {}
+
     /// Whether this backend delegates credential selection and PIN/UV prompts to a native broker.
     fn uses_brokered_key_selection(&self) -> bool {
         false

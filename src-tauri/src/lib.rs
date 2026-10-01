@@ -4,6 +4,11 @@
 use std::sync::Mutex;
 use tauri::Manager;
 
+#[cfg(windows)]
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    GetForegroundWindow, IsIconic, IsWindowVisible, SetForegroundWindow, ShowWindow, SW_RESTORE,
+};
+
 #[cfg(feature = "mock-fido")]
 use crate::fido2::MockBackend;
 #[cfg(all(feature = "real-ctap", not(windows)))]
@@ -171,16 +176,83 @@ fn path_from_state_or_default() -> std::path::PathBuf {
     dir.join("vault.db")
 }
 
-/// Restore and focus the HWND that owns the Windows WebAuthn security UI.
-fn raise_key_operation_window(window: &tauri::WebviewWindow) {
-    if let Err(error) = window.unminimize() {
-        log::warn!("Could not unminimize the WebAuthn parent window: {error}");
+fn ensure_parent_window_ready(
+    require_foreground: bool,
+    is_foreground: bool,
+    visible: bool,
+    minimized: bool,
+) -> Result<()> {
+    if !require_foreground || (is_foreground && visible && !minimized) {
+        Ok(())
+    } else {
+        Err("Windows could not activate the visible FidoVault window. Bring FidoVault to the foreground and retry; no security-key operation was started.".into())
     }
-    if let Err(error) = window.show() {
-        log::warn!("Could not show the WebAuthn parent window: {error}");
+}
+
+/// Restore and activate the live top-level HWND before entering the blocking
+/// Windows WebAuthn call.
+fn raise_key_operation_window(
+    window: &tauri::WebviewWindow,
+    require_foreground: bool,
+) -> Result<isize> {
+    #[cfg(windows)]
+    {
+        if !require_foreground {
+            if let Err(error) = window.unminimize() {
+                log::warn!("Could not unminimize the FIDO parent window: {error}");
+            }
+            if let Err(error) = window.show() {
+                log::warn!("Could not show the FIDO parent window: {error}");
+            }
+            if let Err(error) = window.set_focus() {
+                log::warn!("Could not focus the FIDO parent window: {error}");
+            }
+            return Ok(0);
+        }
+
+        let hwnd = window
+            .hwnd()
+            .map_err(|error| format!("Could not get the live FidoVault HWND: {error}"))?;
+        if hwnd.0.is_null() {
+            return Err(
+                "The live FidoVault HWND is null; no security-key operation was started.".into(),
+            );
+        }
+
+        let foreground_before = unsafe { GetForegroundWindow() };
+        unsafe { ShowWindow(hwnd.0, SW_RESTORE) };
+        let set_foreground = unsafe { SetForegroundWindow(hwnd.0) != 0 };
+        let foreground_after = unsafe { GetForegroundWindow() };
+        let visible = unsafe { IsWindowVisible(hwnd.0) != 0 };
+        let minimized = unsafe { IsIconic(hwnd.0) != 0 };
+        let is_foreground = foreground_after == hwnd.0;
+        log::info!(
+            "WebAuthn parent focus snapshot: hwnd={:p} foreground_before={:p} set_foreground={} foreground_after={:p} visible={} minimized={} is_foreground={}",
+            hwnd.0,
+            foreground_before,
+            set_foreground,
+            foreground_after,
+            visible,
+            minimized,
+            is_foreground,
+        );
+        ensure_parent_window_ready(require_foreground, is_foreground, visible, minimized)?;
+        Ok(hwnd.0 as isize)
     }
-    if let Err(error) = window.set_focus() {
-        log::warn!("Could not focus the WebAuthn parent window: {error}");
+
+    #[cfg(not(windows))]
+    {
+        let _ = require_foreground;
+        if let Err(error) = window.unminimize() {
+            log::warn!("Could not unminimize the FIDO parent window: {error}");
+        }
+        if let Err(error) = window.show() {
+            log::warn!("Could not show the FIDO parent window: {error}");
+        }
+        if let Err(error) = window.set_focus() {
+            log::warn!("Could not focus the FIDO parent window: {error}");
+        }
+        Ok(0)
     }
 }
 
@@ -264,9 +336,11 @@ fn login_key(
     credential_id: String,
     pin: Option<String>,
 ) -> Result<Vec<vault::Entry>> {
-    raise_key_operation_window(&window);
+    let require_foreground = state.with_lock(|g| Ok(g.backend.uses_brokered_key_selection()))?;
+    let owner_hwnd = raise_key_operation_window(&window, require_foreground)?;
     let path = path_from_state_or_default();
     let v = state.with_lock(|g| {
+        g.backend.set_webauthn_parent_hwnd(owner_hwnd);
         vault::Vault::open_key(&path, &credential_id, pin.as_deref(), g.backend.as_mut())
             .map_err(|e| e.to_string())
     })?;
@@ -284,9 +358,11 @@ fn login_any_key(
     window: tauri::WebviewWindow,
     state: tauri::State<VaultState>,
 ) -> Result<Vec<vault::Entry>> {
-    raise_key_operation_window(&window);
+    let require_foreground = state.with_lock(|g| Ok(g.backend.uses_brokered_key_selection()))?;
+    let owner_hwnd = raise_key_operation_window(&window, require_foreground)?;
     let path = path_from_state_or_default();
     let v = state.with_lock(|g| {
+        g.backend.set_webauthn_parent_hwnd(owner_hwnd);
         vault::Vault::open_any_key(&path, None, g.backend.as_mut()).map_err(|e| e.to_string())
     })?;
     let entries = v.entries().to_vec();
@@ -380,12 +456,15 @@ fn register_key(
     state: tauri::State<VaultState>,
     pin: Option<String>,
 ) -> Result<fido2::RegisteredCredential> {
-    raise_key_operation_window(&window);
+    let require_foreground = state.with_lock(|g| Ok(g.backend.uses_brokered_key_selection()))?;
+    let owner_hwnd = raise_key_operation_window(&window, require_foreground)?;
     // 同一後端實例內 detect+register → 類型一致。
     state.with_lock(|g| match g.vault.as_mut() {
-        Some(v) => v
-            .register_key(g.backend.as_mut(), pin.as_deref())
-            .map_err(|e| e.to_string()),
+        Some(v) => {
+            g.backend.set_webauthn_parent_hwnd(owner_hwnd);
+            v.register_key(g.backend.as_mut(), pin.as_deref())
+                .map_err(|e| e.to_string())
+        }
         None => Err("金庫未解鎖".to_string()),
     })
 }
@@ -433,7 +512,7 @@ pub fn run() {
             #[cfg(windows)]
             if window_handle == 0 {
                 log::warn!(
-                    "Main window HWND unavailable; WebAuthn prompt will use a null parent window"
+                    "Main window HWND unavailable during setup; key commands will fetch and validate the live HWND before WebAuthn calls"
                 );
             }
             let inner = AppInner::new(window_handle).map_err(std::io::Error::other)?;
@@ -524,5 +603,19 @@ mod backend_mode_tests {
     #[test]
     fn release_without_real_ctap_does_not_silently_select_mock() {
         assert!(resolve_backend_mode(None, false, false, true).is_err());
+    }
+}
+
+#[cfg(test)]
+mod focus_window_tests {
+    use super::ensure_parent_window_ready;
+
+    #[test]
+    fn key_operation_requires_a_visible_unminimized_foreground_parent() {
+        assert!(ensure_parent_window_ready(true, true, true, false).is_ok());
+        assert!(ensure_parent_window_ready(true, false, true, false).is_err());
+        assert!(ensure_parent_window_ready(true, true, false, false).is_err());
+        assert!(ensure_parent_window_ready(true, true, true, true).is_err());
+        assert!(ensure_parent_window_ready(false, false, false, true).is_ok());
     }
 }

@@ -42,6 +42,20 @@ fn raw_hmac_secret_flag() -> u32 {
     WEBAUTHN_AUTHENTICATOR_HMAC_SECRET_VALUES_FLAG
 }
 
+fn validate_owner_foreground(owner: HWND, foreground: HWND) -> Result<HWND, FidoError> {
+    if owner.is_null() {
+        Err(FidoError::Internal(
+            "Windows WebAuthn parent HWND is unavailable; the security-key operation was not started.".into(),
+        ))
+    } else if owner == foreground {
+        Ok(owner)
+    } else {
+        Err(FidoError::Internal(
+            "Windows WebAuthn was not started because its owner window is not foreground. Bring FidoVault to the foreground and retry.".into(),
+        ))
+    }
+}
+
 fn vault_hmac_salt() -> [u8; 32] {
     crate::crypto::prf_salt_bytes()
 }
@@ -66,11 +80,31 @@ impl WindowsWebAuthnBackend {
         Ok(Self { hwnd, api_version })
     }
 
-    fn hwnd(&self) -> HWND {
+    fn hwnd(&self) -> Result<HWND, FidoError> {
         if self.hwnd == 0 {
-            unsafe { GetForegroundWindow() }
+            Err(FidoError::Internal(
+                "Windows WebAuthn parent HWND was not supplied by the live FidoVault window."
+                    .into(),
+            ))
         } else {
-            self.hwnd as HWND
+            Ok(self.hwnd as HWND)
+        }
+    }
+
+    fn foreground_owner_hwnd(&self) -> Result<(HWND, HWND), FidoError> {
+        let owner = self.hwnd()?;
+        // Best-effort preflight: Windows may still change foreground after this sample.
+        let foreground = unsafe { GetForegroundWindow() };
+        match validate_owner_foreground(owner, foreground) {
+            Ok(owner) => Ok((owner, foreground)),
+            Err(error) => {
+                log::warn!(
+                    "Windows WebAuthn refused before API call: owner={:p} foreground={:p}",
+                    owner,
+                    foreground,
+                );
+                Err(error)
+            }
         }
     }
 
@@ -132,9 +166,10 @@ impl WindowsWebAuthnBackend {
         };
 
         let mut attestation = ptr::null_mut();
+        let (owner_hwnd, foreground_before_api) = self.foreground_owner_hwnd()?;
         let hr = unsafe {
             WebAuthNAuthenticatorMakeCredential(
-                self.hwnd(),
+                owner_hwnd,
                 &rp,
                 &user,
                 &cose_parameters,
@@ -143,6 +178,11 @@ impl WindowsWebAuthnBackend {
                 &mut attestation,
             )
         };
+        log::info!(
+            "Windows WebAuthn MakeCredential owner snapshot captured immediately before API: owner={:p} foreground={:p}",
+            owner_hwnd,
+            foreground_before_api,
+        );
         if hr < 0 {
             if !attestation.is_null() {
                 unsafe { WebAuthNFreeCredentialAttestation(attestation) };
@@ -235,15 +275,21 @@ impl WindowsWebAuthnBackend {
 
         let rp_id = wide(RP_ID);
         let mut assertion = ptr::null_mut();
+        let (owner_hwnd, foreground_before_api) = self.foreground_owner_hwnd()?;
         let hr = unsafe {
             WebAuthNAuthenticatorGetAssertion(
-                self.hwnd(),
+                owner_hwnd,
                 rp_id.as_ptr(),
                 &client_data,
                 &options,
                 &mut assertion,
             )
         };
+        log::info!(
+            "Windows WebAuthn GetAssertion owner snapshot captured immediately before API: owner={:p} foreground={:p}",
+            owner_hwnd,
+            foreground_before_api,
+        );
         if hr < 0 {
             if !assertion.is_null() {
                 unsafe { WebAuthNFreeAssertion(assertion) };
@@ -285,6 +331,10 @@ impl WindowsWebAuthnBackend {
 }
 
 impl FidoBackend for WindowsWebAuthnBackend {
+    fn set_webauthn_parent_hwnd(&mut self, handle: isize) {
+        self.hwnd = handle;
+    }
+
     fn detect(&mut self) -> Result<DetectedKey, FidoError> {
         // The broker owns device selection and prompts during makeCredential/getAssertion.
         Ok(DetectedKey {
@@ -490,6 +540,40 @@ mod tests {
             api_version: 4,
         };
         assert!(backend.uses_brokered_key_selection());
+    }
+
+    #[test]
+    fn windows_api_call_requires_its_owner_to_be_foreground() {
+        let owner = 1usize as HWND;
+        let foreground = 2usize as HWND;
+        assert!(validate_owner_foreground(owner, owner).is_ok());
+        assert!(validate_owner_foreground(owner, foreground).is_err());
+    }
+
+    #[test]
+    fn windows_api_call_rejects_missing_owner_hwnd() {
+        let missing = ptr::null_mut();
+        assert!(validate_owner_foreground(missing, missing).is_err());
+    }
+
+    #[test]
+    fn backend_uses_the_live_owner_hwnd_set_by_the_command() {
+        let mut backend = WindowsWebAuthnBackend {
+            hwnd: 0,
+            api_version: 4,
+        };
+        let live_hwnd = 1usize as isize;
+        backend.set_webauthn_parent_hwnd(live_hwnd);
+        assert_eq!(backend.hwnd().unwrap(), live_hwnd as HWND);
+    }
+
+    #[test]
+    fn backend_rejects_missing_live_owner_hwnd_instead_of_using_foreground_window() {
+        let backend = WindowsWebAuthnBackend {
+            hwnd: 0,
+            api_version: 4,
+        };
+        assert!(backend.hwnd().is_err());
     }
 
     #[test]
