@@ -4,7 +4,7 @@
 > Windows Release GUI 必須以 `--features real-ctap` 建置；一般權限的檔案總管直接啟動時使用 Windows WebAuthn API，無需環境變數或系統管理員提升。Windows 安全性視窗負責 PIN/UV/觸碰；目標系統需 WebAuthn API v4+。Debug build 預設為 MockBackend；明確跑 mock 流程時設定 `F2V_AUTHENTICATOR=mock`。
 
 ## 部署後驗證前確認（2026-10-01）
-已部署的 Release GUI 為 Windows WebAuthn 版本，SHA256：`06B1C5BE7A5E760D28D594B128A1B5BC681C31A6FD26D672E942E5F1062F0EA2`。部署時只替換主程式，`vault.db` 未變更；當時有 1 個金鑰槽。`F2V_AUTHENTICATOR` 的使用者與系統環境變數均未設定。
+已部署 PR #3 的 Windows GNU Release GUI，SHA256：`E9A28C81C73456800E3F1FAF0E8F1A9F6576146C8A675F5AB125FF9135ED8503`。替換前舊 exe 已備份為 `C:\FidoVault\portable-fido-vault.exe.pre-single-key-20261001-112834.bak`（SHA256 `06B1C5BE7A5E760D28D594B128A1B5BC681C31A6FD26D672E942E5F1062F0EA2`）。`vault.db` 未替換，SHA256 `848F961C4C5CB741EF1ADE452008F1D3F17649D06582B4809CEBFC4E16877B99`，3 個 key slots；備份 `C:\FidoVault\vault.db.pre-single-key-20261001-112834.bak` SHA256 相同。部署前 WinRM read-only process check 為 0 個 FIDO client，`F2V_AUTHENTICATOR` 使用者/系統變數均未設定。
 
 執行所需檔案如下；`C:\FidoVault` 也有診斷紀錄與備份檔，**不要因舊版「只有三個檔案」說明而刪除任何其他檔案**：
 
@@ -15,7 +15,7 @@
 | `vault.db` | 既有金庫資料；驗證前另做使用者備份，切勿刪除或重建 |
 | `vault_cli.exe` | 選用 CLI；保留 raw CTAP 診斷路徑，本次部署未替換 |
 
-> 這台 NB 已有既存 `vault.db`。A–F 是全新測試金庫的舊 Gate 流程；本次請照 **G 節** 驗證，勿建立、清空或重建現有金庫。
+> 這台 NB 已有既存 `vault.db`，目前有 3 個 key slots。A–F 是全新測試金庫的舊 Gate 流程；G4–G6 是先前已完成的實體驗收（其步驟中的槽位數是當時紀錄，不代表目前數量）。本次請驗收 **H1–H5**，勿建立、清空或重建現有金庫。
 
 ## A. Gate 1 — 雙擊免安裝執行
 - [ ] **A1** 雙擊 `C:\FidoVault\portable-fido-vault.exe`
@@ -75,11 +75,11 @@ F: F1 _ / F2 _ / F3 _
 > 本節不需設定 `F2V_AUTHENTICATOR`；請以一般權限從檔案總管啟動。Windows 安全性視窗負責安全金鑰選擇、PIN/UV 與觸碰。
 
 - [ ] **G1** 在 Win11-NB 本機互動桌面確認沒有 `vault_cli`、`portable-fido-vault` 或 `yk_open_test` 程序；若有，正常關閉，不要 force-kill。
-- [ ] **G2** 關閉 GUI 後備份 `C:\FidoVault\vault.db`，並記下註冊前金鑰槽位數。
+- [x] **G2** 部署前已備份 `C:\FidoVault\vault.db` 並記錄 baseline：3 個 key slots、SHA256 與備份路徑見上方；切勿刪除或重建此金庫。
 - [ ] **G3** 用一般權限（非系統管理員）的檔案總管直接啟動 `C:\FidoVault\portable-fido-vault.exe`；不設 `F2V_AUTHENTICATOR`。啟動診斷應顯示 `GUI FIDO backend selected: windows-webauthn`。
-- [x] **G4（舊槽相容性）** 按通用「以金鑰登入」入口，以建立舊槽的實體金鑰完成 Windows 安全性提示。成功可確認舊 raw-CTAP 槽能由 Windows WebAuthn backend 解鎖；此時槽位數仍應為 1。若失敗，不要移除或覆寫舊槽；記下錯誤，再用主密碼登入後繼續測試。
-- [x] **G5（註冊）** 登入後進入「金鑰管理」→「＋ 註冊新金鑰」。依 Windows 安全性視窗選用外接安全金鑰，插入 YubiKey Bio，按提示觸碰／按指紋；如要求 PIN，只在本機系統視窗輸入，不要改用 Windows Hello。
-- [x] **G6（新槽登入）** 確認 UI 顯示「已註冊」、槽位數由 1 增至 2；上鎖後按通用「以金鑰登入」入口並用新金鑰解鎖。Gate 4 延伸驗收：第二支 YubiKey NFC 已註冊並完成交叉登入，通過。
+- [x] **G4（舊槽相容性；先前已驗收）** 以原有實體金鑰完成 Windows 安全性提示，確認舊 raw-CTAP 槽能由 Windows WebAuthn backend 解鎖；驗收當時槽位數為 1。若本次 H 驗收遇到登入失敗，不要移除或覆寫任何槽位。
+- [x] **G5（註冊；先前已驗收）** 「金鑰管理」→「＋ 註冊新金鑰」註冊 YubiKey Bio；Windows 安全性提示與觸碰／指紋流程已通過，PIN 只在本機提示輸入。
+- [x] **G6（新槽登入；先前已驗收）** 新槽登入已通過；第二支 YubiKey NFC 亦已註冊並完成交叉登入。這些完成當時的槽位數紀錄不代表目前數量；目前部署前 baseline 為 3 個 key slots。
 
 若視窗未啟動或金鑰未要求互動，保留目前 vault 備份並回報 UI 狀態；不要移除任何無法辨識的槽位。
 
