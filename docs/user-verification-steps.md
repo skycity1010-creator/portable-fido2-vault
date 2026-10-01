@@ -110,3 +110,23 @@ F: F1 _ / F2 _ / F3 _
 | SmartScreen 警告 | 未簽章 exe，「仍要執行」即可（後續可加簽章） |
 | D3 沒自動上鎖 | 多半是滑鼠/鍵盤在 app 視窗內動過 → 計時器被重算；再試一次、切走後別碰輸入設備 |
 | 雙擊完全無反應 | 回傳訊息給 Coder（查 WebView2 / 事件紀錄） |
+
+## 密碼欄位遮罩 — Win11-NB 驗收（2026-10-01）
+
+本次以 PR #5 功能分支 commit `a651a12` 建置 Windows GNU Release（`--features real-ctap`），已部署至 `C:\FidoVault\portable-fido-vault.exe`。
+
+| 項目 | 回讀結果 |
+|---|---|
+| 新版 EXE SHA-256 / 大小 | `50D17C57685E1740DB763EB65A09666DFF7F34CC8009A555EC0D830F4A6C9A57` / 6,145,024 bytes |
+| 替換前 EXE 備份 | `C:\FidoVault\portable-fido-vault.exe.pre-password-mask-20261001-234130.bak`，SHA-256 `59BBAB25C21A419702D02FA7E97242392C388149432BAF733AC0C715F06085D8` |
+| vault 備份 | `C:\FidoVault\vault.db.pre-password-mask-20261001-234130.bak`，SHA-256 `93945AEF2941A2D0785564A57D7D652847E92FD7CF8FD30A26501BA965184087` |
+| 目前 vault | SHA-256 與備份相同，3 個 key slots；部署前後未替換 |
+| 部署後 FIDO client / backend override | 0 個 FIDO client；user/machine `F2V_AUTHENTICATOR` 均未設定 |
+
+本次只推送 GUI EXE，未啟動 GUI、未操作 WebAuthn，也未推送 `vault_cli.exe` 或 `WebView2Loader.dll`。請在 Win11-NB **本機 Console** 以一般權限驗收；RDP 遠端啟動不支援（見 README）。
+
+- [ ] 新增測試條目：密碼預設遮罩；眼睛按鈕可顯示／隱藏。
+- [ ] 編輯該條目：密碼預設遮罩；眼睛按鈕可顯示／隱藏；重新開啟編輯時仍預設遮罩。
+- [ ] 儲存或取消後密碼欄清空並恢復遮罩；條目列表不顯示密碼。
+
+請使用測試用密碼，不要把密碼貼到聊天。密碼歷史、剪貼簿複製、自訂金鑰名稱不包含在本次 build，會分別實作。
