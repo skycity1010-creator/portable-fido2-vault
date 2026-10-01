@@ -2,6 +2,7 @@
 
 > 適用：Win11-NB，`C:\FidoVault`（portable 資料夾）。完成約 15–20 分鐘。
 > Windows Release GUI 必須以 `--features real-ctap` 建置；一般權限的檔案總管直接啟動時使用 Windows WebAuthn API，無需環境變數或系統管理員提升。Windows 安全性視窗負責 PIN/UV/觸碰；目標系統需 WebAuthn API v4+。Debug build 預設為 MockBackend；明確跑 mock 流程時設定 `F2V_AUTHENTICATOR=mock`。
+> **Win11-NB RDP 注意：**已確認 `RDP-Tcp#0` Session 2 的 WebAuthn API 回報 v1，程式依 v4+ fail-closed 而閃退；使用者確認從 Console 啟動可正常開啟。H1–H5 請在 Console session 驗收；RDP redirection 路線未驗收，勿降低 API 版本檢查。
 
 ## 部署後驗證前確認（2026-10-01）
 已部署 PR #3 的 Windows GNU Release GUI，SHA256：`E9A28C81C73456800E3F1FAF0E8F1A9F6576146C8A675F5AB125FF9135ED8503`。替換前舊 exe 已備份為 `C:\FidoVault\portable-fido-vault.exe.pre-single-key-20261001-112834.bak`（SHA256 `06B1C5BE7A5E760D28D594B128A1B5BC681C31A6FD26D672E942E5F1062F0EA2`）。`vault.db` 未替換，SHA256 `848F961C4C5CB741EF1ADE452008F1D3F17649D06582B4809CEBFC4E16877B99`，3 個 key slots；備份 `C:\FidoVault\vault.db.pre-single-key-20261001-112834.bak` SHA256 相同。部署前 WinRM read-only process check 為 0 個 FIDO client，`F2V_AUTHENTICATOR` 使用者/系統變數均未設定。
@@ -72,7 +73,7 @@ F: F1 _ / F2 _ / F3 _
 
 ## G. Gate 3/4 — 實體 YubiKey Bio 註冊與登入（Release GUI）
 
-> 本節不需設定 `F2V_AUTHENTICATOR`；請以一般權限從檔案總管啟動。Windows 安全性視窗負責安全金鑰選擇、PIN/UV 與觸碰。
+> 本節不需設定 `F2V_AUTHENTICATOR`；此 Win11-NB 請從本機 Console session 以一般權限啟動，不要從 RDP session 啟動。Windows 安全性視窗負責安全金鑰選擇、PIN/UV 與觸碰。
 
 - [ ] **G1** 在 Win11-NB 本機互動桌面確認沒有 `vault_cli`、`portable-fido-vault` 或 `yk_open_test` 程序；若有，正常關閉，不要 force-kill。
 - [x] **G2** 部署前已備份 `C:\FidoVault\vault.db` 並記錄 baseline：3 個 key slots、SHA256 與備份路徑見上方；切勿刪除或重建此金庫。
