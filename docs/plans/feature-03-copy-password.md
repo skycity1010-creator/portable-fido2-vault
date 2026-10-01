@@ -30,11 +30,19 @@ Feature 2 implementation is complete, but its Win11-NB local acceptance was expl
 
 ## Implementation sequence
 
-1. Add a focused UI test for one copy behavior and observe the expected RED failure.
-2. Integrate Tauri clipboard-manager, minimal permissions, entry action, and non-secret status; make that vertical slice GREEN.
-3. Add further timer-race and error-path tests one behavior at a time, then implement each.
-4. Run targeted and full automated tests, build the Windows Release GUI/CLI, and update this plan with actual results.
-5. Open/keep the implementation PR before coding; deploy only after automated verification. Manual acceptance remains in the user's local Console session.
+1. [x] Add focused UI tests and observe expected RED failures for missing copy, write-error handling, 60-second clearing, read failure, and in-flight expiry race.
+2. [x] Integrate Tauri clipboard-manager, minimum text-only permissions, row action, and non-secret status.
+3. [x] Cover timer replacement preservation, clear/read errors, and serial ordering for concurrent copies.
+4. [x] Run targeted/full automated tests, Windows Release GUI/CLI build, and `git diff --check`.
+5. [x] Open draft PR #8 before implementation on `feat/copy-password`, stacked on `feat/password-history` (Feature 2 PR #6).
+6. [ ] Win11-NB local Console acceptance; not deployed yet. Do not use WinRM/RDP to operate the GUI or clipboard.
+
+## Verification results
+
+- Targeted clipboard UI tests: 7/7 passed. Full Node UI suite: 19/19; `node --check src/app.js` passed.
+- MSVC Rust library suite (`--locked --features real-ctap`): 57/57. Release backend-mode matrix: 7/7.
+- Windows GNU Release GUI + `vault_cli` build with `--locked --features real-ctap`: passed. GUI artifact is 6,579,712 bytes, SHA-256 `609fa36a872fea3f449a90d605a32ecf8ee10a859573b0f6f242dfbdae428b6a`; CLI SHA-256 `0e0621e595004206b19c5fbc9ff07136c4cfd18d67668fcfbb44a11301365abf`.
+- Draft PR: https://github.com/skycity1010-creator/portable-fido2-vault/pull/8. Feature 2 local acceptance remains deferred per user instruction; Feature 4 has not started.
 
 ## Official API references
 

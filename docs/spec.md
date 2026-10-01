@@ -23,6 +23,7 @@
 ┌─────────────────────────── Tauri v2 (Rust) ───────────────────────────┐
 │  前端 (src/): index.html + app.js + styles.css — 純靜態、無 npm、繁中   │
 │    window.__TAURI__.core.invoke(...) → commands                        │
+│    window.__TAURI__.clipboardManager → text copy / conditional clear   │
 ├─────────────────────────────────────────────────────────────────────────┤
 │  src-tauri/src/lib.rs      — Tauri commands + VaultState (Mutex)        │
 │  src-tauri/src/vault.rs    — 金庫檔案格式 / 載入 / 建立 / 加密落盤       │
@@ -143,12 +144,21 @@ offset   size   field
 - 降低上限時立即移除最舊超額版本。歷史值仍保存在加密 payload。
 - 編輯畫面列出歷史日期並提供「還原」；使用者按儲存才套用，原目前密碼進入歷史，已還原的版本自歷史移除。
 
+### 7.2 密碼剪貼簿複製
+
+- 條目列表提供「複製密碼」操作，使用 Tauri v2 Clipboard Manager 寫入系統文字剪貼簿。
+- 成功/失敗狀態只顯示通用訊息；密碼內容不進 audit、診斷 log 或狀態文字。
+- 60 秒後讀取目前剪貼簿文字；只在內容與該次複製值相同時呼叫清除。若內容已被取代或讀取失敗，保留剪貼簿不動；寫入、讀取及清除錯誤皆由 UI 捕捉並以不含密碼的訊息回報。
+- App 內的剪貼簿操作會序列化，避免已開始的舊到期清除擦掉後續 FidoVault 複製的值。剪貼簿為 OS 共用資源，其他桌面程式可能在到期前讀取內容。
+- Capability 僅授予 `clipboard-manager:allow-write-text`、`clipboard-manager:allow-read-text`、`clipboard-manager:allow-clear`；不開放圖片或 HTML 剪貼簿命令。
+
 ## 8. 安全模型 / 威脅說明
 
 - 金庫檔案外洩（無任何解鎖因子）→ payload 為 AES-256-GCM，header 僅含包裝槽位，無法取得 KEK。
 - **無復原**：主密碼遺忘 + 全部 FIDO2 金鑰全失 = 永久無法取回（UI 於建立帳號與設定頁明示）。
 - 移除金鑰 = 刪該槽；該金鑰即無法再解鎖（不可逆，需確認對話框）。
-- 離線：程式不開啟任何 socket；Tauri 未加 http/fs 外部插件。
+- 離線：程式不開啟任何 socket；Tauri 未加 http/fs 外部插件。Clipboard Manager 僅使用本機系統剪貼簿。
+- 複製密碼會短暫暴露於系統共用剪貼簿；其他桌面程式可能在 60 秒清除前讀取，且清除只在內容仍相同時執行。
 - 已知限制（v0.1）：單機單使用者；檔案權限依賴 OS 使用者權限；不防執行中記憶體 dump（與一般密碼管理程式同級）。
 
 ## 9. Gate 對應
@@ -164,3 +174,4 @@ offset   size   field
 | 7 閒置自動上鎖 | GUI 計時器（縮短逾時實測）+ lock 命令 |
 | 8 加密檔直拷別機可解密 | vault_cli copy-test：A 建立 → 複製 vault.db 至 B 路徑 → B 同密碼/金鑰登入成功 |
 | 9 舊密碼歷史 | 修改密碼時封存；N=1–20（預設3）；調低立即裁剪；查看日期並還原；舊 payload 預設相容 |
+| 10 密碼剪貼簿複製 | 複製成功/失敗、60 秒到期條件清除、保留被其他 app 取代的剪貼簿內容 |

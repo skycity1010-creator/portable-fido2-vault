@@ -521,6 +521,7 @@ pub fn run() {
     #[cfg(feature = "real-ctap")]
     diag_log::init();
     tauri::Builder::default()
+        .plugin(tauri_plugin_clipboard_manager::init())
         .setup(|app| {
             #[cfg(windows)]
             let window_handle = app
