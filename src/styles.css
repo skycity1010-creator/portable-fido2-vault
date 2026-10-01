@@ -129,6 +129,35 @@ button.primary:hover { background: var(--accent-hi); }
 .row input { flex: 1; }
 .row button { width: auto; margin-top: 0; }
 
+.password-input { position: relative; flex: 1; min-width: 0; }
+.password-input input { width: 100%; padding-right: 42px; }
+.password-toggle {
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  padding: 5px;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+}
+.password-toggle:hover { border-color: transparent; color: var(--text); }
+.password-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.password-toggle svg {
+  width: 20px;
+  height: 20px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
 table { width: 100%; border-collapse: collapse; margin-top: 12px; }
 th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--border); font-size: 13px; }
 th { color: var(--muted); font-weight: 600; }
