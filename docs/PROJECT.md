@@ -123,7 +123,7 @@ cargo +stable-x86_64-pc-windows-gnu build --release --features real-ctap --bin p
 - Windows Release GUI 無需 `F2V_AUTHENTICATOR` 或系統管理員權限即可走 brokered backend；Debug 預設 mock，mock demo 可明確設 `F2V_AUTHENTICATOR=mock`。
 - 驗證（2026-10-01）：`cargo test --locked --features real-ctap --lib` 47/47；Release backend-mode 7/7；vendor `device_filter` 6/6；Gate E2E 20/20；login UI Node tests 4/4；Windows GNU Release GUI + CLI build 成功。
 - 實體驗收已由使用者在 Win11-NB 互動桌面通過：舊 raw-CTAP 槽可由 Windows WebAuthn 解鎖、新金鑰註冊與登入成功，第二支 YubiKey NFC 交叉登入亦通過；不再執行原 Kanban 規劃的 raw-CTAP CLI 實體路線。
-- 本次單一登入入口/提示前景修改：使用者確認 Win11-NB Console 啟動正常；H1、H3、H4、H5 通過。H2 部分通過（通用按鈕免選金鑰已確認，但 Windows 安全性操作畫面未置前）；commit `ab3d123` 的焦點修正候選已部署，GUI SHA256 `42D6DB566BEA217282D5BB487FA5DFB207B9252D2F3B1349938C4BB658AB2B58`，尚待本機 Console 驗收 H2。RDP-Tcp#0 Session 2 曾回報 WebAuthn API v1 並依 v4+ fail-closed；RDP redirection 未驗收，不可移除安全檢查。
+- 本次單一登入入口/提示前景修改：使用者確認 Win11-NB Console 啟動正常；H1、H3、H4、H5 通過。H2 通用按鈕免選金鑰通過，但最新候選仍讓 Windows 安全性畫面留在背景；診斷記錄顯示 API 呼叫前 FidoVault HWND 是 foreground、可見且未最小化，需再查 broker 對話框 owner/z-order。commit `ab3d123` 已部署，GUI SHA256 `42D6DB566BEA217282D5BB487FA5DFB207B9252D2F3B1349938C4BB658AB2B58`；最新 Console 重測 H2 仍未通過，下一步抓取 security dialog 的實際 owner/z-order。RDP-Tcp#0 Session 2 曾回報 WebAuthn API v1 並依 v4+ fail-closed；RDP redirection 未驗收，不可移除安全檢查。
 - 建置檔參數：release `strip + lto`。
 
 ## 7. 部署（Win11-NB，WinRM）
