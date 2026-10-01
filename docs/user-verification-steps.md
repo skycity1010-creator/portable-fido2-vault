@@ -7,6 +7,9 @@
 ## 部署後驗證前確認（2026-10-01）
 已部署 PR #3 的 Windows GNU Release GUI，SHA256：`E9A28C81C73456800E3F1FAF0E8F1A9F6576146C8A675F5AB125FF9135ED8503`。替換前舊 exe 已備份為 `C:\FidoVault\portable-fido-vault.exe.pre-single-key-20261001-112834.bak`（SHA256 `06B1C5BE7A5E760D28D594B128A1B5BC681C31A6FD26D672E942E5F1062F0EA2`）。`vault.db` 未替換，SHA256 `848F961C4C5CB741EF1ADE452008F1D3F17649D06582B4809CEBFC4E16877B99`，3 個 key slots；備份 `C:\FidoVault\vault.db.pre-single-key-20261001-112834.bak` SHA256 相同。部署前 WinRM read-only process check 為 0 個 FIDO client，`F2V_AUTHENTICATOR` 使用者/系統變數均未設定。
 
+## H2 焦點修正候選部署（2026-10-01）
+PR #3 commit `ab3d123` 的 Windows GNU Release GUI 已部署至 `C:\FidoVault\portable-fido-vault.exe`，SHA256 `42D6DB566BEA217282D5BB487FA5DFB207B9252D2F3B1349938C4BB658AB2B58`（6,121,472 bytes）。部署前 exe 備份：`C:\FidoVault\portable-fido-vault.exe.pre-focusfix-20261001-203755-e9759808.bak`，SHA256 `E9A28C81C73456800E3F1FAF0E8F1A9F6576146C8A675F5AB125FF9135ED8503`。vault 備份：`C:\FidoVault\vault.db.pre-focusfix-20261001-203755-e9759808.bak`，SHA256 `EB3A9271259DE1A0348DFF031F922456248C5A21A5B387000F6B03B6E4488C46`。部署後遠端回讀確認 exe hash 相符；`vault.db` 保持相同 hash、3 個 key slots；FIDO client process 為 0，user/machine `F2V_AUTHENTICATOR` 均未設定。尚待使用者於本機 Console 驗收 H2 前景；WinRM 未啟動 GUI、未執行 WebAuthn。
+
 執行所需檔案如下；`C:\FidoVault` 也有診斷紀錄與備份檔，**不要因舊版「只有三個檔案」說明而刪除任何其他檔案**：
 
 | 檔案 | 說明 |
