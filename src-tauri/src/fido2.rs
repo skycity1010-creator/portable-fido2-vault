@@ -176,6 +176,27 @@ pub trait FidoBackend: Send {
         pin: Option<&str>,
     ) -> Result<[u8; 32], FidoError>;
 
+    /// Selects one credential from the registered candidates and returns its ID with its PRF secret.
+    /// Interactive broker backends should submit all candidates in one operation and report the
+    /// authenticator-selected credential. The default keeps deterministic mock/single-key behavior.
+    fn get_prf_secret_for_any(
+        &mut self,
+        credential_ids: &[Vec<u8>],
+        pin: Option<&str>,
+    ) -> Result<(Vec<u8>, [u8; 32]), FidoError> {
+        let credential_id = credential_ids.first().ok_or(FidoError::NoDevice)?;
+        let secret = self.get_prf_secret(credential_id, pin)?;
+        Ok((credential_id.clone(), secret))
+    }
+
+    /// Update the native owner HWND before a Windows broker interaction; other backends ignore it.
+    fn set_webauthn_parent_hwnd(&mut self, _handle: isize) {}
+
+    /// Whether this backend delegates credential selection and PIN/UV prompts to a native broker.
+    fn uses_brokered_key_selection(&self) -> bool {
+        false
+    }
+
     /// 預覽「下一支」偵測到的金鑰類型（**不消耗狀態**，供 UI 決定要不要收 PIN）。
     /// 實體後端回目前金鑰類型；mock 回循環中的下一個。
     fn peek_kind(&self) -> KeyKind {
@@ -1068,6 +1089,11 @@ pub use real::RealBackend;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mock_backend_keeps_non_brokered_key_selection_ui() {
+        assert!(!MockBackend::new().uses_brokered_key_selection());
+    }
 
     #[test]
     fn mock_prf_deterministic() {

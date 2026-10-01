@@ -48,11 +48,17 @@ Windows Release GUI（`real-ctap`）從檔案總管啟動時使用 Windows WebAu
 ## 使用流程
 
 1. **首次執行**：輸入主密碼（兩次）→ 建立 `vault.db` → 可順手註冊 FIDO2 金鑰。
-2. **登入**：主密碼，或選擇已註冊的 FIDO2 金鑰；Windows GUI 依提示開啟 Windows 安全性視窗，由系統處理觸碰／指紋／PIN。
+2. **登入**：主密碼，或在 Windows Release 硬體模式按單一「以金鑰登入」入口；Windows 安全性視窗負責選擇／驗證已註冊的金鑰及 PIN/UV/觸碰，不必先在 App 點選特定金鑰。非 brokered 的 Mock/raw-CTAP 模式仍使用逐支選擇與 PIN 欄位。
 3. **條目**：新增/編輯/刪除（網站、帳號、密碼、備註），自動記 created_at/updated_at。
 4. **金鑰管理**：註冊新金鑰（自動偵測類型）／移除金鑰（不可逆，需確認）。
 5. **軌跡紀錄**：登入成功/失敗、金鑰註冊/移除、條目增刪改＋時間（不含任何密碼明文）。
 6. **設定**：閒置自動上鎖分鐘數（預設 5）。
+
+## Windows WebAuthn 與安全性提示焦點
+
+Windows Release 硬體模式以單一通用「以金鑰登入」入口呼叫 Windows WebAuthn；金鑰選擇、PIN/UV 與觸碰由 Windows 安全性提示處理。操作期間，程式會對唯一的新同 session 安全性 broker 視窗做一次受限的前景請求，但只有在 FidoVault 仍為前景時才嘗試；不會把提示設成 topmost，也不會繞過 Windows 的全域前景政策。這是 best-effort，Windows 仍可能切換焦點。
+
+Win11-NB 本機 Console 已確認通用登入不需先選金鑰，Windows 安全性操作提示也出現在前景。Windows WebAuthn API v4+ 仍是硬體 GUI 的必要條件；較舊 API 版本會 fail closed。
 
 ## portable 部署到別台電腦（Win11-NB）
 

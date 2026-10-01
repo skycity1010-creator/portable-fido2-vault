@@ -239,15 +239,66 @@ impl Vault {
             .map_err(|_| VaultError::Format("credential_id 解碼失敗".into()))?;
         // PinRequired → 尚未真正嘗試，不記失敗（使用者只是還沒提供 PIN）。
         let secret = backend.get_prf_secret(&cred_id, pin)?;
+        Self::open_with_key_secret(path, header, payload, slot, secret)
+    }
+
+    /// FIDO2 金鑰登入：一次交給 backend 所有槽位，由 broker 選擇 credential。
+    pub fn open_any_key(
+        path: &Path,
+        pin: Option<&str>,
+        backend: &mut (dyn FidoBackend + 'static),
+    ) -> Result<Self, VaultError> {
+        let (header, payload) = Self::read_file(path)?;
+        let credential_ids = header
+            .key_slots
+            .iter()
+            .map(|slot| {
+                base64_decode(&slot.credential_id)
+                    .map_err(|_| VaultError::Format("credential_id 解碼失敗".into()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if credential_ids.is_empty() {
+            return Err(VaultError::Fido(FidoError::NoDevice));
+        }
+
+        let (selected_id, secret) = backend.get_prf_secret_for_any(&credential_ids, pin)?;
+        let selected_id_b64 = base64_encode(&selected_id);
+        let slot = header
+            .key_slots
+            .iter()
+            .find(|slot| slot.credential_id == selected_id_b64)
+            .ok_or_else(|| {
+                VaultError::Fido(FidoError::Internal(
+                    "backend selected a credential not registered in this vault".into(),
+                ))
+            })?
+            .clone();
+        Self::open_with_key_secret(path, header, payload, slot, secret)
+    }
+
+    fn open_with_key_secret(
+        path: &Path,
+        header: Header,
+        payload: ([u8; 12], Vec<u8>),
+        slot: KeySlot,
+        secret: [u8; 32],
+    ) -> Result<Self, VaultError> {
         let k = kek_from_prf_secret(&secret);
         let nonce = slot_nonce(&slot.nonce)?;
-        let ct = base64_decode(&slot.ct).map_err(|_| VaultError::Format("key slot 解碼失敗".into()))?;
+        let ct =
+            base64_decode(&slot.ct).map_err(|_| VaultError::Format("key slot 解碼失敗".into()))?;
 
         match aes_gcm_decrypt(&k, &nonce, &ct) {
             Ok(kek_bytes) if kek_bytes.len() == 32 => {
                 let mut kek = [0u8; 32];
                 kek.copy_from_slice(&kek_bytes);
-                Self::unlock(path, header, payload, Zeroizing::new(kek), &format!("fido2:{}", slot.label))
+                Self::unlock(
+                    path,
+                    header,
+                    payload,
+                    Zeroizing::new(kek),
+                    &format!("fido2:{}", slot.label),
+                )
             }
             _ => {
                 record_login_failure(path, &format!("fido2:{}", slot.label))?;
@@ -666,6 +717,95 @@ mod tests {
         let mut b = MockBackend::new();
         let v = Vault::open_key(&p, &base64_encode(&k2.credential_id), Some("1234"), &mut b).unwrap();
         assert!(!v.entries().iter().any(|_| false)); // 解鎖成功即可
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    struct ChosenCredentialBackend {
+        selected_id: Vec<u8>,
+        return_unregistered: bool,
+    }
+
+    impl FidoBackend for ChosenCredentialBackend {
+        fn detect(&mut self) -> Result<crate::fido2::DetectedKey, FidoError> {
+            Err(FidoError::NoDevice)
+        }
+
+        fn register_credential(
+            &mut self,
+            _detected: &crate::fido2::DetectedKey,
+            _pin: Option<&str>,
+        ) -> Result<RegisteredCredential, FidoError> {
+            Err(FidoError::NoDevice)
+        }
+
+        fn get_prf_secret(&mut self, id: &[u8], _pin: Option<&str>) -> Result<[u8; 32], FidoError> {
+            Ok(MockBackend::prf_for_credential(id))
+        }
+
+        fn get_prf_secret_for_any(
+            &mut self,
+            credential_ids: &[Vec<u8>],
+            _pin: Option<&str>,
+        ) -> Result<(Vec<u8>, [u8; 32]), FidoError> {
+            if !self.return_unregistered && !credential_ids.contains(&self.selected_id) {
+                return Err(FidoError::NoDevice);
+            }
+            Ok((
+                self.selected_id.clone(),
+                MockBackend::prf_for_credential(&self.selected_id),
+            ))
+        }
+    }
+
+    #[test]
+    fn any_key_login_uses_the_credential_selected_by_the_backend() {
+        let d = tmp_dir("any-key-selected");
+        let p = d.join("vault.db");
+        let _ = fs::remove_file(&p);
+        let v = Vault::create(&p, "Pw-12345").unwrap();
+        drop(v);
+
+        let mut register_backend = MockBackend::new();
+        let mut v = Vault::open_password(&p, "Pw-12345").unwrap();
+        let first = v.register_key(&mut register_backend, None).unwrap();
+        let second = v.register_key(&mut register_backend, Some("1234")).unwrap();
+        assert_ne!(first.credential_id, second.credential_id);
+        let expected_method = format!("fido2:{}", second.label);
+        drop(v);
+
+        let mut login_backend = ChosenCredentialBackend {
+            selected_id: second.credential_id,
+            return_unregistered: false,
+        };
+        let unlocked = Vault::open_any_key(&p, None, &mut login_backend).unwrap();
+        assert!(unlocked
+            .audit()
+            .iter()
+            .any(|event| { event.event == "login_success" && event.method == expected_method }));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn any_key_login_rejects_a_credential_id_not_in_the_vault() {
+        let d = tmp_dir("any-key-unknown");
+        let p = d.join("vault.db");
+        let _ = fs::remove_file(&p);
+        let v = Vault::create(&p, "Pw-12345").unwrap();
+        drop(v);
+
+        let mut register_backend = MockBackend::new();
+        let mut v = Vault::open_password(&p, "Pw-12345").unwrap();
+        v.register_key(&mut register_backend, None).unwrap();
+        drop(v);
+
+        let mut login_backend = ChosenCredentialBackend {
+            selected_id: vec![0xA5; 32],
+            return_unregistered: true,
+        };
+        assert!(matches!(
+            Vault::open_any_key(&p, None, &mut login_backend),
+            Err(VaultError::Fido(FidoError::Internal(_)))
+        ));
         let _ = fs::remove_dir_all(&d);
     }
 

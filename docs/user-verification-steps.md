@@ -2,9 +2,20 @@
 
 > 適用：Win11-NB，`C:\FidoVault`（portable 資料夾）。完成約 15–20 分鐘。
 > Windows Release GUI 必須以 `--features real-ctap` 建置；一般權限的檔案總管直接啟動時使用 Windows WebAuthn API，無需環境變數或系統管理員提升。Windows 安全性視窗負責 PIN/UV/觸碰；目標系統需 WebAuthn API v4+。Debug build 預設為 MockBackend；明確跑 mock 流程時設定 `F2V_AUTHENTICATOR=mock`。
+> **Win11-NB RDP 注意：**已確認 `RDP-Tcp#0` Session 2 的 WebAuthn API 回報 v1，程式依 v4+ fail-closed 而閃退；使用者確認從 Console 啟動可正常開啟。H1–H5 請在 Console session 驗收；RDP redirection 路線未驗收，勿降低 API 版本檢查。
 
 ## 部署後驗證前確認（2026-10-01）
-已部署的 Release GUI 為 Windows WebAuthn 版本，SHA256：`06B1C5BE7A5E760D28D594B128A1B5BC681C31A6FD26D672E942E5F1062F0EA2`。部署時只替換主程式，`vault.db` 未變更；當時有 1 個金鑰槽。`F2V_AUTHENTICATOR` 的使用者與系統環境變數均未設定。
+已部署 PR #3 的 Windows GNU Release GUI，SHA256：`E9A28C81C73456800E3F1FAF0E8F1A9F6576146C8A675F5AB125FF9135ED8503`。替換前舊 exe 已備份為 `C:\FidoVault\portable-fido-vault.exe.pre-single-key-20261001-112834.bak`（SHA256 `06B1C5BE7A5E760D28D594B128A1B5BC681C31A6FD26D672E942E5F1062F0EA2`）。`vault.db` 未替換，SHA256 `848F961C4C5CB741EF1ADE452008F1D3F17649D06582B4809CEBFC4E16877B99`，3 個 key slots；備份 `C:\FidoVault\vault.db.pre-single-key-20261001-112834.bak` SHA256 相同。部署前 WinRM read-only process check 為 0 個 FIDO client，`F2V_AUTHENTICATOR` 使用者/系統變數均未設定。
+
+## H2 焦點修正候選部署（2026-10-01）
+PR #3 commit `ab3d123` 的 Windows GNU Release GUI 已部署至 `C:\FidoVault\portable-fido-vault.exe`，SHA256 `42D6DB566BEA217282D5BB487FA5DFB207B9252D2F3B1349938C4BB658AB2B58`（6,121,472 bytes）。部署前 exe 備份：`C:\FidoVault\portable-fido-vault.exe.pre-focusfix-20261001-203755-e9759808.bak`，SHA256 `E9A28C81C73456800E3F1FAF0E8F1A9F6576146C8A675F5AB125FF9135ED8503`。vault 備份：`C:\FidoVault\vault.db.pre-focusfix-20261001-203755-e9759808.bak`，SHA256 `EB3A9271259DE1A0348DFF031F922456248C5A21A5B387000F6B03B6E4488C46`。部署後遠端回讀確認 exe hash 相符；`vault.db` 保持相同 hash、3 個 key slots；FIDO client process 為 0，user/machine `F2V_AUTHENTICATOR` 均未設定。尚待使用者於本機 Console 驗收 H2 前景；WinRM 未啟動 GUI、未執行 WebAuthn。
+
+## H2 broker 對話框前景候選部署（2026-10-01）
+唯讀 Console 探測確認：擷取時 FidoVault HWND `0x1D056C` 是 foreground、z-order 17；`CredentialUIBroker` HWND `0x1203CE`（PID 1492，Session 2）顯示「Windows 安全性」、class `Credential Dialog Xaml Host`，z-order 18，`OWNER=0`、`ROOTOWNER` 為自身。這證實 broker 對話框是獨立的 unowned top-level window；主窗置前不會自動提升它。
+
+新候選在 GetAssertion/MakeCredential 等待期間監測；只有唯一、同 session、新建立的 System32 `CredentialUIBroker.exe` 安全性視窗才嘗試一次 `SetForegroundWindow`，並要求使用者仍把 FidoVault 留在 foreground。基線包含隱藏 top-level 視窗及既有 broker PID；不改對話框 owner、不設 topmost、不使用 `ASFW_ANY`。前景交接仍是 best-effort，Windows 在檢查與呼叫間仍可能切換焦點。
+
+新候選來源 commit `45d3aa6`（PR #3）部署為 `C:\FidoVault\portable-fido-vault.exe` SHA256 `59BBAB25C21A419702D02FA7E97242392C388149432BAF733AC0C715F06085D8`（6,140,928 bytes）。取代前 GUI 備份 `C:\FidoVault\portable-fido-vault.exe.pre-H2focus-20261001-223428-2985cea4.bak`，SHA256 `42D6DB566BEA217282D5BB487FA5DFB207B9252D2F3B1349938C4BB658AB2B58`。vault 備份 `C:\FidoVault\vault.db.pre-H2focus-20261001-223428-2985cea4.bak`，SHA256 `58A1D4877C2274B3D403E1D87CD1E9BA7C5404D450C3F69E1D9486501F02D780`；部署前後維持 3 個 slots 與相同 vault hash。`WebView2Loader.dll` 未替換，SHA256 `86545B66CDB0603BC26B626FB9AD610CB6E71F28D468F5EA66DF23B03DDA96D5`；user/machine `F2V_AUTHENTICATOR` 均未設定，遠端沒有啟動 GUI 或 WebAuthn。程式碼獨立審查通過，Rust 53/53、UI 4/4、GNU Release build 成功。**使用者已確認 H2 本機 Console 測試 OK：通用登入免選金鑰，Windows 安全性操作提示置前；本項已結案。**
 
 執行所需檔案如下；`C:\FidoVault` 也有診斷紀錄與備份檔，**不要因舊版「只有三個檔案」說明而刪除任何其他檔案**：
 
@@ -15,7 +26,7 @@
 | `vault.db` | 既有金庫資料；驗證前另做使用者備份，切勿刪除或重建 |
 | `vault_cli.exe` | 選用 CLI；保留 raw CTAP 診斷路徑，本次部署未替換 |
 
-> 這台 NB 已有既存 `vault.db`。A–F 是全新測試金庫的舊 Gate 流程；本次請照 **G 節** 驗證，勿建立、清空或重建現有金庫。
+> 這台 NB 已有既存 `vault.db`，目前有 3 個 key slots。A–F 是全新測試金庫的舊 Gate 流程；G4–G6 是先前已完成的實體驗收（其步驟中的槽位數是當時紀錄，不代表目前數量）。本次請驗收 **H1–H5**，勿建立、清空或重建現有金庫。
 
 ## A. Gate 1 — 雙擊免安裝執行
 - [ ] **A1** 雙擊 `C:\FidoVault\portable-fido-vault.exe`
@@ -72,16 +83,26 @@ F: F1 _ / F2 _ / F3 _
 
 ## G. Gate 3/4 — 實體 YubiKey Bio 註冊與登入（Release GUI）
 
-> 本節不需設定 `F2V_AUTHENTICATOR`；請以一般權限從檔案總管啟動。Windows 安全性視窗負責安全金鑰選擇、PIN/UV 與觸碰。
+> 本節不需設定 `F2V_AUTHENTICATOR`；此 Win11-NB 請從本機 Console session 以一般權限啟動，不要從 RDP session 啟動。Windows 安全性視窗負責安全金鑰選擇、PIN/UV 與觸碰。
 
 - [ ] **G1** 在 Win11-NB 本機互動桌面確認沒有 `vault_cli`、`portable-fido-vault` 或 `yk_open_test` 程序；若有，正常關閉，不要 force-kill。
-- [ ] **G2** 關閉 GUI 後備份 `C:\FidoVault\vault.db`，並記下註冊前金鑰槽位數。
+- [x] **G2** 部署前已備份 `C:\FidoVault\vault.db` 並記錄 baseline：3 個 key slots、SHA256 與備份路徑見上方；切勿刪除或重建此金庫。
 - [ ] **G3** 用一般權限（非系統管理員）的檔案總管直接啟動 `C:\FidoVault\portable-fido-vault.exe`；不設 `F2V_AUTHENTICATOR`。啟動診斷應顯示 `GUI FIDO backend selected: windows-webauthn`。
-- [ ] **G4（舊槽相容性）** 先在登入畫面選取原有金鑰槽，用建立該槽的實體金鑰嘗試登入。成功可確認舊 raw-CTAP 槽能由 Windows WebAuthn backend 解鎖；此時槽位數仍應為 1。若失敗，不要移除或覆寫舊槽；記下錯誤，再用主密碼登入後繼續測試。
-- [ ] **G5（註冊）** 登入後進入「金鑰管理」→「＋ 註冊新金鑰」。依 Windows 安全性視窗選用外接安全金鑰，插入 YubiKey Bio，按提示觸碰／按指紋；如要求 PIN，只在本機系統視窗輸入，不要改用 Windows Hello。
-- [ ] **G6（新槽登入）** 確認 UI 顯示「已註冊」、金鑰出現在清單，槽位數由 1 增至 2；上鎖後用新金鑰登入。若要驗證 Gate 4，再註冊第二支支援 PRF 的實體金鑰並交叉登入。
+- [x] **G4（舊槽相容性；先前已驗收）** 以原有實體金鑰完成 Windows 安全性提示，確認舊 raw-CTAP 槽能由 Windows WebAuthn backend 解鎖；驗收當時槽位數為 1。若本次 H 驗收遇到登入失敗，不要移除或覆寫任何槽位。
+- [x] **G5（註冊；先前已驗收）** 「金鑰管理」→「＋ 註冊新金鑰」註冊 YubiKey Bio；Windows 安全性提示與觸碰／指紋流程已通過，PIN 只在本機提示輸入。
+- [x] **G6（新槽登入；先前已驗收）** 新槽登入已通過；第二支 YubiKey NFC 亦已註冊並完成交叉登入。這些完成當時的槽位數紀錄不代表目前數量；目前部署前 baseline 為 3 個 key slots。
 
 若視窗未啟動或金鑰未要求互動，保留目前 vault 備份並回報 UI 狀態；不要移除任何無法辨識的槽位。
+
+## H. 單一金鑰登入入口與 Windows 安全性視窗前景驗收
+
+> 使用已完成 G4–G6 的既有金庫與兩支不同 YubiKey；不要重建或刪除任何 key slot。主密碼登入仍須保留。
+
+- [x] **H1** 登入畫面仍有主密碼欄位；金鑰區不列出逐支金鑰卡片，只顯示一個通用「以金鑰登入」按鈕。
+- [x] **H2** 通用按鈕不需先選金鑰；使用者已確認 Win11-NB 本機 Console 測試中 Windows 安全性操作提示出現在前景。broker 視窗置前仍是 best-effort，Windows 可能在其他情境切換焦點。
+- [x] **H3** 上鎖後用同一按鈕改用第二支 YubiKey NFC 登入，確認可解鎖相同金庫。
+- [x] **H4** 取消 Windows 金鑰操作，確認金庫仍維持鎖定、顯示錯誤/取消狀態，且可重試或改用主密碼登入。
+- [x] **H5** 使用者回報註冊流程通過；H2 前景驗收已另行完成。本次不需註冊多餘金鑰。
 
 ## 常見狀況
 | 現象 | 說明 |

@@ -4,6 +4,11 @@
 use std::sync::Mutex;
 use tauri::Manager;
 
+#[cfg(windows)]
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    GetForegroundWindow, IsIconic, IsWindowVisible, SetForegroundWindow, ShowWindow, SW_RESTORE,
+};
+
 #[cfg(feature = "mock-fido")]
 use crate::fido2::MockBackend;
 #[cfg(all(feature = "real-ctap", not(windows)))]
@@ -49,6 +54,7 @@ pub struct LoginScreenInfo {
     pub has_vault: bool,
     pub keys: Vec<KeyInfo>,
     pub idle_lock_minutes: u32,
+    pub brokered_key_login: bool,
 }
 
 /// Backend policy for the GUI. Keeping this pure makes the release/debug policy testable without hardware.
@@ -170,6 +176,86 @@ fn path_from_state_or_default() -> std::path::PathBuf {
     dir.join("vault.db")
 }
 
+fn ensure_parent_window_ready(
+    require_foreground: bool,
+    is_foreground: bool,
+    visible: bool,
+    minimized: bool,
+) -> Result<()> {
+    if !require_foreground || (is_foreground && visible && !minimized) {
+        Ok(())
+    } else {
+        Err("Windows could not activate the visible FidoVault window. Bring FidoVault to the foreground and retry; no security-key operation was started.".into())
+    }
+}
+
+/// Restore and activate the live top-level HWND before entering the blocking
+/// Windows WebAuthn call.
+fn raise_key_operation_window(
+    window: &tauri::WebviewWindow,
+    require_foreground: bool,
+) -> Result<isize> {
+    #[cfg(windows)]
+    {
+        if !require_foreground {
+            if let Err(error) = window.unminimize() {
+                log::warn!("Could not unminimize the FIDO parent window: {error}");
+            }
+            if let Err(error) = window.show() {
+                log::warn!("Could not show the FIDO parent window: {error}");
+            }
+            if let Err(error) = window.set_focus() {
+                log::warn!("Could not focus the FIDO parent window: {error}");
+            }
+            return Ok(0);
+        }
+
+        let hwnd = window
+            .hwnd()
+            .map_err(|error| format!("Could not get the live FidoVault HWND: {error}"))?;
+        if hwnd.0.is_null() {
+            return Err(
+                "The live FidoVault HWND is null; no security-key operation was started.".into(),
+            );
+        }
+
+        let foreground_before = unsafe { GetForegroundWindow() };
+        unsafe { ShowWindow(hwnd.0, SW_RESTORE) };
+        let set_foreground = unsafe { SetForegroundWindow(hwnd.0) != 0 };
+        let foreground_after = unsafe { GetForegroundWindow() };
+        let visible = unsafe { IsWindowVisible(hwnd.0) != 0 };
+        let minimized = unsafe { IsIconic(hwnd.0) != 0 };
+        let is_foreground = foreground_after == hwnd.0;
+        log::info!(
+            "WebAuthn parent focus snapshot: hwnd={:p} foreground_before={:p} set_foreground={} foreground_after={:p} visible={} minimized={} is_foreground={}",
+            hwnd.0,
+            foreground_before,
+            set_foreground,
+            foreground_after,
+            visible,
+            minimized,
+            is_foreground,
+        );
+        ensure_parent_window_ready(require_foreground, is_foreground, visible, minimized)?;
+        Ok(hwnd.0 as isize)
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = require_foreground;
+        if let Err(error) = window.unminimize() {
+            log::warn!("Could not unminimize the FIDO parent window: {error}");
+        }
+        if let Err(error) = window.show() {
+            log::warn!("Could not show the FIDO parent window: {error}");
+        }
+        if let Err(error) = window.set_focus() {
+            log::warn!("Could not focus the FIDO parent window: {error}");
+        }
+        Ok(0)
+    }
+}
+
 // ─────────────────────────── commands ───────────────────────────
 
 /// 啟動畫面資訊：是否有金庫、已註冊金鑰清單（供登入畫面）。
@@ -177,9 +263,18 @@ fn path_from_state_or_default() -> std::path::PathBuf {
 fn boot_info(state: tauri::State<VaultState>) -> Result<LoginScreenInfo> {
     let path = path_from_state_or_default();
     let has_vault = path.exists();
-    let keys = if has_vault { read_keys_from_file(&path)? } else { Vec::new() };
-    let _ = state; // idle 設定需解鎖後才有意義；boot 時回預設 5
-    Ok(LoginScreenInfo { has_vault, keys, idle_lock_minutes: 5 })
+    let keys = if has_vault {
+        read_keys_from_file(&path)?
+    } else {
+        Vec::new()
+    };
+    let brokered_key_login = state.with_lock(|g| Ok(g.backend.uses_brokered_key_selection()))?;
+    Ok(LoginScreenInfo {
+        has_vault,
+        keys,
+        idle_lock_minutes: 5,
+        brokered_key_login,
+    })
 }
 
 /// 讀取 vault.db 的 header（不需 KEK）→ 金鑰清單。
@@ -226,33 +321,81 @@ fn login_password(state: tauri::State<VaultState>, password: String) -> Result<V
     let path = path_from_state_or_default();
     let v = vault::Vault::open_password(&path, &password).map_err(|e| e.to_string())?;
     let entries = v.entries().to_vec();
-    state.with_lock(|g| { g.vault = Some(v); Ok(()) })?;
+    state.with_lock(|g| {
+        g.vault = Some(v);
+        Ok(())
+    })?;
     Ok(entries)
 }
 
 /// FIDO2 金鑰登入。pin：PIN 型金鑰必填；其他類型忽略。
 #[tauri::command]
-fn login_key(state: tauri::State<VaultState>, credential_id: String, pin: Option<String>) -> Result<Vec<vault::Entry>> {
+fn login_key(
+    window: tauri::WebviewWindow,
+    state: tauri::State<VaultState>,
+    credential_id: String,
+    pin: Option<String>,
+) -> Result<Vec<vault::Entry>> {
+    let require_foreground = state.with_lock(|g| Ok(g.backend.uses_brokered_key_selection()))?;
+    let owner_hwnd = raise_key_operation_window(&window, require_foreground)?;
     let path = path_from_state_or_default();
     let v = state.with_lock(|g| {
+        g.backend.set_webauthn_parent_hwnd(owner_hwnd);
         vault::Vault::open_key(&path, &credential_id, pin.as_deref(), g.backend.as_mut())
             .map_err(|e| e.to_string())
     })?;
     let entries = v.entries().to_vec();
-    state.with_lock(|g| { g.vault = Some(v); Ok(()) })?;
+    state.with_lock(|g| {
+        g.vault = Some(v);
+        Ok(())
+    })?;
+    Ok(entries)
+}
+
+/// FIDO2 key login without a UI-selected key; let the active backend select from every vault slot.
+#[tauri::command]
+fn login_any_key(
+    window: tauri::WebviewWindow,
+    state: tauri::State<VaultState>,
+) -> Result<Vec<vault::Entry>> {
+    let require_foreground = state.with_lock(|g| Ok(g.backend.uses_brokered_key_selection()))?;
+    let owner_hwnd = raise_key_operation_window(&window, require_foreground)?;
+    let path = path_from_state_or_default();
+    let v = state.with_lock(|g| {
+        g.backend.set_webauthn_parent_hwnd(owner_hwnd);
+        vault::Vault::open_any_key(&path, None, g.backend.as_mut()).map_err(|e| e.to_string())
+    })?;
+    let entries = v.entries().to_vec();
+    state.with_lock(|g| {
+        g.vault = Some(v);
+        Ok(())
+    })?;
     Ok(entries)
 }
 
 /// 上鎖（手動或閒置）。回傳登入畫面資訊。
 #[tauri::command]
 fn lock(state: tauri::State<VaultState>, reason: Option<String>) -> Result<LoginScreenInfo> {
-    let header = state.with_lock(|g| {
+    let (header, brokered_key_login) = state.with_lock(|g| {
+        let brokered_key_login = g.backend.uses_brokered_key_selection();
         match g.vault.take() {
-            Some(v) => Ok(if reason.as_deref() == Some("idle") { v.auto_lock() } else { v.lock() }),
+            Some(v) => Ok((
+                if reason.as_deref() == Some("idle") {
+                    v.auto_lock()
+                } else {
+                    v.lock()
+                },
+                brokered_key_login,
+            )),
             None => Err("尚未解鎖".to_string()),
         }
     })?;
-    Ok(LoginScreenInfo { has_vault: true, keys: (&header).into(), idle_lock_minutes: 5 })
+    Ok(LoginScreenInfo {
+        has_vault: true,
+        keys: (&header).into(),
+        idle_lock_minutes: 5,
+        brokered_key_login,
+    })
 }
 
 fn with_unlocked<R>(state: &VaultState, f: impl FnOnce(&mut vault::Vault) -> Result<R>) -> Result<R> {
@@ -308,13 +451,21 @@ fn list_audit(state: tauri::State<VaultState>) -> Result<Vec<vault::AuditEvent>>
 }
 
 #[tauri::command]
-fn register_key(state: tauri::State<VaultState>, pin: Option<String>) -> Result<fido2::RegisteredCredential> {
+fn register_key(
+    window: tauri::WebviewWindow,
+    state: tauri::State<VaultState>,
+    pin: Option<String>,
+) -> Result<fido2::RegisteredCredential> {
+    let require_foreground = state.with_lock(|g| Ok(g.backend.uses_brokered_key_selection()))?;
+    let owner_hwnd = raise_key_operation_window(&window, require_foreground)?;
     // 同一後端實例內 detect+register → 類型一致。
-    state.with_lock(|g| {
-        match g.vault.as_mut() {
-            Some(v) => v.register_key(g.backend.as_mut(), pin.as_deref()).map_err(|e| e.to_string()),
-            None => Err("金庫未解鎖".to_string()),
+    state.with_lock(|g| match g.vault.as_mut() {
+        Some(v) => {
+            g.backend.set_webauthn_parent_hwnd(owner_hwnd);
+            v.register_key(g.backend.as_mut(), pin.as_deref())
+                .map_err(|e| e.to_string())
         }
+        None => Err("金庫未解鎖".to_string()),
     })
 }
 
@@ -361,7 +512,7 @@ pub fn run() {
             #[cfg(windows)]
             if window_handle == 0 {
                 log::warn!(
-                    "Main window HWND unavailable; WebAuthn prompt will use a null parent window"
+                    "Main window HWND unavailable during setup; key commands will fetch and validate the live HWND before WebAuthn calls"
                 );
             }
             let inner = AppInner::new(window_handle).map_err(std::io::Error::other)?;
@@ -373,6 +524,7 @@ pub fn run() {
             create_vault,
             login_password,
             login_key,
+            login_any_key,
             lock,
             list_entries,
             add_entry,
@@ -451,5 +603,19 @@ mod backend_mode_tests {
     #[test]
     fn release_without_real_ctap_does_not_silently_select_mock() {
         assert!(resolve_backend_mode(None, false, false, true).is_err());
+    }
+}
+
+#[cfg(test)]
+mod focus_window_tests {
+    use super::ensure_parent_window_ready;
+
+    #[test]
+    fn key_operation_requires_a_visible_unminimized_foreground_parent() {
+        assert!(ensure_parent_window_ready(true, true, true, false).is_ok());
+        assert!(ensure_parent_window_ready(true, false, true, false).is_err());
+        assert!(ensure_parent_window_ready(true, true, false, false).is_err());
+        assert!(ensure_parent_window_ready(true, true, true, true).is_err());
+        assert!(ensure_parent_window_ready(false, false, false, true).is_ok());
     }
 }
