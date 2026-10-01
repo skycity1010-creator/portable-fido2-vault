@@ -123,7 +123,7 @@ cargo +stable-x86_64-pc-windows-gnu build --release --features real-ctap --bin p
 - Windows Release GUI 無需 `F2V_AUTHENTICATOR` 或系統管理員權限即可走 brokered backend；Debug 預設 mock，mock demo 可明確設 `F2V_AUTHENTICATOR=mock`。
 - 驗證（2026-10-01）：`cargo test --locked --features real-ctap --lib` 53/53；Release backend-mode 7/7；vendor `device_filter` 6/6；Gate E2E 20/20；login UI Node tests 4/4；Windows GNU Release GUI + CLI build 成功。
 - 實體驗收已由使用者在 Win11-NB 互動桌面通過：舊 raw-CTAP 槽可由 Windows WebAuthn 解鎖、新金鑰註冊與登入成功，第二支 YubiKey NFC 交叉登入亦通過；不再執行原 Kanban 規劃的 raw-CTAP CLI 實體路線。
-- 本次單一登入入口/提示前景修改：使用者確認 Console 啟動正常；H1、H3、H4、H5 通過。H2 通用按鈕免選金鑰通過；上一候選的安全性視窗仍在背景。Console 唯讀 EnumWindows 探測確認 FidoVault 前景 z-order 17，獨立 `CredentialUIBroker`「Windows 安全性」視窗 z-order 18、`OWNER=0`。新增窄範圍 best-effort broker-window monitor：baseline 所有 top-level HWND 與既有 broker PID，只針對唯一的新同-session System32 CredentialUIBroker 視窗，在 FidoVault 仍為 foreground 時嘗試一次 SetForegroundWindow；不設 topmost、不用 ASFW_ANY。程式碼獨立審查通過；commit `45d3aa6` 已推至 PR #3 branch；Rust 53/53、UI 4/4、Windows GNU Release build 成功。該 commit 的新 GUI 已部署至 Win11-NB，SHA256 `59BBAB25C21A419702D02FA7E97242392C388149432BAF733AC0C715F06085D8`，6,140,928 bytes；舊 exe 備份 `C:\FidoVault\portable-fido-vault.exe.pre-H2focus-20261001-223428-2985cea4.bak`。vault 備份 `C:\FidoVault\vault.db.pre-H2focus-20261001-223428-2985cea4.bak`；部署前後均為 3 slots、SHA256 `58A1D4877C2274B3D403E1D87CD1E9BA7C5404D450C3F69E1D9486501F02D780`。本機 Console H2 測試已由使用者確認 OK：通用登入免選金鑰，Windows 安全性操作提示置前；H2 驗收通過並結案。前景交接仍是 best-effort。RDP-Tcp#0 Session 2 曾回報 WebAuthn API v1，維持 v4+ fail-closed；RDP redirection 未驗收。
+- 本次單一登入入口/提示前景修改：使用者確認 Console 啟動正常；H1、H3、H4、H5 通過。H2 通用按鈕免選金鑰通過；上一候選的安全性視窗仍在背景。Console 唯讀 EnumWindows 探測確認 FidoVault 前景 z-order 17，獨立 `CredentialUIBroker`「Windows 安全性」視窗 z-order 18、`OWNER=0`。新增窄範圍 best-effort broker-window monitor：baseline 所有 top-level HWND 與既有 broker PID，只針對唯一的新同-session System32 CredentialUIBroker 視窗，在 FidoVault 仍為 foreground 時嘗試一次 SetForegroundWindow；不設 topmost、不用 ASFW_ANY。程式碼獨立審查通過；commit `45d3aa6` 已推至 PR #3 branch；Rust 53/53、UI 4/4、Windows GNU Release build 成功。該 commit 的新 GUI 已部署至 Win11-NB，SHA256 `59BBAB25C21A419702D02FA7E97242392C388149432BAF733AC0C715F06085D8`，6,140,928 bytes；舊 exe 備份 `C:\FidoVault\portable-fido-vault.exe.pre-H2focus-20261001-223428-2985cea4.bak`。vault 備份 `C:\FidoVault\vault.db.pre-H2focus-20261001-223428-2985cea4.bak`；部署前後均為 3 slots、SHA256 `58A1D4877C2274B3D403E1D87CD1E9BA7C5404D450C3F69E1D9486501F02D780`。本機 Console H2 測試已由使用者確認 OK：通用登入免選金鑰，Windows 安全性操作提示置前；H2 驗收通過並結案。前景交接仍是 best-effort。RDP-Tcp#0 Session 2 曾回報 WebAuthn API v1，維持 v4+ fail-closed；RDP／WebAuthn redirection 不支援，並已在 README 明確說明；硬體驗收使用本機 Console session。
 - 建置檔參數：release `strip + lto`。
 
 ## 7. 部署（Win11-NB，WinRM）
@@ -142,13 +142,13 @@ cargo +stable-x86_64-pc-windows-gnu build --release --features real-ctap --bin p
 
 | Gate | 內容 | 狀態 |
 |---|---|---|
-| 1 | portable + NB 一般權限直接啟動 | ⚠️ WebAuthn build 已部署且互動驗收；一般權限/Explorer 啟動條件未單獨確認 |
+| 1 | portable + NB 一般權限直接啟動 | ✅ 使用者確認 G1/G3 驗收通過：一般權限、檔案總管啟動 |
 | 2 | 建立帳號/密碼登入/錯誤拒絕 | ✅（mock E2E，20/20） |
 | 3 | 金鑰註冊+登入（實體） | ✅ Win11-NB Windows WebAuthn：註冊與登入通過 |
 | 4 | 第二支金鑰/任一支可登入 | ✅ 第二支 YubiKey NFC 交叉登入通過 |
 | 5 | CRUD + 時間戳 | ✅（mock E2E） |
 | 6 | 軌跡完整/無明文密碼 | ✅（mock E2E） |
-| 7 | 閒置自動上鎖 | ✅（先前 GUI 實測；新 build 未重測） |
+| 7 | 閒置自動上鎖 | ✅ 使用者確認 G7 驗收通過（D1–D4） |
 | 8 | 加密檔直拷別機可解密 | ✅（mock E2E copy-test） |
 
 ## 9. 2026-09-29 Win11-NB log 問題：根因與修復
@@ -187,18 +187,9 @@ cargo +stable-x86_64-pc-windows-gnu build --release --features real-ctap --bin p
 - `cargo test --features real-ctap --lib`：**23 passed / 0 failed**。
 - release build（GNU + `--features real-ctap`，含 `vault_cli`）：產出後部署 NB。
 
-## 10. 待驗證（2026-09-29 build，含 §9 修復）
+## 10. raw CTAP CLI 硬體路線（非目前驗收範圍）
 
-部署機：Win11-NB `C:\FidoVault`（portable-fido-vault.exe / vault_cli.exe / WebView2Loader.dll）。
-**實體金鑰流程需互動桌面 session**（登入 NB 後手動執行；WinRM session-0 的 HID 行為不同）。
-
-1. **硬體 register（§9 重點）**：插入 YubiKey 5 → `vault_cli register-key --path vault.db --pw <pw> --authenticator hw`
-   - 正常：成功註冊（fingerprint 型），audit 有 `key_registered`。
-   - 若 handle 仍被鎖：**快速失敗並顯示 `DeviceOpenDenied` 訊息**（不再是 96s 後 `U2FToken(NotAllowed)`）；
-     關閉其他占用金鑰的程序/拔插重試。
-2. **硬體 login**：`vault_cli login-key --path vault.db --idx 0 --authenticator hw`（按指紋）→ 成功。
-3. **GUI 硬體流程**：金鑰管理「＋ 註冊新金鑰」（hw）→ 上鎖 → 以該金鑰登入。
-4. 既有 mock E2E 回歸：`python scripts/gate_e2e.py`（WS2）不受影響（23/23 測試通過）。
+2026-09-29 build 的 `vault_cli --authenticator hw` register/login 驗證曾列為待辦；後續產品 GUI 硬體驗收改採 Windows WebAuthn API，並已由使用者在 Win11-NB 本機 Console 完成 G4–G6 與 H1–H5 驗收。**raw CTAP CLI 的實體 register/login 不再是目前驗收項目**；`vault_cli` 仍保留作為獨立診斷路徑，若未來要將 CLI 硬體流程納入支援範圍，再另行驗證。Mock E2E 與自動化測試結果見 §6。
 
 ## 11. 相關專案
 
