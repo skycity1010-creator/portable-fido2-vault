@@ -134,7 +134,15 @@ F: F1 _ / F2 _ / F3 _
 
 ## 舊密碼歷史 — Win11-NB 驗收
 
-新功能使用現有 `vault.db` 的 AES-GCM 加密 payload；舊 vault 缺少歷史資料時應以空歷史、保留上限 3 開啟。部署前請照本次部署紀錄保留 EXE/vault 備份，勿重建或刪除金庫。
+本次以 PR #6 功能分支 commit `fdc55be` 建置 Windows GNU Release（`--features real-ctap`），已部署至 `C:\FidoVault\portable-fido-vault.exe`。
+
+- 新版 EXE SHA-256：`9c79a04dcfbd0f16b1f37a4b1c3cdd9e571f39190ef26904c269ba69c6102057`（6,158,336 bytes）。
+- 替換前 EXE 備份：`C:\FidoVault\portable-fido-vault.exe.pre-password-history-20261002-010914.bak`，SHA-256 `50d17c57685e1740db763eb65a09666dff7f34cc8009a555ec0d830f4a6c9a57`。
+- vault 備份：`C:\FidoVault\vault.db.pre-password-history-20261002-010914.bak`，SHA-256 `1e3c9fe8266bf41a7f25ece8f2c2bf45cbb63367001042e06291234efe2b9f54`。
+- 部署後回讀確認新版 EXE 雜湊相符；`vault.db` 未替換，仍為 3 個 key slots 且雜湊與備份相同；0 個 FIDO client，user/machine `F2V_AUTHENTICATOR` 均未設定。
+- 本次只推送 GUI EXE，未啟動 GUI、未操作 WebAuthn，也未推送 `vault_cli.exe` 或 `WebView2Loader.dll`。請在 Win11-NB **本機 Console** 以一般權限驗收；RDP 遠端啟動不支援（見 README）。
+
+舊 vault 缺少歷史資料欄位時應以空歷史、保留上限 3 開啟；部署前已建立可回復的 vault 備份。使用者登入會把相容預設值寫入加密 payload，屆時 vault 雜湊自然會更新。
 
 - [ ] 解鎖既有 vault，在設定確認舊密碼保留代數預設為 3；設定改為 4、重新登入後仍為 4。
 - [ ] 對測試條目依序改密碼 3 次；編輯畫面顯示三筆舊版本日期，最近版本在前，舊密碼值預設不明文顯示。
