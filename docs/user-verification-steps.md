@@ -2,7 +2,7 @@
 
 > 適用：Win11-NB，`C:\FidoVault`（portable 資料夾）。完成約 15–20 分鐘。
 > Windows Release GUI 必須以 `--features real-ctap` 建置；一般權限的檔案總管直接啟動時使用 Windows WebAuthn API，無需環境變數或系統管理員提升。Windows 安全性視窗負責 PIN/UV/觸碰；目標系統需 WebAuthn API v4+。Debug build 預設為 MockBackend；明確跑 mock 流程時設定 `F2V_AUTHENTICATOR=mock`。
-> **Win11-NB RDP 注意：**已確認 `RDP-Tcp#0` Session 2 的 WebAuthn API 回報 v1，程式依 v4+ fail-closed 而閃退；使用者確認從 Console 啟動可正常開啟。H1–H5 請在 Console session 驗收；RDP redirection 路線未驗收，勿降低 API 版本檢查。
+> **RDP 不支援：**目前不支援從 RDP 遠端桌面 session 啟動或操作 FidoVault 硬體金鑰流程；請使用目標機本機 Console session。Win11-NB 的 RDP session 回報 WebAuthn API v1，低於 v4+ 要求，程式會 fail closed；勿降低 API 版本檢查。
 
 ## 部署後驗證前確認（2026-10-01）
 已部署 PR #3 的 Windows GNU Release GUI，SHA256：`E9A28C81C73456800E3F1FAF0E8F1A9F6576146C8A675F5AB125FF9135ED8503`。替換前舊 exe 已備份為 `C:\FidoVault\portable-fido-vault.exe.pre-single-key-20261001-112834.bak`（SHA256 `06B1C5BE7A5E760D28D594B128A1B5BC681C31A6FD26D672E942E5F1062F0EA2`）。`vault.db` 未替換，SHA256 `848F961C4C5CB741EF1ADE452008F1D3F17649D06582B4809CEBFC4E16877B99`，3 個 key slots；備份 `C:\FidoVault\vault.db.pre-single-key-20261001-112834.bak` SHA256 相同。部署前 WinRM read-only process check 為 0 個 FIDO client，`F2V_AUTHENTICATOR` 使用者/系統變數均未設定。
@@ -50,11 +50,11 @@ PR #3 commit `ab3d123` 的 Windows GNU Release GUI 已部署至 `C:\FidoVault\po
 - [ ] **C4**（選用）新增第二條再「刪除」（會問確認）→ 表格少一列
 
 ## D. Gate 7 — 閒置自動上鎖 ⭐（本卡重點）
-- [ ] **D1** 「設定」分頁：輸入 `1` →「套用」→ **預期**：彈出「已套用：閒置 1 分鐘自動上鎖」
-- [ ] **D2** 切到**其他視窗或桌面**，**完全不要碰滑鼠與鍵盤超過 60 秒**
+- [x] **D1** 「設定」分頁：輸入 `1` →「套用」→ **預期**：彈出「已套用：閒置 1 分鐘自動上鎖」
+- [x] **D2** 切到**其他視窗或桌面**，**完全不要碰滑鼠與鍵盤超過 60 秒**
   - ⚠️ 注意：**只要滑鼠在 app 視窗內移動、或在它上面按鍵/打字，計時器就會重算**。最保險：切走後去泡杯咖啡，別回頭動滑鼠。
-- [ ] **D3** 60 秒後回到該視窗 → **預期**：已自動跳回登入畫面（「已解鎖」變鎖定狀態）
-- [ ] **D4** 重新登入 →「軌跡紀錄」→ **預期**：最新一列是 `auto_lock`（方式欄 idle）
+- [x] **D3** 60 秒後回到該視窗 → **預期**：已自動跳回登入畫面（「已解鎖」變鎖定狀態）
+- [x] **D4** 重新登入 →「軌跡紀錄」→ **預期**：最新一列是 `auto_lock`（方式欄 idle）
 - [ ] **D5**（對照組，選測）再上鎖一次前點右上「上鎖」手動按鈕 → 回登入畫面 → 軌跡多一列 `lock`
 
 ## E. Gate 3/4 — FIDO2 金鑰流程（mock）
@@ -85,9 +85,9 @@ F: F1 _ / F2 _ / F3 _
 
 > 本節不需設定 `F2V_AUTHENTICATOR`；此 Win11-NB 請從本機 Console session 以一般權限啟動，不要從 RDP session 啟動。Windows 安全性視窗負責安全金鑰選擇、PIN/UV 與觸碰。
 
-- [ ] **G1** 在 Win11-NB 本機互動桌面確認沒有 `vault_cli`、`portable-fido-vault` 或 `yk_open_test` 程序；若有，正常關閉，不要 force-kill。
+- [x] **G1** 在 Win11-NB 本機互動桌面確認沒有 `vault_cli`、`portable-fido-vault` 或 `yk_open_test` 程序；若有，正常關閉，不要 force-kill。
 - [x] **G2** 部署前已備份 `C:\FidoVault\vault.db` 並記錄 baseline：3 個 key slots、SHA256 與備份路徑見上方；切勿刪除或重建此金庫。
-- [ ] **G3** 用一般權限（非系統管理員）的檔案總管直接啟動 `C:\FidoVault\portable-fido-vault.exe`；不設 `F2V_AUTHENTICATOR`。啟動診斷應顯示 `GUI FIDO backend selected: windows-webauthn`。
+- [x] **G3** 用一般權限（非系統管理員）的檔案總管直接啟動 `C:\FidoVault\portable-fido-vault.exe`；不設 `F2V_AUTHENTICATOR`。啟動診斷應顯示 `GUI FIDO backend selected: windows-webauthn`。
 - [x] **G4（舊槽相容性；先前已驗收）** 以原有實體金鑰完成 Windows 安全性提示，確認舊 raw-CTAP 槽能由 Windows WebAuthn backend 解鎖；驗收當時槽位數為 1。若本次 H 驗收遇到登入失敗，不要移除或覆寫任何槽位。
 - [x] **G5（註冊；先前已驗收）** 「金鑰管理」→「＋ 註冊新金鑰」註冊 YubiKey Bio；Windows 安全性提示與觸碰／指紋流程已通過，PIN 只在本機提示輸入。
 - [x] **G6（新槽登入；先前已驗收）** 新槽登入已通過；第二支 YubiKey NFC 亦已註冊並完成交叉登入。這些完成當時的槽位數紀錄不代表目前數量；目前部署前 baseline 為 3 個 key slots。

@@ -42,6 +42,10 @@ cargo +stable-x86_64-pc-windows-gnu build --release --features real-ctap --bin p
 
 Windows Release GUI（`real-ctap`）從檔案總管啟動時使用 Windows WebAuthn API；PIN、指紋與觸碰提示由 Windows 安全性視窗處理，無需設定 `F2V_AUTHENTICATOR` 或以系統管理員身分啟動。目標系統需提供 WebAuthn API v4 或更新版本。Debug 建置仍預設 MockBackend；若需在 Release 明確執行 mock 測試，可設定 `F2V_AUTHENTICATOR=mock`。未設定覆寫值且 Release 缺少 `real-ctap` 時會拒絕啟動。`vault_cli --authenticator hw` 保留 raw CTAP/HID 診斷路徑，與 GUI 使用的 Windows API 不同。
 
+### 不支援 RDP 遠端桌面啟動
+
+目前**不支援從 RDP 遠端桌面 session 啟動 FidoVault，也不支援在 RDP session 中操作硬體金鑰流程**。請在目標 Windows 電腦的本機 Console session 啟動程式，並在該 session 完成 Windows 安全性提示。Win11-NB 的 RDP session 曾回報 WebAuthn API v1，低於本程式要求的 v4+；程式會 fail closed，不會為了支援 RDP 而降低版本檢查。RDP／WebAuthn redirection 不屬於目前支援的使用情境。
+
 > portable 部署：將 `target\release\portable-fido-vault.exe` 複製到任意資料夾即完成安裝；
 > 首次執行後該資料夾會多出 `vault.db`（你的金庫）。整個資料夾＝全部資產。
 
