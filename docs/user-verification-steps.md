@@ -15,7 +15,7 @@ PR #3 commit `ab3d123` 的 Windows GNU Release GUI 已部署至 `C:\FidoVault\po
 
 新候選在 GetAssertion/MakeCredential 等待期間監測；只有唯一、同 session、新建立的 System32 `CredentialUIBroker.exe` 安全性視窗才嘗試一次 `SetForegroundWindow`，並要求使用者仍把 FidoVault 留在 foreground。基線包含隱藏 top-level 視窗及既有 broker PID；不改對話框 owner、不設 topmost、不使用 `ASFW_ANY`。前景交接仍是 best-effort，Windows 在檢查與呼叫間仍可能切換焦點。
 
-新候選來源 commit `45d3aa6`（PR #3）部署為 `C:\FidoVault\portable-fido-vault.exe` SHA256 `59BBAB25C21A419702D02FA7E97242392C388149432BAF733AC0C715F06085D8`（6,140,928 bytes）。取代前 GUI 備份 `C:\FidoVault\portable-fido-vault.exe.pre-H2focus-20261001-223428-2985cea4.bak`，SHA256 `42D6DB566BEA217282D5BB487FA5DFB207B9252D2F3B1349938C4BB658AB2B58`。vault 備份 `C:\FidoVault\vault.db.pre-H2focus-20261001-223428-2985cea4.bak`，SHA256 `58A1D4877C2274B3D403E1D87CD1E9BA7C5404D450C3F69E1D9486501F02D780`；部署前後維持 3 個 slots 與相同 vault hash。`WebView2Loader.dll` 未替換，SHA256 `86545B66CDB0603BC26B626FB9AD610CB6E71F28D468F5EA66DF23B03DDA96D5`；user/machine `F2V_AUTHENTICATOR` 均未設定，遠端沒有啟動 GUI 或 WebAuthn。程式碼獨立審查通過，Rust 53/53、UI 4/4、GNU Release build 成功。**H2 本機 Console 實測待使用者確認，尚未標記通過。**
+新候選來源 commit `45d3aa6`（PR #3）部署為 `C:\FidoVault\portable-fido-vault.exe` SHA256 `59BBAB25C21A419702D02FA7E97242392C388149432BAF733AC0C715F06085D8`（6,140,928 bytes）。取代前 GUI 備份 `C:\FidoVault\portable-fido-vault.exe.pre-H2focus-20261001-223428-2985cea4.bak`，SHA256 `42D6DB566BEA217282D5BB487FA5DFB207B9252D2F3B1349938C4BB658AB2B58`。vault 備份 `C:\FidoVault\vault.db.pre-H2focus-20261001-223428-2985cea4.bak`，SHA256 `58A1D4877C2274B3D403E1D87CD1E9BA7C5404D450C3F69E1D9486501F02D780`；部署前後維持 3 個 slots 與相同 vault hash。`WebView2Loader.dll` 未替換，SHA256 `86545B66CDB0603BC26B626FB9AD610CB6E71F28D468F5EA66DF23B03DDA96D5`；user/machine `F2V_AUTHENTICATOR` 均未設定，遠端沒有啟動 GUI 或 WebAuthn。程式碼獨立審查通過，Rust 53/53、UI 4/4、GNU Release build 成功。**使用者已確認 H2 本機 Console 測試 OK：通用登入免選金鑰，Windows 安全性操作提示置前；本項已結案。**
 
 執行所需檔案如下；`C:\FidoVault` 也有診斷紀錄與備份檔，**不要因舊版「只有三個檔案」說明而刪除任何其他檔案**：
 
@@ -99,10 +99,10 @@ F: F1 _ / F2 _ / F3 _
 > 使用已完成 G4–G6 的既有金庫與兩支不同 YubiKey；不要重建或刪除任何 key slot。主密碼登入仍須保留。
 
 - [x] **H1** 登入畫面仍有主密碼欄位；金鑰區不列出逐支金鑰卡片，只顯示一個通用「以金鑰登入」按鈕。
-- [ ] **H2（部分通過；新候選待測）** 通用按鈕不需先選金鑰已確認。前一候選仍讓 Windows 安全性畫面留在背景；Console 唯讀探測確認 FidoVault 在 foreground/z-order 17，獨立的 `CredentialUIBroker` 安全性視窗為 z-order 18 且 `OWNER=0`。已部署新的受限前景監測候選（部署細節見上節），尚待使用者在本機 Console 實測；H2 未通過前不得勾選。此處理為 best-effort，Windows 仍可能在檢查後切換焦點。
+- [x] **H2** 通用按鈕不需先選金鑰；使用者已確認 Win11-NB 本機 Console 測試中 Windows 安全性操作提示出現在前景。broker 視窗置前仍是 best-effort，Windows 可能在其他情境切換焦點。
 - [x] **H3** 上鎖後用同一按鈕改用第二支 YubiKey NFC 登入，確認可解鎖相同金庫。
 - [x] **H4** 取消 Windows 金鑰操作，確認金庫仍維持鎖定、顯示錯誤/取消狀態，且可重試或改用主密碼登入。
-- [x] **H5** 使用者回報註冊流程通過；本次尚待修正的是 H2 金鑰登入時 Windows 安全性操作畫面未置前。不要為驗收而註冊多餘金鑰。
+- [x] **H5** 使用者回報註冊流程通過；H2 前景驗收已另行完成。本次不需註冊多餘金鑰。
 
 ## 常見狀況
 | 現象 | 說明 |
