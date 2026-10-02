@@ -33,7 +33,7 @@
 - Windows GNU Release GUI + CLI build (`--locked --features real-ctap`): passed. GUI 6,729,216 bytes, SHA-256 `7deba32418fb173d5ada126e600c81a748ffa51bcfe503afc7bed683fb928ed1`; CLI 2,427,392 bytes, SHA-256 `1493ab5d09fb942a61f77cc9e82827b2fa08f60e3e74d81e5d1cd657771ab3c2`.
 - Static added-line security scan: no findings; `git diff --check` passed.
 - `cargo clippy -D warnings` remains blocked by 11 existing diagnostics in `diag_log.rs`, `fido2.rs`, `windows_webauthn.rs`, and unrelated `vault.rs` lines; no warning points to the new alias code. Whole-file rustfmt check also fails on baseline formatting; unrelated lines were not reformatted.
-- Manual Win11-NB Console acceptance has not yet occurred. The GUI is deployed and hash-verified; Feature 2/3/4 remain pending the user's requested combined local test.
+- User confirmed the combined Feature 2/3/4 Win11-NB local Console acceptance passed on 2026-10-02. The deployed GUI was hash-verified before the test.
 
 ## Explicitly out of scope
 

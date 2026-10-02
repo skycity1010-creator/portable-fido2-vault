@@ -130,11 +130,13 @@ F: F1 _ / F2 _ / F3 _
 - [x] 編輯該條目：密碼預設遮罩；眼睛按鈕可顯示／隱藏；重新開啟編輯時仍預設遮罩。
 - [x] 儲存或取消後密碼欄清空並恢復遮罩；條目列表不顯示密碼。
 
-請使用測試用密碼，不要把密碼貼到聊天。本次密碼遮罩 build 未包含密碼歷史；剪貼簿複製、自訂金鑰名稱仍待後續實作。
+請使用測試用密碼，不要把密碼貼到聊天。當時的 Feature 1 build 未包含 Feature 2–4；後續驗收結果記錄於下列各節。
 
-## 舊密碼歷史 — Win11-NB 驗收
+## 舊密碼歷史 — Win11-NB 驗收（通過，2026-10-02）
 
-本次以 PR #6 功能分支 commit `fdc55be` 建置 Windows GNU Release（`--features real-ctap`），已部署至 `C:\FidoVault\portable-fido-vault.exe`。
+> 使用者確認 Feature 2、3、4 在 Win11-NB 本機 Console 集中驗收全部通過；以下手動驗收項依此整體 PASS 標記完成。
+
+Feature 2 standalone staging 以 PR #6 功能分支 commit `fdc55be` 建置 Windows GNU Release（`--features real-ctap`），已部署至 `C:\FidoVault\portable-fido-vault.exe`。
 
 - 新版 EXE SHA-256：`9c79a04dcfbd0f16b1f37a4b1c3cdd9e571f39190ef26904c269ba69c6102057`（6,158,336 bytes）。
 - 替換前 EXE 備份：`C:\FidoVault\portable-fido-vault.exe.pre-password-history-20261002-010914.bak`，SHA-256 `50d17c57685e1740db763eb65a09666dff7f34cc8009a555ec0d830f4a6c9a57`。
@@ -144,37 +146,37 @@ F: F1 _ / F2 _ / F3 _
 
 舊 vault 缺少歷史資料欄位時應以空歷史、保留上限 3 開啟；部署前已建立可回復的 vault 備份。使用者登入會把相容預設值寫入加密 payload，屆時 vault 雜湊自然會更新。
 
-- [ ] 解鎖既有 vault，在設定確認舊密碼保留代數預設為 3；設定改為 4、重新登入後仍為 4。
-- [ ] 對測試條目依序改密碼 3 次；編輯畫面顯示三筆舊版本日期，最近版本在前，舊密碼值預設不明文顯示。
-- [ ] 只修改網站/帳號/備註或儲存相同密碼，不新增歷史版本。
-- [ ] 選一筆舊版本按「還原」並儲存：該值成為目前密碼；原目前密碼成為最新舊版本；被還原版本不再重複留在歷史。
-- [ ] 將保留代數調低為 1 並套用：每筆條目立即只留最新一筆舊密碼；重新登入後設定仍為 1。
+- [x] 解鎖既有 vault，在設定確認舊密碼保留代數預設為 3；設定改為 4、重新登入後仍為 4。
+- [x] 對測試條目依序改密碼 3 次；編輯畫面顯示三筆舊版本日期，最近版本在前，舊密碼值預設不明文顯示。
+- [x] 只修改網站/帳號/備註或儲存相同密碼，不新增歷史版本。
+- [x] 選一筆舊版本按「還原」並儲存：該值成為目前密碼；原目前密碼成為最新舊版本；被還原版本不再重複留在歷史。
+- [x] 將保留代數調低為 1 並套用：每筆條目立即只留最新一筆舊密碼；重新登入後設定仍為 1。
 
 請使用測試用條目與密碼，不要將密碼貼到聊天。調低保留代數會立即刪除超額的最舊歷史版本。
 
-## 條目密碼複製 — Win11-NB 驗收（PR #8，尚未部署）
+## 條目密碼複製 — Win11-NB 驗收（PR #8，通過，2026-10-02）
 
-候選 Windows GNU Release（`--features real-ctap`）GUI：6,589,440 bytes，SHA-256 `58ba298f7f2bcd5fa4d2c1bdda5ab6e5d2847379af8e282c7ea92e3732838dde`。此 build 尚未部署至 NB；Feature 2 本機驗收也仍依使用者指示延後。
+Feature 3 standalone 候選 GUI（6,589,440 bytes，SHA-256 `58ba298f7f2bcd5fa4d2c1bdda5ab6e5d2847379af8e282c7ea92e3732838dde`）未單獨部署；三項功能以 Feature 4 整合 GUI（見下節）在 Win11-NB 本機 Console 一起驗收，使用者確認通過。
 
-- [ ] 在 Win11-NB **本機 Console** 以一般權限開啟，建立只含測試資料的條目；逐列按「複製密碼」，確認各自複製正確條目的密碼，狀態不顯示密碼明文。
-- [ ] 複製後保持剪貼簿不變，等候 60 秒；確認內容自動清除。
-- [ ] 再複製測試密碼，60 秒內從另一個程式把無敏感性的標記文字複製到剪貼簿；等候 60 秒，確認標記文字仍在，未被清除。
-- [ ] 快速連續複製兩個測試條目；確認舊計時器不會清掉後一次複製的密碼，並以後一次複製時間起算 60 秒。
-- [ ] 確認複製操作不新增包含密碼的軌跡紀錄；剪貼簿錯誤不能使 App 崩潰。
+- [x] 在 Win11-NB **本機 Console** 以一般權限開啟，建立只含測試資料的條目；逐列按「複製密碼」，確認各自複製正確條目的密碼，狀態不顯示密碼明文。
+- [x] 複製後保持剪貼簿不變，等候 60 秒；確認內容自動清除。
+- [x] 再複製測試密碼，60 秒內從另一個程式把無敏感性的標記文字複製到剪貼簿；等候 60 秒，確認標記文字仍在，未被清除。
+- [x] 快速連續複製兩個測試條目；確認舊計時器不會清掉後一次複製的密碼，並以後一次複製時間起算 60 秒。
+- [x] 確認複製操作不新增包含密碼的軌跡紀錄；剪貼簿錯誤不能使 App 崩潰。
 
 系統剪貼簿是共用資源，其他桌面程式可能在清除前讀取內容；Windows 剪貼簿歷程/雲端剪貼簿也可能保存或同步，EmptyClipboard 不會移除已保存的歷程項目。請只用測試用密碼，切勿貼到聊天。不要透過 RDP/WinRM 啟動或操作 GUI；本功能不需要實體 FIDO 金鑰。
 
-## 安全性金鑰自訂名稱 — Win11-NB 驗收（PR #9，已部署／本機驗收待使用者）
+## 安全性金鑰自訂名稱 — Win11-NB 驗收（PR #9，通過，2026-10-02）
 
-本機候選 Windows GNU Release（`--locked --features real-ctap`）GUI：6,729,216 bytes，SHA-256 `7deba32418fb173d5ada126e600c81a748ffa51bcfe503afc7bed683fb928ed1`；CLI 2,427,392 bytes，SHA-256 `1493ab5d09fb942a61f77cc9e82827b2fa08f60e3e74d81e5d1cd657771ab3c2`。GUI 已部署至 `C:\FidoVault\portable-fido-vault.exe`（source commit `c8c10c23a97c08cf4074c79b1b6aee5728721b98`），目標端讀回 SHA-256 `7deba32418fb173d5ada126e600c81a748ffa51bcfe503afc7bed683fb928ed1`。舊 GUI 備份：`C:\FidoVault\portable-fido-vault.exe.pre-custom-key-name-c8c10c2.bak`，SHA-256 `9c79a04dcfbd0f16b1f37a4b1c3cdd9e571f39190ef26904c269ba69c6102057`；vault 備份：`C:\FidoVault\vault.db.pre-custom-key-name-c8c10c2.bak`，SHA-256 `00d772240939a12eee85dde5b0b0a2a12096f9039e1323a7c4c1c1c7dbd1faf0`。部署前後 live vault SHA-256 均為 `00d772240939a12eee85dde5b0b0a2a12096f9039e1323a7c4c1c1c7dbd1faf0`、3 key slots；前後唯讀檢查均未發現 FIDO client，`F2V_AUTHENTICATOR` user/machine override 均未設定。Feature 2、3、4 的 Win11-NB 本機驗收仍待使用者集中測試。
+本機候選 Windows GNU Release（`--locked --features real-ctap`）GUI：6,729,216 bytes，SHA-256 `7deba32418fb173d5ada126e600c81a748ffa51bcfe503afc7bed683fb928ed1`；CLI 2,427,392 bytes，SHA-256 `1493ab5d09fb942a61f77cc9e82827b2fa08f60e3e74d81e5d1cd657771ab3c2`。GUI 已部署至 `C:\FidoVault\portable-fido-vault.exe`（source commit `c8c10c23a97c08cf4074c79b1b6aee5728721b98`），目標端讀回 SHA-256 `7deba32418fb173d5ada126e600c81a748ffa51bcfe503afc7bed683fb928ed1`。舊 GUI 備份：`C:\FidoVault\portable-fido-vault.exe.pre-custom-key-name-c8c10c2.bak`，SHA-256 `9c79a04dcfbd0f16b1f37a4b1c3cdd9e571f39190ef26904c269ba69c6102057`；vault 備份：`C:\FidoVault\vault.db.pre-custom-key-name-c8c10c2.bak`，SHA-256 `00d772240939a12eee85dde5b0b0a2a12096f9039e1323a7c4c1c1c7dbd1faf0`。部署前後 live vault SHA-256 均為 `00d772240939a12eee85dde5b0b0a2a12096f9039e1323a7c4c1c1c7dbd1faf0`、3 key slots；前後唯讀檢查均未發現 FIDO client，`F2V_AUTHENTICATOR` user/machine override 均未設定。使用者於 2026-10-02 確認 Feature 2/3/4 整合 GUI 本機 Console 驗收全部通過。
 
 **安全準備：**使用測試金鑰與測試資料；不要以唯一解鎖金鑰做測試。只在 Win11-NB **本機 Console** 以一般權限開啟；RDP 遠端啟動／操作 GUI 不支援。
 
-- [ ] 開啟「金鑰管理 → 註冊新金鑰」：對話框顯示一個未使用的建議別名；可編輯；文字說明此為 FidoVault 本機名稱，且 header 中的名稱是明文資料。
-- [ ] 將名稱留白、輸入已存在名稱的大小寫／空白變體，或輸入 Unicode 大小寫等價名稱（例如既有 `Σ` 時輸入 `ς`）：顯示驗證錯誤、對話框保持開啟，且尚未執行 authenticator 偵測或出現 Windows 安全性註冊提示。
-- [ ] 取消註冊：不出現 Windows 安全性註冊提示；金庫 key-slot 數與 audit 不變。
-- [ ] 以測試別名（例如 `F4 Local Test Key`）完成一支測試金鑰註冊：Windows 安全性視窗照常驗證；成功狀態、金鑰清單與 `key_registered` audit 使用自訂別名。確認提示視窗名稱／authenticator credential 本身不因別名改變。
-- [ ] 上鎖並重新登入：清單仍顯示該別名；確認只新增一個 slot。不要把真實密碼或敏感個資當成別名。
-- [ ] 按前節 Feature 2 步驟驗證舊密碼保留數、歷史檢視／還原；按 Feature 3 步驟驗證複製、60 秒清除、外部替換保留及快速連續複製。
+- [x] 開啟「金鑰管理 → 註冊新金鑰」：對話框顯示一個未使用的建議別名；可編輯；文字說明此為 FidoVault 本機名稱，且 header 中的名稱是明文資料。
+- [x] 將名稱留白、輸入已存在名稱的大小寫／空白變體，或輸入 Unicode 大小寫等價名稱（例如既有 `Σ` 時輸入 `ς`）：顯示驗證錯誤、對話框保持開啟，且尚未執行 authenticator 偵測或出現 Windows 安全性註冊提示。
+- [x] 取消註冊：不出現 Windows 安全性註冊提示；金庫 key-slot 數與 audit 不變。
+- [x] 以測試別名（例如 `F4 Local Test Key`）完成一支測試金鑰註冊：Windows 安全性視窗照常驗證；成功狀態、金鑰清單與 `key_registered` audit 使用自訂別名。確認提示視窗名稱／authenticator credential 本身不因別名改變。
+- [x] 上鎖並重新登入：清單仍顯示該別名；確認只新增一個 slot。不要把真實密碼或敏感個資當成別名。
+- [x] 按前節 Feature 2 步驟驗證舊密碼保留數、歷史檢視／還原；按 Feature 3 步驟驗證複製、60 秒清除、外部替換保留及快速連續複製。
 
 剪貼簿只使用測試用密碼；Windows 剪貼簿歷程／雲端剪貼簿可能保存或同步，條件清除不會刪除歷程項目。FIDO/WebAuthn 必須由使用者在本機 Console 操作，不能透過 RDP 或 WinRM 執行 GUI 驗收。
