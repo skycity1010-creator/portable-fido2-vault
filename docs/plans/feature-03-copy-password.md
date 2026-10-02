@@ -4,10 +4,10 @@
 
 - Add a **copy password** action to every password entry. It copies that entry's current password as plain text to the operating-system clipboard.
 - Show a generic success or failure status in the UI. Never place password text in a status message, audit record, diagnostic log, or error message.
-- After 60 seconds, read the current clipboard and clear it only if its text still exactly matches the value copied by this action. If another value replaced it, preserve that newer content.
+- After 60 seconds, execute one Windows native conditional-clear operation: hold the clipboard lock, compare its CF_UNICODETEXT value to the copied password, and empty the clipboard only on an exact match. This closes the external read-then-clear race; if the text differs, preserve it.
 - A later copy initiated in FidoVault supersedes the previous FidoVault clear timer, even when the copied values happen to be equal; the earlier timer must not clear the later copy prematurely.
-- Clipboard API failures must produce a generic user-facing status without crashing the app. If the delayed read fails, do not clear unknown clipboard content.
-- Use the official Tauri v2 clipboard-manager plugin. Request only plain-text read/write and clear permissions; do not enable image or HTML clipboard commands. The app already uses `withGlobalTauri: true`, so no JavaScript bundler dependency is needed.
+- Clipboard API/Win32 failures must produce a generic user-facing status without crashing the app. If the conditional operation cannot safely inspect or clear the clipboard, leave it unchanged.
+- Use the official Tauri v2 clipboard-manager plugin for plain-text writes only. Grant only `clipboard-manager:allow-write-text`; use Win32 `OpenClipboard`/`EmptyClipboard` for atomic compare-and-clear. The app already uses `withGlobalTauri: true`, so no JavaScript bundler dependency is needed.
 
 ## Acceptance criteria
 
@@ -30,9 +30,9 @@ Feature 2 implementation is complete, but its Win11-NB local acceptance was expl
 
 ## Implementation sequence
 
-1. [x] Add focused UI tests and observe expected RED failures for missing copy, write-error handling, 60-second clearing, read failure, and in-flight expiry race.
-2. [x] Integrate Tauri clipboard-manager, minimum text-only permissions, row action, and non-secret status.
-3. [x] Cover timer replacement preservation, clear/read errors, and serial ordering for concurrent copies.
+1. [x] Add focused UI regression and Rust UTF-16 matcher tests; observe RED for the non-atomic clipboard race and missing matcher.
+2. [x] Integrate Tauri clipboard-manager with write-text-only permission and a synchronous Win32 compare-and-clear command under the OS clipboard lock.
+3. [x] Cover atomic-command invocation, replacement preservation, Win32-command errors, and serial ordering for concurrent copies.
 4. [x] Run targeted/full automated tests, Windows Release GUI/CLI build, and `git diff --check`.
 5. [x] Open draft PR #8 before implementation on `feat/copy-password`, stacked on `feat/password-history` (Feature 2 PR #6).
 6. [ ] Win11-NB local Console acceptance; not deployed yet. Do not use WinRM/RDP to operate the GUI or clipboard.
@@ -40,8 +40,8 @@ Feature 2 implementation is complete, but its Win11-NB local acceptance was expl
 ## Verification results
 
 - Targeted clipboard UI tests: 7/7 passed. Full Node UI suite: 19/19; `node --check src/app.js` passed.
-- MSVC Rust library suite (`--locked --features real-ctap`): 57/57. Release backend-mode matrix: 7/7.
-- Windows GNU Release GUI + `vault_cli` build with `--locked --features real-ctap`: passed. GUI artifact is 6,579,712 bytes, SHA-256 `609fa36a872fea3f449a90d605a32ecf8ee10a859573b0f6f242dfbdae428b6a`; CLI SHA-256 `0e0621e595004206b19c5fbc9ff07136c4cfd18d67668fcfbb44a11301365abf`.
+- MSVC Rust library suite (`--locked --features real-ctap`): 60/60. Release backend-mode matrix: 7/7.
+- Windows GNU Release GUI + `vault_cli` build with `--locked --features real-ctap`: passed. GUI artifact is 6,589,440 bytes, SHA-256 `58ba298f7f2bcd5fa4d2c1bdda5ab6e5d2847379af8e282c7ea92e3732838dde`; CLI SHA-256 `d98ce617f19054467818f46df611d4cea6eea723be30000c77102e0a8b134674`.
 - Draft PR: https://github.com/skycity1010-creator/portable-fido2-vault/pull/8. Feature 2 local acceptance remains deferred per user instruction; Feature 4 has not started.
 
 ## Official API references
@@ -49,3 +49,5 @@ Feature 2 implementation is complete, but its Win11-NB local acceptance was expl
 - Tauri Clipboard plugin: https://v2.tauri.app/plugin/clipboard/
 - Plugin JavaScript API/source: https://github.com/tauri-apps/plugins-workspace/tree/v2/plugins/clipboard-manager/guest-js
 - Rust crate API (Tauri 2-compatible): https://docs.rs/tauri-plugin-clipboard-manager/latest/tauri_plugin_clipboard_manager/
+- Microsoft Win32 `OpenClipboard` (locks against other writers): https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-openclipboard
+- Microsoft Win32 `EmptyClipboard`: https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-emptyclipboard

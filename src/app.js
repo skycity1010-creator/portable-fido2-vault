@@ -207,11 +207,8 @@ async function copyEntryPassword(id) {
       try {
         const outcome = await queueClipboardOperation(async () => {
           if (generation !== clipboardCopyGeneration) return "superseded";
-          const current = await clipboard.readText();
-          if (generation !== clipboardCopyGeneration) return "superseded";
-          if (current !== copiedPassword) return "changed";
-          await clipboard.clear();
-          return "cleared";
+          const cleared = await invoke("clear_clipboard_if_matches", { expected: copiedPassword });
+          return cleared ? "cleared" : "changed";
         });
         if (generation !== clipboardCopyGeneration) return;
         if (outcome === "cleared") $("copy-password-status").textContent = "已自動清除剪貼簿";

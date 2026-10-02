@@ -47,10 +47,11 @@ function element(type = "") {
   return node;
 }
 
-function loadClipboardUi({ writeError = null, readError = null, clearError = null } = {}) {
+function loadClipboardUi({ writeError = null, clearError = null, beforeConditionalClear = null } = {}) {
   const elements = new Map([["entries-body", element()], ["copy-password-status", element()]]);
   const writeCalls = [];
   const clearCalls = [];
+  const invokeCalls = [];
   const timers = new Map();
   let nextTimerId = 1;
   let clipboardText = "";
@@ -68,21 +69,23 @@ function loadClipboardUi({ writeError = null, readError = null, clearError = nul
   const window = {
     addEventListener() {},
     __TAURI__: {
-      core: { invoke: async () => undefined },
+      core: {
+        async invoke(command, args) {
+          invokeCalls.push({ command, args });
+          if (command !== "clear_clipboard_if_matches") return undefined;
+          if (beforeConditionalClear) await beforeConditionalClear(args);
+          if (clearError) throw clearError;
+          if (clipboardText !== args.expected) return false;
+          clearCalls.push(true);
+          clipboardText = "";
+          return true;
+        },
+      },
       clipboardManager: {
         async writeText(value) {
           if (writeError) throw writeError;
           writeCalls.push(value);
           clipboardText = value;
-        },
-        async readText() {
-          if (readError) throw readError;
-          return clipboardText;
-        },
-        async clear() {
-          if (clearError) throw clearError;
-          clearCalls.push(true);
-          clipboardText = "";
         },
       },
     },
@@ -109,13 +112,14 @@ function loadClipboardUi({ writeError = null, readError = null, clearError = nul
     timers,
     writeCalls,
     clearCalls,
+    invokeCalls,
     get clipboardText() { return clipboardText; },
     set clipboardText(value) { clipboardText = value; },
     get alertCount() { return alertCount; },
   };
 }
 
-test("clipboard clear failure is contained and reported generically", async () => {
+test("conditional clipboard clear failure is contained and reported generically", async () => {
   const ui = loadClipboardUi({ clearError: new Error("secret-a") });
   const entries = [{ id: "entry-a", site: "a.example", account: "alice", password: "secret-a", created_at: "now", updated_at: "now" }];
   ui.context.renderEntries(entries);
@@ -128,22 +132,23 @@ test("clipboard clear failure is contained and reported generically", async () =
   assert.match(status, /自動清除失敗/);
   assert.doesNotMatch(status, /secret-a/);
   assert.equal(ui.clipboardText, "secret-a");
+  assert.equal(ui.invokeCalls.filter((call) => call.command === "clear_clipboard_if_matches").length, 1);
 });
 
-test("clipboard read failure at expiry is contained and reported generically", async () => {
-  const ui = loadClipboardUi({ readError: new Error("secret-a") });
+test("expiry uses one atomic conditional-clear command", async () => {
+  const ui = loadClipboardUi();
   const entries = [{ id: "entry-a", site: "a.example", account: "alice", password: "secret-a", created_at: "now", updated_at: "now" }];
   ui.context.renderEntries(entries);
   await ui.elements.get("entries-body").children[0].buttons.find((item) => item.dataset.act === "copy").onclick();
   const timer = [...ui.timers.values()].find((item) => item.delay === 60_000);
 
-  await assert.doesNotReject(timer.callback());
+  await timer.callback();
 
-  const status = ui.elements.get("copy-password-status").textContent;
-  assert.match(status, /自動清除失敗/);
-  assert.doesNotMatch(status, /secret-a/);
-  assert.equal(ui.clipboardText, "secret-a");
-  assert.equal(ui.clearCalls.length, 0);
+  const clearCalls = ui.invokeCalls.filter((call) => call.command === "clear_clipboard_if_matches");
+  assert.equal(clearCalls.length, 1);
+  assert.equal(clearCalls[0].args.expected, "secret-a");
+  assert.equal(ui.clearCalls.length, 1);
+  assert.equal(ui.clipboardText, "");
 });
 
 test("60-second expiry preserves clipboard text replaced by another app", async () => {
@@ -194,7 +199,15 @@ test("clipboard write failure is reported without exposing clipboard error detai
 });
 
 test("an older in-flight expiry cannot erase a later FidoVault copy", async () => {
-  const ui = loadClipboardUi();
+  let releaseClear;
+  let announceClear;
+  const clearStarted = new Promise((resolve) => { announceClear = resolve; });
+  const ui = loadClipboardUi({
+    beforeConditionalClear: async () => {
+      announceClear();
+      await new Promise((resolve) => { releaseClear = resolve; });
+    },
+  });
   const entries = [
     { id: "entry-a", site: "a.example", account: "alice", password: "secret-a", created_at: "now", updated_at: "now" },
     { id: "entry-b", site: "b.example", account: "bob", password: "secret-b", created_at: "now", updated_at: "now" },
@@ -203,17 +216,6 @@ test("an older in-flight expiry cannot erase a later FidoVault copy", async () =
   const buttons = ui.elements.get("entries-body").children.map((row) => row.buttons.find((button) => button.dataset.act === "copy"));
   await buttons[0].onclick();
   const expiry = [...ui.timers.values()][0].callback;
-
-  let releaseClear;
-  let announceClear;
-  const clearStarted = new Promise((resolve) => { announceClear = resolve; });
-  const clipboard = ui.context.window.__TAURI__.clipboardManager;
-  const realClear = clipboard.clear;
-  clipboard.clear = async () => {
-    announceClear();
-    await new Promise((resolve) => { releaseClear = resolve; });
-    await realClear();
-  };
 
   const expiryWork = expiry();
   await clearStarted;

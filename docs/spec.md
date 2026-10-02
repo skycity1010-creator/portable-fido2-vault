@@ -148,17 +148,19 @@ offset   size   field
 
 - 條目列表提供「複製密碼」操作，使用 Tauri v2 Clipboard Manager 寫入系統文字剪貼簿。
 - 成功/失敗狀態只顯示通用訊息；密碼內容不進 audit、診斷 log 或狀態文字。
-- 60 秒後讀取目前剪貼簿文字；只在內容與該次複製值相同時呼叫清除。若內容已被取代或讀取失敗，保留剪貼簿不動；寫入、讀取及清除錯誤皆由 UI 捕捉並以不含密碼的訊息回報。
-- App 內的剪貼簿操作會序列化，避免已開始的舊到期清除擦掉後續 FidoVault 複製的值。剪貼簿為 OS 共用資源，其他桌面程式可能在到期前讀取內容。
-- Capability 僅授予 `clipboard-manager:allow-write-text`、`clipboard-manager:allow-read-text`、`clipboard-manager:allow-clear`；不開放圖片或 HTML 剪貼簿命令。
+- 60 秒後執行 Windows 原生條件清除：以 `OpenClipboard` 鎖定系統剪貼簿，在同一個鎖定區段中取得 `CF_UNICODETEXT`、與該次複製值逐字比較，符合才呼叫 `EmptyClipboard`，然後才釋放鎖。Windows 文件保證剪貼簿開啟期間其他程式不能修改，因此比較與清除之間沒有 read-then-clear 競態；內容不同時保留原內容。
+- 若剪貼簿沒有相符文字、鎖定/讀取/清除 API 失敗，UI 只顯示通用訊息且 App 不崩潰；密碼不進 audit、診斷 log 或狀態文字。
+- App 內的剪貼簿操作會序列化，避免舊到期清除擦掉後續 FidoVault 複製的值。剪貼簿仍是 OS 共用資源，其他桌面程式可能在到期前讀取內容。
+- Capability 僅授予 `clipboard-manager:allow-write-text`；條件清除使用本機 Win32 API，不授予 plugin 的讀取或清除權限，也不開放圖片或 HTML 剪貼簿命令。
+- Windows API 參考：[`OpenClipboard`](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-openclipboard)（阻止其他程式修改）、[`EmptyClipboard`](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-emptyclipboard)。
 
 ## 8. 安全模型 / 威脅說明
 
 - 金庫檔案外洩（無任何解鎖因子）→ payload 為 AES-256-GCM，header 僅含包裝槽位，無法取得 KEK。
 - **無復原**：主密碼遺忘 + 全部 FIDO2 金鑰全失 = 永久無法取回（UI 於建立帳號與設定頁明示）。
 - 移除金鑰 = 刪該槽；該金鑰即無法再解鎖（不可逆，需確認對話框）。
-- 離線：程式不開啟任何 socket；Tauri 未加 http/fs 外部插件。Clipboard Manager 僅使用本機系統剪貼簿。
-- 複製密碼會短暫暴露於系統共用剪貼簿；其他桌面程式可能在 60 秒清除前讀取，且清除只在內容仍相同時執行。
+- 離線：程式不開啟任何 socket；Tauri 未加 http/fs 外部插件。Clipboard Manager 僅寫入本機系統剪貼簿，條件清除為本機 Win32 呼叫。
+- 複製密碼會短暫暴露於系統共用剪貼簿；其他桌面程式可能在 60 秒清除前讀取。Windows 剪貼簿歷程/雲端剪貼簿也可能在此期間擷取或同步內容；EmptyClipboard 不負責清除已另行保存的歷程項目。
 - 已知限制（v0.1）：單機單使用者；檔案權限依賴 OS 使用者權限；不防執行中記憶體 dump（與一般密碼管理程式同級）。
 
 ## 9. Gate 對應

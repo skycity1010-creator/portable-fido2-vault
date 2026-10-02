@@ -99,8 +99,8 @@ offset   size   field
 
 - 金庫檔案外洩（無解鎖因子）→ payload AES-256-GCM 不可解；header 僅包裝槽位。
 - 無復原（設計如此）；移除金鑰不可逆。
-- 離線：不開啟任何 socket；未加 http/fs 插件；Clipboard Manager 僅使用本機剪貼簿。
-- audit 僅記非機密資訊（事件、方式、site 名稱、失敗代碼）；**永不明文記錄密碼/PIN/金流**。複製狀態與 app 診斷 log 不含密碼明文。複製會短暫暴露於系統共用剪貼簿；只有到期內容仍相同時才清除，其他桌面程式可能在此之前讀取。
+- 離線：不開啟任何 socket；未加 http/fs 插件；Clipboard Manager 僅寫入本機剪貼簿，條件清除使用 Win32 鎖定後比對/清除。
+- audit 僅記非機密資訊（事件、方式、site 名稱、失敗代碼）；**永不明文記錄密碼/PIN/金流**。複製狀態與 app 診斷 log 不含密碼明文。系統其他程式或 Windows 剪貼簿歷程/雲端功能仍可能在清除前讀取、保存或同步剪貼簿內容。
 - 已知限制（v0.1）：單機單使用者；檔案權限依賴 OS 使用者權限；不防執行中記憶體 dump。
 
 ## 6. 建置（WS2 建置機）
@@ -121,7 +121,7 @@ cargo +stable-x86_64-pc-windows-gnu build --release --features real-ctap --bin p
 
 - `--features real-ctap`：編入實體 FIDO2 支援；Windows GUI 使用系統 WebAuthn API，CLI `--authenticator hw` 使用 raw CTAP/HID。
 - Windows Release GUI 無需 `F2V_AUTHENTICATOR` 或系統管理員權限即可走 brokered backend；Debug 預設 mock，mock demo 可明確設 `F2V_AUTHENTICATOR=mock`。
-- 驗證（截至 2026-10-02）：MSVC `cargo test --lib --locked --features real-ctap` 57/57；Release backend-mode 7/7；vendor `device_filter` 6/6；Gate E2E 20/20（Feature 2 基線）；Node UI 19/19（剪貼簿測試 7/7）；`node --check src/app.js`；Windows GNU Release GUI + CLI `--locked` build 成功。Feature 2 的本機驗收仍待使用者；Feature 3 draft PR #8 已開，Win11-NB Console 驗收待安排。
+- 驗證（截至 2026-10-02）：MSVC `cargo test --lib --locked --features real-ctap` 60/60；Release backend-mode 7/7；vendor `device_filter` 6/6；Gate E2E 20/20（Feature 2 基線）；Node UI 19/19（剪貼簿測試 7/7）；`node --check src/app.js`；Windows GNU Release GUI + CLI `--locked` build 成功。Feature 2 的本機驗收仍待使用者；Feature 3 draft PR #8 已開，Win11-NB Console 驗收待安排。
 - 實體驗收已由使用者在 Win11-NB 互動桌面通過：舊 raw-CTAP 槽可由 Windows WebAuthn 解鎖、新金鑰註冊與登入成功，第二支 YubiKey NFC 交叉登入亦通過；不再執行原 Kanban 規劃的 raw-CTAP CLI 實體路線。
 - 本次單一登入入口/提示前景修改：使用者確認 Console 啟動正常；H1、H3、H4、H5 通過。H2 通用按鈕免選金鑰通過；上一候選的安全性視窗仍在背景。Console 唯讀 EnumWindows 探測確認 FidoVault 前景 z-order 17，獨立 `CredentialUIBroker`「Windows 安全性」視窗 z-order 18、`OWNER=0`。新增窄範圍 best-effort broker-window monitor：baseline 所有 top-level HWND 與既有 broker PID，只針對唯一的新同-session System32 CredentialUIBroker 視窗，在 FidoVault 仍為 foreground 時嘗試一次 SetForegroundWindow；不設 topmost、不用 ASFW_ANY。程式碼獨立審查通過；commit `45d3aa6` 已推至 PR #3 branch；Rust 53/53、UI 4/4、Windows GNU Release build 成功。該 commit 的新 GUI 已部署至 Win11-NB，SHA256 `59BBAB25C21A419702D02FA7E97242392C388149432BAF733AC0C715F06085D8`，6,140,928 bytes；舊 exe 備份 `C:\FidoVault\portable-fido-vault.exe.pre-H2focus-20261001-223428-2985cea4.bak`。vault 備份 `C:\FidoVault\vault.db.pre-H2focus-20261001-223428-2985cea4.bak`；部署前後均為 3 slots、SHA256 `58A1D4877C2274B3D403E1D87CD1E9BA7C5404D450C3F69E1D9486501F02D780`。本機 Console H2 測試已由使用者確認 OK：通用登入免選金鑰，Windows 安全性操作提示置前；H2 驗收通過並結案。前景交接仍是 best-effort。RDP-Tcp#0 Session 2 曾回報 WebAuthn API v1，維持 v4+ fail-closed；RDP redirection 未驗收。
 - 建置檔參數：release `strip + lto`。
@@ -151,7 +151,7 @@ cargo +stable-x86_64-pc-windows-gnu build --release --features real-ctap --bin p
 | 7 | 閒置自動上鎖 | ✅（先前 GUI 實測；新 build 未重測） |
 | 8 | 加密檔直拷別機可解密 | ✅（mock E2E copy-test） |
 | 9 | 每筆條目舊密碼歷史（預設 3，可設 1–20） | 🟡 Rust/UI/E2E 測試與建置通過；使用者明確延後 Win11-NB 本機 Console 實機驗收 |
-| 10 | 條目複製密碼（60 秒條件清除） | 🟡 Rust 57/57、Node UI 19/19、Windows GNU Release GUI/CLI build 通過；待 Win11-NB 本機 Console 驗收 |
+| 10 | 條目複製密碼（60 秒 Win32 原子條件清除） | 🟡 Rust 60/60、Node UI 19/19、GNU Release build 通過；待 Win11-NB 本機 Console 驗收 |
 
 ## 9. 2026-09-29 Win11-NB log 問題：根因與修復
 

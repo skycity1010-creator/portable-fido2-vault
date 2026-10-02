@@ -26,6 +26,78 @@ pub mod vault;
 
 pub type Result<T> = std::result::Result<T, String>;
 
+fn clipboard_text_matches(actual: &[u16], expected: &str) -> bool {
+    let expected_utf16: Vec<u16> = expected.encode_utf16().collect();
+    actual.len() == expected_utf16.len() + 1
+        && actual[..expected_utf16.len()] == expected_utf16
+        && actual[expected_utf16.len()] == 0
+}
+
+#[cfg(windows)]
+mod native_clipboard {
+    use super::{clipboard_text_matches, Result};
+    use std::mem::size_of;
+
+    use windows_sys::Win32::System::DataExchange::{
+        CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard,
+    };
+    use windows_sys::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+
+    const CF_UNICODETEXT: u32 = 13;
+
+    struct ClipboardGuard;
+
+    impl Drop for ClipboardGuard {
+        fn drop(&mut self) {
+            unsafe {
+                CloseClipboard();
+            }
+        }
+    }
+
+    pub fn clear_if_matches(owner_hwnd: isize, expected: &str) -> Result<bool> {
+        unsafe {
+            if OpenClipboard(owner_hwnd as _) == 0 {
+                return Err("could not open system clipboard".to_string());
+            }
+            let _clipboard_guard = ClipboardGuard;
+
+            let data = GetClipboardData(CF_UNICODETEXT);
+            if data.is_null() {
+                return Ok(false);
+            }
+
+            let expected_utf16: Vec<u16> = expected.encode_utf16().collect();
+            let required_units = expected_utf16
+                .len()
+                .checked_add(1)
+                .ok_or_else(|| "clipboard text length is invalid".to_string())?;
+            let required_bytes = required_units
+                .checked_mul(size_of::<u16>())
+                .ok_or_else(|| "clipboard text length is invalid".to_string())?;
+            if GlobalSize(data as _) < required_bytes {
+                return Ok(false);
+            }
+
+            let locked = GlobalLock(data as _);
+            if locked.is_null() {
+                return Err("could not read system clipboard text".to_string());
+            }
+            let actual = std::slice::from_raw_parts(locked.cast::<u16>(), required_units);
+            let matches = clipboard_text_matches(actual, expected);
+            GlobalUnlock(data as _);
+
+            if !matches {
+                return Ok(false);
+            }
+            if EmptyClipboard() == 0 {
+                return Err("could not clear system clipboard".to_string());
+            }
+            Ok(true)
+        }
+    }
+}
+
 /// 金鑰清單項目（回傳前端，不含任何機密）。
 #[derive(serde::Serialize)]
 pub struct KeyInfo {
@@ -500,6 +572,29 @@ fn set_password_history_limit(state: tauri::State<VaultState>, limit: u32) -> Re
     })
 }
 
+#[tauri::command]
+fn clear_clipboard_if_matches(app: tauri::AppHandle, expected: String) -> Result<bool> {
+    #[cfg(windows)]
+    {
+        let window = app
+            .get_webview_window("main")
+            .ok_or_else(|| "main window is unavailable".to_string())?;
+        let hwnd = window
+            .hwnd()
+            .map_err(|_| "main window handle is unavailable".to_string())?
+            .0 as isize;
+        if hwnd == 0 {
+            return Err("main window handle is unavailable".to_string());
+        }
+        native_clipboard::clear_if_matches(hwnd, &expected)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (app, expected);
+        Err("conditional clipboard clearing is only supported on Windows".to_string())
+    }
+}
+
 /// 偵測金鑰（註冊前預覽：類型 + label）。**不消耗**後端狀態 → 與緊接的 register_key 一致。
 #[tauri::command]
 fn detect_key(state: tauri::State<VaultState>) -> Result<fido2::DetectedKey> {
@@ -558,6 +653,7 @@ pub fn run() {
             set_idle_lock,
             get_vault_settings,
             set_password_history_limit,
+            clear_clipboard_if_matches,
             detect_key
         ])
         .run(tauri::generate_context!())
@@ -641,5 +737,38 @@ mod focus_window_tests {
         assert!(ensure_parent_window_ready(true, true, false, false).is_err());
         assert!(ensure_parent_window_ready(true, true, true, true).is_err());
         assert!(ensure_parent_window_ready(false, false, false, true).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod clipboard_match_tests {
+    use super::clipboard_text_matches;
+
+    fn terminated(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    #[test]
+    fn matches_exact_null_terminated_utf16_text_including_non_ascii() {
+        assert!(clipboard_text_matches(&terminated("密碼🔐"), "密碼🔐"));
+    }
+
+    #[test]
+    fn rejects_different_or_extended_clipboard_text() {
+        assert!(!clipboard_text_matches(
+            &terminated("replacement"),
+            "expected"
+        ));
+        assert!(!clipboard_text_matches(
+            &terminated("expected-extra"),
+            "expected"
+        ));
+    }
+
+    #[test]
+    fn requires_a_null_terminator_after_the_expected_text() {
+        let unterminated: Vec<u16> = "expected".encode_utf16().collect();
+        assert!(!clipboard_text_matches(&unterminated, "expected"));
+        assert!(!clipboard_text_matches(&[], ""));
     }
 }
