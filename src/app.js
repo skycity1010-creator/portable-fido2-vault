@@ -8,6 +8,9 @@ let brokeredKeyLogin = false;
 let idleTimer = null;
 let idleMinutes = 5;
 let editingRestoreHistory = null;
+let clipboardClearTimer = null;
+let clipboardCopyGeneration = 0;
+let clipboardOperationQueue = Promise.resolve();
 
 // ─────────────── 工具 ───────────────
 function show(id) { $(id).classList.remove("hidden"); }
@@ -159,6 +162,7 @@ function renderEntries(entries) {
       <td class="mono">${esc(e.updated_at)}</td>
       <td class="rowbtns">
         <button data-act="show" data-id="${e.id}">顯示</button>
+        <button data-act="copy" data-id="${e.id}">複製密碼</button>
         <button data-act="edit" data-id="${e.id}">編輯</button>
         <button data-act="del" data-id="${e.id}">刪除</button>
       </td>`;
@@ -175,9 +179,49 @@ function renderEntries(entries) {
       } else if (b.dataset.act === "show") {
         const en = entries.find((x) => x.id === id);
         prompt("密碼", en ? en.password : "");
+      } else if (b.dataset.act === "copy") {
+        await copyEntryPassword(id);
       }
     };
   });
+}
+
+function queueClipboardOperation(operation) {
+  const result = clipboardOperationQueue.then(operation, operation);
+  clipboardOperationQueue = result.catch(() => {});
+  return result;
+}
+
+async function copyEntryPassword(id) {
+  const entry = (window.__lastEntries || []).find((item) => item.id === id);
+  if (!entry) return;
+  const clipboard = window.__TAURI__.clipboardManager;
+  try {
+    await queueClipboardOperation(() => clipboard.writeText(entry.password));
+    const generation = ++clipboardCopyGeneration;
+    $("copy-password-status").textContent = "已複製密碼到剪貼簿，60 秒後自動清除";
+    if (clipboardClearTimer !== null) clearTimeout(clipboardClearTimer);
+    const copiedPassword = entry.password;
+    clipboardClearTimer = setTimeout(async () => {
+      if (generation !== clipboardCopyGeneration) return;
+      try {
+        const outcome = await queueClipboardOperation(async () => {
+          if (generation !== clipboardCopyGeneration) return "superseded";
+          const cleared = await invoke("clear_clipboard_if_matches", { expected: copiedPassword });
+          return cleared ? "cleared" : "changed";
+        });
+        if (generation !== clipboardCopyGeneration) return;
+        if (outcome === "cleared") $("copy-password-status").textContent = "已自動清除剪貼簿";
+        else if (outcome === "changed") $("copy-password-status").textContent = "剪貼簿內容已變更，未清除";
+      } catch {
+        if (generation === clipboardCopyGeneration) $("copy-password-status").textContent = "自動清除失敗，請手動清除剪貼簿";
+      } finally {
+        if (generation === clipboardCopyGeneration) clipboardClearTimer = null;
+      }
+    }, 60_000);
+  } catch {
+    $("copy-password-status").textContent = "複製失敗，請確認剪貼簿功能可用";
+  }
 }
 
 async function refreshEntries() {
