@@ -28,3 +28,7 @@ Clipboard copy/auto-clear and custom security-key labels (separate feature cards
 2. Implement the encrypted data/settings model and Tauri command, retaining the existing serialized vault compatibility.
 3. Add failing UI tests for retention controls and history/restore interaction, then implement the UI.
 4. Run targeted and full tests, build, and update this verification plan. Deploy only after the implementation PR is open and all build checks pass.
+
+## Win11-NB acceptance
+
+- User confirmed Feature 2 passed the combined Win11-NB local Console acceptance with Features 3 and 4 on 2026-10-02.

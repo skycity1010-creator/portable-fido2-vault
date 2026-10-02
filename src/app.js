@@ -12,6 +12,8 @@ let clipboardClearTimer = null;
 let clipboardCopyGeneration = 0;
 let clipboardOperationQueue = Promise.resolve();
 
+let keyNameDialogGeneration = 0;
+
 // ─────────────── 工具 ───────────────
 function show(id) { $(id).classList.remove("hidden"); }
 function hide(id) { $(id).classList.add("hidden"); }
@@ -334,9 +336,92 @@ async function renderKeys() {
   });
 }
 
+
+function validateKeyLabel(value) {
+  const raw = String(value ?? "");
+  if (/[\u0000-\u001f\u007f-\u009f]/u.test(raw)) return "名稱不能包含控制字元";
+  const label = raw.trim();
+  if (!label) return "名稱不可空白";
+  if ([...label].length > 64) return "名稱最多 64 個字元";
+  return "";
+}
+
+
+
+async function requestKeyLabel() {
+  const dialog = $("key-name-dialog");
+  const input = $("key-name-input");
+  const status = $("key-name-status");
+  const confirmButton = $("btn-confirm-key-name");
+  const suggestedLabel = await invoke("suggest_key_label");
+  keyNameDialogGeneration += 1;
+  confirmButton.disabled = false;
+  confirmButton.removeAttribute?.("aria-busy");
+  input.value = suggestedLabel;
+  input.removeAttribute?.("aria-invalid");
+  status.textContent = "";
+  dialog.returnValue = "";
+  return new Promise((resolve) => {
+    dialog.addEventListener("close", () => {
+      resolve(dialog.returnValue === "confirm" ? input.value.trim() : null);
+    }, { once: true });
+    dialog.showModal();
+    input.focus?.();
+  });
+}
+
+function bindKeyNameDialog() {
+  const dialog = $("key-name-dialog");
+  const input = $("key-name-input");
+  const status = $("key-name-status");
+  const confirmButton = $("btn-confirm-key-name");
+  confirmButton.onclick = async () => {
+    if (confirmButton.disabled) return;
+    const issue = validateKeyLabel(input.value);
+    if (issue) {
+      status.textContent = issue;
+      input.setAttribute("aria-invalid", "true");
+      input.focus?.();
+      return;
+    }
+    const generation = keyNameDialogGeneration;
+    confirmButton.disabled = true;
+    confirmButton.setAttribute("aria-busy", "true");
+    try {
+      await invoke("validate_key_label", { label: input.value.trim() });
+      if (dialog.open && generation === keyNameDialogGeneration) {
+        input.setAttribute("aria-invalid", "false");
+        dialog.close("confirm");
+      }
+    } catch (error) {
+      if (dialog.open && generation === keyNameDialogGeneration) {
+        status.textContent = String(error);
+        input.setAttribute("aria-invalid", "true");
+        input.focus?.();
+      }
+    } finally {
+      if (dialog.open && generation === keyNameDialogGeneration) {
+        confirmButton.disabled = false;
+        confirmButton.removeAttribute?.("aria-busy");
+      }
+    }
+  };
+  $("btn-cancel-key-name").onclick = () => dialog.close("cancel");
+}
+
 async function registerKey() {
-  $("register-status").textContent = "偵測中…請插入金鑰";
+  const registerButton = $("btn-register-key");
+  if (registerButton.disabled) return;
+  registerButton.disabled = true;
+  registerButton.setAttribute("aria-busy", "true");
+  $("register-status").textContent = "請先為此金鑰命名";
   try {
+    const label = await requestKeyLabel();
+    if (label === null) {
+      $("register-status").textContent = "已取消註冊";
+      return;
+    }
+    $("register-status").textContent = "偵測中…請插入金鑰";
     const det = await invoke("detect_key");
     let pin = null;
     if (det.key_type === "windows_managed") {
@@ -346,10 +431,14 @@ async function registerKey() {
       pin = prompt(`「${det.label}」為 PIN 型金鑰 — 請輸入 PIN：`);
       if (pin === null) return; // 取消
     }
-    const reg = await invoke("register_key", { pin });
+    const reg = await invoke("register_key", { pin, label });
     $("register-status").textContent = `已註冊：${reg.label}（${reg.key_type}）`;
     renderKeys();
   } catch (e) { $("register-status").textContent = "失敗：" + String(e); }
+  finally {
+    registerButton.disabled = false;
+    registerButton.removeAttribute?.("aria-busy");
+  }
 }
 
 // ─────────────── 軌跡 ───────────────
@@ -435,6 +524,7 @@ document.addEventListener("DOMContentLoaded", () => {
   $("btn-toggle-e-pass").onclick = () => togglePasswordVisibility("e-pass", "btn-toggle-e-pass");
   $("btn-toggle-ed-pass").onclick = () => togglePasswordVisibility("ed-pass", "btn-toggle-ed-pass");
   $("btn-register-key").onclick = registerKey;
+  bindKeyNameDialog();
   $("btn-set-idle").onclick = setIdle;
   $("btn-set-password-history-limit").onclick = setPasswordHistoryLimit;
   $("btn-lock").onclick = doLock;

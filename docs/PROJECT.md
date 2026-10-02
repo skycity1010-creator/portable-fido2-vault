@@ -13,6 +13,7 @@ Windows 桌面、**完全離線**、**portable 免安裝**的 FIDO2 密碼金庫
 - 之後**主密碼或任一支已註冊 FIDO2 金鑰**皆可登入（允許多支）
 - 金鑰類型：raw CTAP 可辨識指紋型 / PIN 型 / touch-only；Windows GUI 使用 `windows_managed`，由 Windows broker 提示驗證。
 - **僅接受支援 CTAP2 hmac-secret/PRF 的金鑰**（如 YubiKey 5+）；不支援者拒絕註冊並顯示原因
+- 新增安全性金鑰時可設定 FidoVault 本機別名；沿用明文 header `KeySlot.label`，Rust 以 Unicode canonical caseless matching 提供唯一建議並在 authenticator 偵測前驗證，UI 警告勿輸入敏感資料
 - 加密：Argon2id + **AES-256-GCM**，整個金庫加密為單一檔案 `vault.db`
 - CRUD ＋ created_at/updated_at ＋ 每筆條目舊密碼歷史（預設 3 代，可設 1–20）＋ 條目密碼複製（60 秒後僅在剪貼簿內容仍相同時清除）＋ 軌跡紀錄（絕不明文記錄密碼）＋ 閒置自動上鎖
 - ⚠️ **無復原機制**：主密碼遺忘且所有 FIDO2 金鑰全失 = 資料永久無法取回（設計如此，UI 明示）
@@ -54,7 +55,7 @@ portable-fido2-vault/
 offset   size   field
 0        6      magic "F2VLT\x01"
 6        4      header_len u32 LE
-10       N     header JSON（明文、僅金鑰包裝槽位，不含機密值）
+10       N     header JSON（明文金鑰包裝區；不含密碼/金鑰機密，`key_slots[].label` 為明文顯示別名）
 10+N     12    payload nonce（AES-GCM 96-bit）
 22+N     …     AES-256-GCM(KEK, vault_json) — 含 16B tag 於尾端
 ```
@@ -121,7 +122,7 @@ cargo +stable-x86_64-pc-windows-gnu build --release --features real-ctap --bin p
 
 - `--features real-ctap`：編入實體 FIDO2 支援；Windows GUI 使用系統 WebAuthn API，CLI `--authenticator hw` 使用 raw CTAP/HID。
 - Windows Release GUI 無需 `F2V_AUTHENTICATOR` 或系統管理員權限即可走 brokered backend；Debug 預設 mock，mock demo 可明確設 `F2V_AUTHENTICATOR=mock`。
-- 驗證（截至 2026-10-02）：MSVC `cargo test --lib --locked --features real-ctap` 60/60；Release backend-mode 7/7；vendor `device_filter` 6/6；Gate E2E 20/20（Feature 2 基線）；Node UI 19/19（剪貼簿測試 7/7）；`node --check src/app.js`；Windows GNU Release GUI + CLI `--locked` build 成功。Feature 2 的本機驗收仍待使用者；Feature 3 draft PR #8 已開，Win11-NB Console 驗收待安排。
+- 驗證（截至 2026-10-02）：MSVC `cargo test --lib --locked --features real-ctap` 64/64；Release backend-mode 7/7；Node UI 24/24（Feature 4 targeted 5/5）；`node --check src/app.js`、`git diff --check` 通過。Windows GNU Release GUI + CLI（`--locked --features real-ctap`）建置成功；GUI 6,729,216 bytes，SHA-256 `7deba32418fb173d5ada126e600c81a748ffa51bcfe503afc7bed683fb928ed1`；CLI 2,427,392 bytes，SHA-256 `1493ab5d09fb942a61f77cc9e82827b2fa08f60e3e74d81e5d1cd657771ab3c2`。`cargo clippy -D warnings` 仍受 11 個既有其他模組警告阻擋，新增別名路徑無相關警告。Feature 4 獨立 review 已通過並部署至 Win11-NB（GUI 目標端 SHA-256 `7deba32418fb173d5ada126e600c81a748ffa51bcfe503afc7bed683fb928ed1`）；舊 EXE 與 vault 均有驗證備份，部署前後 live vault hash 不變、3 slots。使用者於 2026-10-02 確認 Feature 2、3、4 集中 Win11-NB 本機 Console 驗收全部通過；Feature 1 先前亦已通過。
 - 實體驗收已由使用者在 Win11-NB 互動桌面通過：舊 raw-CTAP 槽可由 Windows WebAuthn 解鎖、新金鑰註冊與登入成功，第二支 YubiKey NFC 交叉登入亦通過；不再執行原 Kanban 規劃的 raw-CTAP CLI 實體路線。
 - 本次單一登入入口/提示前景修改：使用者確認 Console 啟動正常；H1、H3、H4、H5 通過。H2 通用按鈕免選金鑰通過；上一候選的安全性視窗仍在背景。Console 唯讀 EnumWindows 探測確認 FidoVault 前景 z-order 17，獨立 `CredentialUIBroker`「Windows 安全性」視窗 z-order 18、`OWNER=0`。新增窄範圍 best-effort broker-window monitor：baseline 所有 top-level HWND 與既有 broker PID，只針對唯一的新同-session System32 CredentialUIBroker 視窗，在 FidoVault 仍為 foreground 時嘗試一次 SetForegroundWindow；不設 topmost、不用 ASFW_ANY。程式碼獨立審查通過；commit `45d3aa6` 已推至 PR #3 branch；Rust 53/53、UI 4/4、Windows GNU Release build 成功。該 commit 的新 GUI 已部署至 Win11-NB，SHA256 `59BBAB25C21A419702D02FA7E97242392C388149432BAF733AC0C715F06085D8`，6,140,928 bytes；舊 exe 備份 `C:\FidoVault\portable-fido-vault.exe.pre-H2focus-20261001-223428-2985cea4.bak`。vault 備份 `C:\FidoVault\vault.db.pre-H2focus-20261001-223428-2985cea4.bak`；部署前後均為 3 slots、SHA256 `58A1D4877C2274B3D403E1D87CD1E9BA7C5404D450C3F69E1D9486501F02D780`。本機 Console H2 測試已由使用者確認 OK：通用登入免選金鑰，Windows 安全性操作提示置前；H2 驗收通過並結案。前景交接仍是 best-effort。RDP-Tcp#0 Session 2 曾回報 WebAuthn API v1，維持 v4+ fail-closed；RDP／WebAuthn redirection 不支援，並已在 README 明確說明；硬體驗收使用本機 Console session。
 - 建置檔參數：release `strip + lto`。
@@ -152,6 +153,7 @@ cargo +stable-x86_64-pc-windows-gnu build --release --features real-ctap --bin p
 | 8 | 加密檔直拷別機可解密 | ✅（mock E2E copy-test） |
 | 9 | 每筆條目舊密碼歷史（預設 3，可設 1–20） | 🟡 Rust/UI/E2E 測試與建置通過；使用者明確延後 Win11-NB 本機 Console 實機驗收 |
 | 10 | 條目複製密碼（60 秒 Win32 原子條件清除） | 🟡 Rust 60/60、Node UI 19/19、GNU Release build 通過；待 Win11-NB 本機 Console 驗收 |
+| 11 | 註冊時設定安全性金鑰本機別名 | 🟡 自動化測試及 GNU Release build 完成後，與 Gate 9/10 一併交由使用者於 Win11-NB 本機 Console 驗收 |
 
 ## 9. 2026-09-29 Win11-NB log 問題：根因與修復
 

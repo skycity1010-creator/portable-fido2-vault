@@ -140,9 +140,48 @@ pub struct Settings {
 }
 
 const DEFAULT_PASSWORD_HISTORY_LIMIT: u32 = 3;
+const MAX_KEY_LABEL_CHARS: usize = 64;
 
 fn default_password_history_limit() -> u32 {
     DEFAULT_PASSWORD_HISTORY_LIMIT
+}
+
+fn validate_key_label(candidate: &str, existing_labels: &[&str]) -> Result<String, VaultError> {
+    if candidate.chars().any(|character| character.is_control()) {
+        return Err(VaultError::Format("金鑰名稱不能包含控制字元".into()));
+    }
+    let label = candidate.trim();
+    if label.is_empty() {
+        return Err(VaultError::Format("金鑰名稱不可空白".into()));
+    }
+    if label.chars().count() > MAX_KEY_LABEL_CHARS {
+        return Err(VaultError::Format(format!(
+            "金鑰名稱最多 {MAX_KEY_LABEL_CHARS} 個字元"
+        )));
+    }
+    if existing_labels
+        .iter()
+        .any(|existing| caseless::canonical_caseless_match_str(existing.trim(), label))
+    {
+        return Err(VaultError::Format("金鑰名稱已存在，請改用其他名稱".into()));
+    }
+    Ok(label.to_owned())
+}
+
+fn suggest_unique_key_label(existing_labels: &[&str]) -> String {
+    let base = "安全性金鑰";
+    let candidate_count = existing_labels.len().saturating_add(1);
+    for suffix in 1..=candidate_count {
+        let candidate = if suffix == 1 {
+            base.to_owned()
+        } else {
+            format!("{base} {suffix}")
+        };
+        if validate_key_label(&candidate, existing_labels).is_ok() {
+            return candidate;
+        }
+    }
+    unreachable!("one more candidate than existing labels must be available")
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -583,7 +622,53 @@ impl Vault {
     /// 偵測 + 註冊新金鑰：以目前 KEK 包出新槽位。
     /// PIN 型金鑰註冊時即需提供 PIN（makeCredential 需與 token 建立安全通道）。
     /// **產品決策：不支援 PRF/hmac-secret 的金鑰一律拒絕註冊**（無法解鎖離線金庫）。
-    pub fn register_key(&mut self, backend: &mut (dyn FidoBackend + 'static), pin: Option<&str>) -> Result<RegisteredCredential, VaultError> {
+    pub fn register_key(
+        &mut self,
+        backend: &mut (dyn FidoBackend + 'static),
+        pin: Option<&str>,
+    ) -> Result<RegisteredCredential, VaultError> {
+        self.register_key_internal(backend, pin, None)
+    }
+
+    /// Register with a FidoVault-local alias. Validate it before querying the authenticator.
+    pub fn register_key_with_label(
+        &mut self,
+        backend: &mut (dyn FidoBackend + 'static),
+        pin: Option<&str>,
+        candidate_label: &str,
+    ) -> Result<RegisteredCredential, VaultError> {
+        let label = self.validate_new_key_label(candidate_label)?;
+        self.register_key_internal(backend, pin, Some(&label))
+    }
+
+    /// Validate a proposed local alias against every slot already stored in this vault.
+    pub fn validate_new_key_label(&self, candidate_label: &str) -> Result<String, VaultError> {
+        let existing_labels: Vec<&str> = self
+            .header
+            .key_slots
+            .iter()
+            .map(|slot| slot.label.as_str())
+            .collect();
+        validate_key_label(candidate_label, &existing_labels)
+    }
+
+    /// Suggest an unused default alias using the same canonical Unicode comparison as validation.
+    pub fn suggested_key_label(&self) -> String {
+        let existing_labels: Vec<&str> = self
+            .header
+            .key_slots
+            .iter()
+            .map(|slot| slot.label.as_str())
+            .collect();
+        suggest_unique_key_label(&existing_labels)
+    }
+
+    fn register_key_internal(
+        &mut self,
+        backend: &mut (dyn FidoBackend + 'static),
+        pin: Option<&str>,
+        custom_label: Option<&str>,
+    ) -> Result<RegisteredCredential, VaultError> {
         // 裁決②：不支援 hmac-secret/PRF 的金鑰拒絕註冊。
         // 順序：先 detect()（real 後端需 getInfo 才能知 PRF 能力；mock 的 detect 為無害循環），
         // 再 prf_supported()（依 detect 快取的資訊判定）。
@@ -591,12 +676,15 @@ impl Vault {
         if !backend.prf_supported() {
             return Err(VaultError::Fido(FidoError::PrfNotSupported));
         }
-        let reg = backend.register_credential(&detected, pin)?;
+        let mut reg = backend.register_credential(&detected, pin)?;
         let secret = backend.get_prf_secret(&reg.credential_id, pin)?;
         let k = kek_from_prf_secret(&secret);
         let nonce = random_nonce();
         let ct = aes_gcm_encrypt(&k, &nonce, self.kek.as_slice());
 
+        if let Some(label) = custom_label {
+            reg.label = label.to_owned();
+        }
         self.header.key_slots.push(KeySlot {
             credential_id: base64_encode(&reg.credential_id),
             aaguid: hex32_16(reg.aaguid),
@@ -606,7 +694,11 @@ impl Vault {
             ct: base64_encode(&ct),
         });
         let kind_str = format!("{}", reg.kind);
-        self.record("key_registered", &format!("fido2:{}", reg.label), &format!("type={kind_str}"))?;
+        self.record(
+            "key_registered",
+            &format!("fido2:{}", reg.label),
+            &format!("type={kind_str}"),
+        )?;
         Ok(reg)
     }
 
@@ -723,6 +815,11 @@ mod tests {
         let mut bad = NoPrfBackend(MockBackend::new());
         assert!(matches!(
             v.register_key(&mut bad, None),
+            Err(VaultError::Fido(FidoError::PrfNotSupported))
+        ));
+        let mut bad_named = NoPrfBackend(MockBackend::new());
+        assert!(matches!(
+            v.register_key_with_label(&mut bad_named, None, "Test Alias"),
             Err(VaultError::Fido(FidoError::PrfNotSupported))
         ));
         // 金鑰槽數不變
@@ -1055,6 +1152,110 @@ mod tests {
         let header_len = u32::from_le_bytes(buf[6..10].try_into().unwrap()) as usize;
         let header_str = String::from_utf8_lossy(&buf[10..10 + header_len]);
         assert!(!header_str.contains("TopSecret-Pw-77"));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn custom_key_label_validation_trims_and_rejects_invalid_or_duplicate_values() {
+        assert_eq!(
+            validate_key_label("  Recovery Key  ", &[]).unwrap(),
+            "Recovery Key"
+        );
+        assert!(validate_key_label("", &[]).is_err());
+        assert!(validate_key_label("   ", &[]).is_err());
+        assert!(validate_key_label("line\nbreak", &[]).is_err());
+        assert!(validate_key_label(&"x".repeat(65), &[]).is_err());
+        assert!(validate_key_label(&"😀".repeat(64), &[]).is_ok());
+        assert!(validate_key_label(&"😀".repeat(65), &[]).is_err());
+        assert!(validate_key_label(" recovery key ", &["Recovery Key"]).is_err());
+        assert!(validate_key_label("ς", &["Σ"]).is_err());
+        assert!(validate_key_label("STRASSE", &["Straße"]).is_err());
+        assert!(validate_key_label("É", &["e\u{301}"]).is_err());
+    }
+
+    #[test]
+    fn suggested_key_label_skips_existing_names_using_the_canonical_comparison() {
+        assert_eq!(suggest_unique_key_label(&[]), "安全性金鑰");
+        assert_eq!(
+            suggest_unique_key_label(&["安全性金鑰", "安全性金鑰 2"]),
+            "安全性金鑰 3"
+        );
+    }
+
+    #[test]
+    fn custom_key_label_persists_to_header_list_and_audit() {
+        let d = tmp_dir("custom-key-label");
+        let p = d.join("vault.db");
+        let _ = fs::remove_file(&p);
+        let mut v = Vault::create(&p, "Pw-12345").unwrap();
+        let mut backend = MockBackend::new();
+        let registered = v
+            .register_key_with_label(&mut backend, None, "  Recovery Key  ")
+            .unwrap();
+        assert_eq!(registered.label, "Recovery Key");
+        assert_eq!(v.keys_meta()[0].1, "Recovery Key");
+        assert!(v.audit().iter().any(|event| {
+            event.event == "key_registered" && event.method == "fido2:Recovery Key"
+        }));
+        drop(v);
+
+        let reopened = Vault::open_password(&p, "Pw-12345").unwrap();
+        assert_eq!(reopened.keys_meta()[0].1, "Recovery Key");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn invalid_or_duplicate_key_label_is_rejected_before_backend_detection() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        struct DetectSpy(Arc<AtomicBool>);
+        impl FidoBackend for DetectSpy {
+            fn detect(&mut self) -> Result<crate::fido2::DetectedKey, FidoError> {
+                self.0.store(true, Ordering::SeqCst);
+                Err(FidoError::NoDevice)
+            }
+            fn register_credential(
+                &mut self,
+                _detected: &crate::fido2::DetectedKey,
+                _pin: Option<&str>,
+            ) -> Result<RegisteredCredential, FidoError> {
+                Err(FidoError::NoDevice)
+            }
+            fn get_prf_secret(
+                &mut self,
+                _id: &[u8],
+                _pin: Option<&str>,
+            ) -> Result<[u8; 32], FidoError> {
+                Err(FidoError::NoDevice)
+            }
+        }
+
+        let d = tmp_dir("custom-key-label-invalid");
+        let p = d.join("vault.db");
+        let _ = fs::remove_file(&p);
+        let mut v = Vault::create(&p, "Pw-12345").unwrap();
+        let mut initial = MockBackend::new();
+        v.register_key_with_label(&mut initial, None, "Existing Key")
+            .unwrap();
+
+        let detected = Arc::new(AtomicBool::new(false));
+        let mut spy = DetectSpy(detected.clone());
+        assert!(matches!(
+            v.register_key_with_label(&mut spy, None, " existing key "),
+            Err(VaultError::Format(_))
+        ));
+        assert!(!detected.load(Ordering::SeqCst));
+        assert_eq!(v.keys_meta().len(), 1);
+
+        let mut blank_spy = DetectSpy(detected.clone());
+        assert!(matches!(
+            v.register_key_with_label(&mut blank_spy, None, "  "),
+            Err(VaultError::Format(_))
+        ));
+        assert!(!detected.load(Ordering::SeqCst));
         let _ = fs::remove_dir_all(&d);
     }
 

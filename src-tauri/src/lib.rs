@@ -535,6 +535,7 @@ fn register_key(
     window: tauri::WebviewWindow,
     state: tauri::State<VaultState>,
     pin: Option<String>,
+    label: String,
 ) -> Result<fido2::RegisteredCredential> {
     let require_foreground = state.with_lock(|g| Ok(g.backend.uses_brokered_key_selection()))?;
     let owner_hwnd = raise_key_operation_window(&window, require_foreground)?;
@@ -542,11 +543,25 @@ fn register_key(
     state.with_lock(|g| match g.vault.as_mut() {
         Some(v) => {
             g.backend.set_webauthn_parent_hwnd(owner_hwnd);
-            v.register_key(g.backend.as_mut(), pin.as_deref())
+            v.register_key_with_label(g.backend.as_mut(), pin.as_deref(), &label)
                 .map_err(|e| e.to_string())
         }
         None => Err("金庫未解鎖".to_string()),
     })
+}
+
+#[tauri::command]
+fn validate_key_label(state: tauri::State<VaultState>, label: String) -> Result<()> {
+    with_unlocked(&state, |v| {
+        v.validate_new_key_label(&label)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    })
+}
+
+#[tauri::command]
+fn suggest_key_label(state: tauri::State<VaultState>) -> Result<String> {
+    with_unlocked(&state, |v| Ok(v.suggested_key_label()))
 }
 
 #[tauri::command]
@@ -649,6 +664,8 @@ pub fn run() {
             delete_entry,
             list_audit,
             register_key,
+            validate_key_label,
+            suggest_key_label,
             remove_key,
             set_idle_lock,
             get_vault_settings,
