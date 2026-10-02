@@ -410,6 +410,9 @@ mod real {
     }
 
     impl RealBackend {
+        // The constructor installs a process-global HID filter; keep that side effect explicit
+        // rather than disguising it behind `Default`.
+        #[allow(clippy::new_without_default)]
         pub fn new() -> Self {
             let mut service = AuthenticatorService::new().expect("authenticator service init");
             // Windows raw HID transport（CLI/診斷用；一般權限會受 Windows FIDO access policy 限制）。
@@ -713,7 +716,7 @@ mod real {
                     hmac_create_secret: Some(true), // 註冊即宣告支援 hmac-secret（裁決②）
                     ..Default::default()
                 },
-                pin: pin.map(|p| Pin::new(p)),
+                pin: pin.map(Pin::new),
                 use_ctap1_fallback: false,
             };
 
@@ -757,7 +760,7 @@ mod real {
                     }),
                     ..Default::default()
                 },
-                pin: pin.map(|p| Pin::new(p)),
+                pin: pin.map(Pin::new),
                 use_ctap1_fallback: false,
             };
 

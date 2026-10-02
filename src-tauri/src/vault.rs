@@ -96,6 +96,9 @@ pub struct Header {
     pub created_at: String,
 }
 
+type EncryptedPayload = ([u8; 12], Vec<u8>);
+type VaultFileContents = (Header, EncryptedPayload);
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FailureStamp {
     pub ts: String,
@@ -291,7 +294,7 @@ impl Vault {
             .key_slots
             .iter()
             .find(|s| s.credential_id == credential_id_b64)
-            .ok_or_else(|| VaultError::Fido(FidoError::NoDevice))?
+            .ok_or(VaultError::Fido(FidoError::NoDevice))?
             .clone();
 
         let cred_id = base64_decode(&slot.credential_id)
@@ -338,7 +341,7 @@ impl Vault {
     fn open_with_key_secret(
         path: &Path,
         header: Header,
-        payload: ([u8; 12], Vec<u8>),
+        payload: EncryptedPayload,
         slot: KeySlot,
         secret: [u8; 32],
     ) -> Result<Self, VaultError> {
@@ -370,7 +373,7 @@ impl Vault {
     fn unlock(
         path: &Path,
         header: Header,
-        payload: ([u8; 12], Vec<u8>),
+        payload: EncryptedPayload,
         kek: Zeroizing<[u8; 32]>,
         method: &str,
     ) -> Result<Self, VaultError> {
@@ -407,7 +410,7 @@ impl Vault {
     // ── 檔案 I/O ──
 
     /// 讀檔 → (header, (payload_nonce, ciphertext))。
-    fn read_file(path: &Path) -> Result<(Header, ([u8; 12], Vec<u8>)), VaultError> {
+    fn read_file(path: &Path) -> Result<VaultFileContents, VaultError> {
         let buf = fs::read(path)?;
         if buf.len() < 6 + 4 + 12 {
             return Err(VaultError::Format("檔案過小".into()));
@@ -431,7 +434,10 @@ impl Vault {
         Ok((header, (nonce, ciphertext)))
     }
 
-    fn decrypt_payload(kek: &[u8; 32], payload: &([u8; 12], Vec<u8>)) -> Result<VaultData, VaultError> {
+    fn decrypt_payload(
+        kek: &[u8; 32],
+        payload: &EncryptedPayload,
+    ) -> Result<VaultData, VaultError> {
         let pt = aes_gcm_decrypt(kek, &payload.0, &payload.1).map_err(VaultError::Crypto)?;
         serde_json::from_slice(&pt).map_err(VaultError::Json)
     }
@@ -508,7 +514,7 @@ impl Vault {
             created_at: ts.clone(),
             updated_at: ts,
         });
-        self.record("entry_added", "manual", &site)?;
+        self.record("entry_added", "manual", site)?;
         Ok(id)
     }
 
@@ -709,7 +715,7 @@ impl Vault {
             .key_slots
             .iter()
             .position(|s| s.credential_id == credential_id_b64)
-            .ok_or_else(|| VaultError::Fido(FidoError::NoDevice))?;
+            .ok_or(VaultError::Fido(FidoError::NoDevice))?;
         let label = self.header.key_slots[idx].label.clone();
         self.header.key_slots.remove(idx);
         self.record("key_removed", &format!("fido2:{label}"), "金鑰槽已移除（該金鑰無法再解鎖）")?;
