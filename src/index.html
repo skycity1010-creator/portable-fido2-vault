@@ -64,6 +64,12 @@
       <div class="row">
         <input id="e-site" placeholder="網站（例：example.com）" />
         <input id="e-account" placeholder="帳號 / 使用者名稱" />
+        <div class="password-input">
+          <input id="e-pass" type="password" autocomplete="new-password" placeholder="密碼" />
+          <button id="btn-toggle-e-pass" class="password-toggle" type="button" aria-label="顯示密碼" aria-pressed="false" title="顯示密碼">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg>
+          </button>
+        </div>
         <button id="btn-add" class="primary">＋ 新增</button>
       </div>
       <table id="entries-table">
@@ -74,7 +80,13 @@
         <h3>編輯條目</h3>
         <label>網站</label><input id="ed-site" />
         <label>帳號</label><input id="ed-account" />
-        <label>密碼</label><input id="ed-pass" type="text" />
+        <label>密碼</label>
+        <div class="password-input">
+          <input id="ed-pass" type="password" autocomplete="current-password" />
+          <button id="btn-toggle-ed-pass" class="password-toggle" type="button" aria-label="顯示密碼" aria-pressed="false" title="顯示密碼">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg>
+          </button>
+        </div>
         <label>備註</label><textarea id="ed-notes" rows="2"></textarea>
         <div class="row">
           <button id="btn-save-entry" class="primary">儲存</button>

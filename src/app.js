@@ -11,6 +11,18 @@ let idleMinutes = 5;
 // ─────────────── 工具 ───────────────
 function show(id) { $(id).classList.remove("hidden"); }
 function hide(id) { $(id).classList.add("hidden"); }
+function setPasswordVisibility(inputId, buttonId, visible) {
+  const input = $(inputId);
+  const button = $(buttonId);
+  input.type = visible ? "text" : "password";
+  const label = visible ? "隱藏密碼" : "顯示密碼";
+  button.setAttribute("aria-label", label);
+  button.setAttribute("title", label);
+  button.setAttribute("aria-pressed", String(visible));
+}
+function togglePasswordVisibility(inputId, buttonId) {
+  setPasswordVisibility(inputId, buttonId, $(inputId).type === "password");
+}
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -175,6 +187,7 @@ function openEdit(id) {
   $("ed-site").value = e.site;
   $("ed-account").value = e.account;
   $("ed-pass").value = e.password;
+  setPasswordVisibility("ed-pass", "btn-toggle-ed-pass", false);
   $("ed-notes").value = e.notes || "";
   show("entry-edit");
 }
@@ -189,6 +202,8 @@ async function saveEntry() {
       notes: $("ed-notes").value,
     });
     hide("entry-edit");
+    $("ed-pass").value = "";
+    setPasswordVisibility("ed-pass", "btn-toggle-ed-pass", false);
     await refreshEntries();
   } catch (e) { alert(String(e)); }
 }
@@ -200,10 +215,12 @@ async function addEntry() {
     await invoke("add_entry", {
       site,
       account: $("e-account").value.trim(),
-      password: prompt("密碼：") || "",
+      password: $("e-pass").value,
       notes: null,
     });
     $("e-site").value = ""; $("e-account").value = "";
+    $("e-pass").value = "";
+    setPasswordVisibility("e-pass", "btn-toggle-e-pass", false);
     await refreshEntries();
   } catch (e) { alert(String(e)); }
 }
@@ -311,7 +328,13 @@ document.addEventListener("DOMContentLoaded", () => {
 
   $("btn-add").onclick = addEntry;
   $("btn-save-entry").onclick = saveEntry;
-  $("btn-cancel-entry").onclick = () => hide("entry-edit");
+  $("btn-cancel-entry").onclick = () => {
+    hide("entry-edit");
+    $("ed-pass").value = "";
+    setPasswordVisibility("ed-pass", "btn-toggle-ed-pass", false);
+  };
+  $("btn-toggle-e-pass").onclick = () => togglePasswordVisibility("e-pass", "btn-toggle-e-pass");
+  $("btn-toggle-ed-pass").onclick = () => togglePasswordVisibility("ed-pass", "btn-toggle-ed-pass");
   $("btn-register-key").onclick = registerKey;
   $("btn-set-idle").onclick = setIdle;
   $("btn-lock").onclick = doLock;
