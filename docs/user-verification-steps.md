@@ -164,11 +164,11 @@ F: F1 _ / F2 _ / F3 _
 
 系統剪貼簿是共用資源，其他桌面程式可能在清除前讀取內容；Windows 剪貼簿歷程/雲端剪貼簿也可能保存或同步，EmptyClipboard 不會移除已保存的歷程項目。請只用測試用密碼，切勿貼到聊天。不要透過 RDP/WinRM 啟動或操作 GUI；本功能不需要實體 FIDO 金鑰。
 
-## 安全性金鑰自訂名稱 — Win11-NB 驗收（PR #9，待部署／本機驗收）
+## 安全性金鑰自訂名稱 — Win11-NB 驗收（PR #9，已部署／本機驗收待使用者）
 
-本機候選 Windows GNU Release（`--locked --features real-ctap`）GUI：6,729,216 bytes，SHA-256 `7deba32418fb173d5ada126e600c81a748ffa51bcfe503afc7bed683fb928ed1`；CLI 2,427,392 bytes，SHA-256 `1493ab5d09fb942a61f77cc9e82827b2fa08f60e3e74d81e5d1cd657771ab3c2`。GUI 尚未部署至 NB；部署後會再記錄目標端讀回 hash、舊 EXE/vault 備份資訊及 key-slot baseline。Feature 2、3 的 Win11-NB 本機驗收仍待使用者與 Feature 4 集中測試。
+本機候選 Windows GNU Release（`--locked --features real-ctap`）GUI：6,729,216 bytes，SHA-256 `7deba32418fb173d5ada126e600c81a748ffa51bcfe503afc7bed683fb928ed1`；CLI 2,427,392 bytes，SHA-256 `1493ab5d09fb942a61f77cc9e82827b2fa08f60e3e74d81e5d1cd657771ab3c2`。GUI 已部署至 `C:\FidoVault\portable-fido-vault.exe`（source commit `c8c10c23a97c08cf4074c79b1b6aee5728721b98`），目標端讀回 SHA-256 `7deba32418fb173d5ada126e600c81a748ffa51bcfe503afc7bed683fb928ed1`。舊 GUI 備份：`C:\FidoVault\portable-fido-vault.exe.pre-custom-key-name-c8c10c2.bak`，SHA-256 `9c79a04dcfbd0f16b1f37a4b1c3cdd9e571f39190ef26904c269ba69c6102057`；vault 備份：`C:\FidoVault\vault.db.pre-custom-key-name-c8c10c2.bak`，SHA-256 `00d772240939a12eee85dde5b0b0a2a12096f9039e1323a7c4c1c1c7dbd1faf0`。部署前後 live vault SHA-256 均為 `00d772240939a12eee85dde5b0b0a2a12096f9039e1323a7c4c1c1c7dbd1faf0`、3 key slots；前後唯讀檢查均未發現 FIDO client，`F2V_AUTHENTICATOR` user/machine override 均未設定。Feature 2、3、4 的 Win11-NB 本機驗收仍待使用者集中測試。
 
-**安全準備：**先按既有備份流程備份 `C:\FidoVault\vault.db`，使用測試金鑰與測試資料；不要以唯一解鎖金鑰做測試。只在 Win11-NB **本機 Console** 以一般權限開啟；RDP 遠端啟動／操作 GUI 不支援。
+**安全準備：**使用測試金鑰與測試資料；不要以唯一解鎖金鑰做測試。只在 Win11-NB **本機 Console** 以一般權限開啟；RDP 遠端啟動／操作 GUI 不支援。
 
 - [ ] 開啟「金鑰管理 → 註冊新金鑰」：對話框顯示一個未使用的建議別名；可編輯；文字說明此為 FidoVault 本機名稱，且 header 中的名稱是明文資料。
 - [ ] 將名稱留白、輸入已存在名稱的大小寫／空白變體，或輸入 Unicode 大小寫等價名稱（例如既有 `Σ` 時輸入 `ς`）：顯示驗證錯誤、對話框保持開啟，且尚未執行 authenticator 偵測或出現 Windows 安全性註冊提示。

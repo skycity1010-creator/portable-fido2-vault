@@ -24,7 +24,7 @@
 3. [x] Verify successful persistence/list/audit labels after reopening the vault, rejected duplicate/blank names before FIDO detection, and failed non-PRF registration leaves the slot count unchanged.
 4. [x] Run full Rust/Node suites, backend-mode Release tests, static scan, and Windows GNU Release GUI/CLI build; update README/spec/project/user-verification docs and PR #9.
 5. [x] Independent code review passed.
-6. [ ] Stage the exact GUI Release artifact on Win11-NB using the read-only preflight/backup/hash workflow. Do not launch the app or operate WebAuthn over WinRM/RDP; hand off Feature 2/3/4 checks for the user's local Console test.
+6. [x] Stage the exact GUI Release artifact on Win11-NB; independently read back the target hash and confirm the live vault hash/key-slot baseline stayed unchanged. Do not launch the app or operate WebAuthn over WinRM/RDP; Feature 2/3/4 local Console acceptance remains with the user.
 
 ## Verification results
 
@@ -33,7 +33,7 @@
 - Windows GNU Release GUI + CLI build (`--locked --features real-ctap`): passed. GUI 6,729,216 bytes, SHA-256 `7deba32418fb173d5ada126e600c81a748ffa51bcfe503afc7bed683fb928ed1`; CLI 2,427,392 bytes, SHA-256 `1493ab5d09fb942a61f77cc9e82827b2fa08f60e3e74d81e5d1cd657771ab3c2`.
 - Static added-line security scan: no findings; `git diff --check` passed.
 - `cargo clippy -D warnings` remains blocked by 11 existing diagnostics in `diag_log.rs`, `fido2.rs`, `windows_webauthn.rs`, and unrelated `vault.rs` lines; no warning points to the new alias code. Whole-file rustfmt check also fails on baseline formatting; unrelated lines were not reformatted.
-- Manual Win11-NB acceptance and deployment have not yet occurred. Feature 2/3/4 remain pending the user's requested combined local Console test.
+- Manual Win11-NB Console acceptance has not yet occurred. The GUI is deployed and hash-verified; Feature 2/3/4 remain pending the user's requested combined local test.
 
 ## Explicitly out of scope
 
