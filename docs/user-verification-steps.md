@@ -130,4 +130,24 @@ F: F1 _ / F2 _ / F3 _
 - [x] 編輯該條目：密碼預設遮罩；眼睛按鈕可顯示／隱藏；重新開啟編輯時仍預設遮罩。
 - [x] 儲存或取消後密碼欄清空並恢復遮罩；條目列表不顯示密碼。
 
-請使用測試用密碼，不要把密碼貼到聊天。密碼歷史、剪貼簿複製、自訂金鑰名稱不包含在本次 build，會分別實作。
+請使用測試用密碼，不要把密碼貼到聊天。本次密碼遮罩 build 未包含密碼歷史；剪貼簿複製、自訂金鑰名稱仍待後續實作。
+
+## 舊密碼歷史 — Win11-NB 驗收
+
+本次以 PR #6 功能分支 commit `fdc55be` 建置 Windows GNU Release（`--features real-ctap`），已部署至 `C:\FidoVault\portable-fido-vault.exe`。
+
+- 新版 EXE SHA-256：`9c79a04dcfbd0f16b1f37a4b1c3cdd9e571f39190ef26904c269ba69c6102057`（6,158,336 bytes）。
+- 替換前 EXE 備份：`C:\FidoVault\portable-fido-vault.exe.pre-password-history-20261002-010914.bak`，SHA-256 `50d17c57685e1740db763eb65a09666dff7f34cc8009a555ec0d830f4a6c9a57`。
+- vault 備份：`C:\FidoVault\vault.db.pre-password-history-20261002-010914.bak`，SHA-256 `1e3c9fe8266bf41a7f25ece8f2c2bf45cbb63367001042e06291234efe2b9f54`。
+- 部署後回讀確認新版 EXE 雜湊相符；`vault.db` 未替換，仍為 3 個 key slots 且雜湊與備份相同；0 個 FIDO client，user/machine `F2V_AUTHENTICATOR` 均未設定。
+- 本次只推送 GUI EXE，未啟動 GUI、未操作 WebAuthn，也未推送 `vault_cli.exe` 或 `WebView2Loader.dll`。請在 Win11-NB **本機 Console** 以一般權限驗收；RDP 遠端啟動不支援（見 README）。
+
+舊 vault 缺少歷史資料欄位時應以空歷史、保留上限 3 開啟；部署前已建立可回復的 vault 備份。使用者登入會把相容預設值寫入加密 payload，屆時 vault 雜湊自然會更新。
+
+- [ ] 解鎖既有 vault，在設定確認舊密碼保留代數預設為 3；設定改為 4、重新登入後仍為 4。
+- [ ] 對測試條目依序改密碼 3 次；編輯畫面顯示三筆舊版本日期，最近版本在前，舊密碼值預設不明文顯示。
+- [ ] 只修改網站/帳號/備註或儲存相同密碼，不新增歷史版本。
+- [ ] 選一筆舊版本按「還原」並儲存：該值成為目前密碼；原目前密碼成為最新舊版本；被還原版本不再重複留在歷史。
+- [ ] 將保留代數調低為 1 並套用：每筆條目立即只留最新一筆舊密碼；重新登入後設定仍為 1。
+
+請使用測試用條目與密碼，不要將密碼貼到聊天。調低保留代數會立即刪除超額的最舊歷史版本。

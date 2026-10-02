@@ -7,6 +7,7 @@ let selectedKey = null;
 let brokeredKeyLogin = false;
 let idleTimer = null;
 let idleMinutes = 5;
+let editingRestoreHistory = null;
 
 // ─────────────── 工具 ───────────────
 function show(id) { $(id).classList.remove("hidden"); }
@@ -134,6 +135,10 @@ async function enterMain(entries) {
   hide("screen-login");
   show("screen-main");
   if (!entries) entries = await invoke("list_entries");
+  const settings = await invoke("get_vault_settings");
+  idleMinutes = Math.min(60, Math.max(1, Number(settings.idle_lock_minutes) || 5));
+  $("idle-minutes").value = idleMinutes;
+  $("password-history-limit").value = Math.min(20, Math.max(1, Number(settings.password_history_limit) || 3));
   const audit = await invoke("list_audit");
   renderEntries(entries);
   renderAudit(audit);
@@ -180,14 +185,45 @@ async function refreshEntries() {
 }
 
 let editingId = null;
+function renderPasswordHistory(history) {
+  const box = $("ed-pass-history");
+  box.innerHTML = "";
+  $("ed-pass-history-status").textContent = "";
+  if (!history.length) {
+    box.textContent = "（尚無舊密碼版本）";
+    return;
+  }
+  for (const version of history) {
+    const row = document.createElement("div");
+    row.className = "password-history-item";
+    const date = document.createElement("span");
+    date.textContent = `變更於 ${version.archived_at}`;
+    const restore = document.createElement("button");
+    restore.type = "button";
+    restore.textContent = "還原";
+    restore.setAttribute("aria-label", `還原 ${version.archived_at} 的密碼`);
+    restore.onclick = () => {
+      editingRestoreHistory = { id: version.id, password: version.password };
+      $("ed-pass").value = version.password;
+      setPasswordVisibility("ed-pass", "btn-toggle-ed-pass", false);
+      $("ed-pass-history-status").textContent = "已選擇該版本；按「儲存」後還原";
+    };
+    row.appendChild(date);
+    row.appendChild(restore);
+    box.appendChild(row);
+  }
+}
+
 function openEdit(id) {
   const e = (window.__lastEntries || []).find((x) => x.id === id);
   if (!e) return;
   editingId = id;
+  editingRestoreHistory = null;
   $("ed-site").value = e.site;
   $("ed-account").value = e.account;
   $("ed-pass").value = e.password;
   setPasswordVisibility("ed-pass", "btn-toggle-ed-pass", false);
+  renderPasswordHistory(e.password_history || []);
   $("ed-notes").value = e.notes || "";
   show("entry-edit");
 }
@@ -200,10 +236,15 @@ async function saveEntry() {
       account: $("ed-account").value,
       password: $("ed-pass").value,
       notes: $("ed-notes").value,
+      restoreHistoryId: editingRestoreHistory && editingRestoreHistory.password === $("ed-pass").value
+        ? editingRestoreHistory.id
+        : null,
     });
     hide("entry-edit");
     $("ed-pass").value = "";
     setPasswordVisibility("ed-pass", "btn-toggle-ed-pass", false);
+    editingRestoreHistory = null;
+    $("ed-pass-history-status").textContent = "";
     await refreshEntries();
   } catch (e) { alert(String(e)); }
 }
@@ -289,6 +330,18 @@ async function setIdle() {
   } catch (e) { alert(String(e)); }
 }
 
+async function setPasswordHistoryLimit() {
+  const limit = Number.parseInt($("password-history-limit").value, 10);
+  if (!Number.isInteger(limit) || limit < 1 || limit > 20) {
+    return alert("請輸入 1–20 的舊密碼保留代數");
+  }
+  try {
+    await invoke("set_password_history_limit", { limit });
+    $("password-history-limit").value = limit;
+    alert(`已套用：每筆條目保留最近 ${limit} 代舊密碼`);
+  } catch (e) { alert(String(e)); }
+}
+
 function resetIdle() {
   if (idleTimer) { clearTimeout(idleTimer); startIdleTimer(idleMinutes); }
 }
@@ -332,11 +385,14 @@ document.addEventListener("DOMContentLoaded", () => {
     hide("entry-edit");
     $("ed-pass").value = "";
     setPasswordVisibility("ed-pass", "btn-toggle-ed-pass", false);
+    editingRestoreHistory = null;
+    $("ed-pass-history-status").textContent = "";
   };
   $("btn-toggle-e-pass").onclick = () => togglePasswordVisibility("e-pass", "btn-toggle-e-pass");
   $("btn-toggle-ed-pass").onclick = () => togglePasswordVisibility("ed-pass", "btn-toggle-ed-pass");
   $("btn-register-key").onclick = registerKey;
   $("btn-set-idle").onclick = setIdle;
+  $("btn-set-password-history-limit").onclick = setPasswordHistoryLimit;
   $("btn-lock").onclick = doLock;
 
   ["mousemove", "keydown", "click"].forEach((ev) => window.addEventListener(ev, resetIdle));

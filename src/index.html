@@ -87,6 +87,11 @@
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg>
           </button>
         </div>
+        <div class="password-history">
+          <label>舊密碼歷史</label>
+          <div id="ed-pass-history" class="password-history-list"></div>
+          <div id="ed-pass-history-status" class="muted" aria-live="polite"></div>
+        </div>
         <label>備註</label><textarea id="ed-notes" rows="2"></textarea>
         <div class="row">
           <button id="btn-save-entry" class="primary">儲存</button>
@@ -124,6 +129,12 @@
         <input id="idle-minutes" type="number" min="1" max="60" style="width:80px" />
         <button id="btn-set-idle" class="primary">套用</button>
       </div>
+      <label>每筆條目保留舊密碼（代數，1–20）</label>
+      <div class="row">
+        <input id="password-history-limit" type="number" min="1" max="20" value="3" style="width:80px" />
+        <button id="btn-set-password-history-limit" class="primary">套用</button>
+      </div>
+      <p class="muted">只保留最近 N 個舊密碼版本；不包含目前密碼。調低上限時會立即移除最舊版本。</p>
       <div class="warn" style="margin-top:16px">⚠️ <b>無復原機制</b>：金鑰全失 + 忘記主密碼 = 資料永久無法取回（設計如此）。</div>
     </section>
   </div>

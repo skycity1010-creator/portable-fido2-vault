@@ -108,9 +108,18 @@ pub struct Entry {
     pub site: String,
     pub account: String,
     pub password: String,
+    #[serde(default)]
+    pub password_history: Vec<PasswordHistoryEntry>,
     pub notes: String,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PasswordHistoryEntry {
+    pub id: String,
+    pub password: String,
+    pub archived_at: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -126,6 +135,14 @@ pub struct AuditEvent {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Settings {
     pub idle_lock_minutes: u32,
+    #[serde(default = "default_password_history_limit")]
+    pub password_history_limit: u32,
+}
+
+const DEFAULT_PASSWORD_HISTORY_LIMIT: u32 = 3;
+
+fn default_password_history_limit() -> u32 {
+    DEFAULT_PASSWORD_HISTORY_LIMIT
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -187,7 +204,10 @@ impl Vault {
                     crate::crypto::ARGON2_P_COST
                 ),
             }],
-            settings: Settings { idle_lock_minutes: 5 },
+            settings: Settings {
+                idle_lock_minutes: 5,
+                password_history_limit: DEFAULT_PASSWORD_HISTORY_LIMIT,
+            },
         };
 
         let vault = Self { path: path.to_path_buf(), header, data, kek };
@@ -444,6 +464,7 @@ impl Vault {
             site: site.into(),
             account: account.into(),
             password: password.into(),
+            password_history: Vec::new(),
             notes: notes.into(),
             created_at: ts.clone(),
             updated_at: ts,
@@ -460,12 +481,41 @@ impl Vault {
         password: Option<&str>,
         notes: Option<&str>,
     ) -> Result<(), VaultError> {
+        self.update_entry_with_restore(id, site, account, password, notes, None)
+    }
+
+    pub fn update_entry_with_restore(
+        &mut self,
+        id: &str,
+        site: Option<&str>,
+        account: Option<&str>,
+        password: Option<&str>,
+        notes: Option<&str>,
+        restore_history_id: Option<&str>,
+    ) -> Result<(), VaultError> {
+        let history_limit = self.data.settings.password_history_limit.clamp(1, 20) as usize;
         let e = self
             .data
             .entries
             .iter_mut()
             .find(|e| e.id == id)
             .ok_or_else(|| VaultError::Format("找不到該條目".into()))?;
+        let selected_restore = if let Some(history_id) = restore_history_id {
+            if password.is_none() {
+                return Err(VaultError::Format("還原舊密碼時必須提供密碼值".into()));
+            }
+            let history = e
+                .password_history
+                .iter()
+                .find(|item| item.id == history_id)
+                .ok_or_else(|| VaultError::Format("找不到該舊密碼版本".into()))?;
+            if password != Some(history.password.as_str()) {
+                return Err(VaultError::Format("還原的舊密碼值不相符".into()));
+            }
+            Some(history.id.clone())
+        } else {
+            None
+        };
         if let Some(v) = site {
             e.site = v.into();
         }
@@ -473,8 +523,22 @@ impl Vault {
             e.account = v.into();
         }
         if let Some(v) = password {
-            e.password = v.into();
+            if v != e.password {
+                let old_password = std::mem::replace(&mut e.password, v.into());
+                e.password_history.insert(
+                    0,
+                    PasswordHistoryEntry {
+                        id: hex32(&random_bytes(16)),
+                        password: old_password,
+                        archived_at: now_rfc3339(),
+                    },
+                );
+            }
         }
+        if let Some(history_id) = selected_restore.as_deref() {
+            e.password_history.retain(|item| item.id != history_id);
+        }
+        e.password_history.truncate(history_limit);
         if let Some(v) = notes {
             e.notes = v.into();
         }
@@ -497,6 +561,20 @@ impl Vault {
     pub fn set_idle_lock(&mut self, minutes: u32) -> Result<(), VaultError> {
         self.data.settings.idle_lock_minutes = minutes.clamp(1, 60);
         self.record("settings_changed", "manual", &format!("idle_lock={}", self.data.settings.idle_lock_minutes))?;
+        Ok(())
+    }
+
+    pub fn set_password_history_limit(&mut self, limit: u32) -> Result<(), VaultError> {
+        let limit = limit.clamp(1, 20);
+        self.data.settings.password_history_limit = limit;
+        for entry in &mut self.data.entries {
+            entry.password_history.truncate(limit as usize);
+        }
+        self.record(
+            "settings_changed",
+            "manual",
+            &format!("password_history_limit={limit}"),
+        )?;
         Ok(())
     }
 
@@ -656,6 +734,117 @@ mod tests {
         let d = env::temp_dir().join(format!("f2v-test-{tag}-{}", std::process::id()));
         let _ = fs::create_dir_all(&d);
         d
+    }
+
+    #[test]
+    fn legacy_payload_defaults_password_history_and_limit() {
+        let legacy = serde_json::json!({
+            "entries": [{
+                "id": "entry-1",
+                "site": "example.com",
+                "account": "alice",
+                "password": "current-secret",
+                "notes": "",
+                "created_at": "2026-10-01T00:00:00Z",
+                "updated_at": "2026-10-01T00:00:00Z"
+            }],
+            "audit": [],
+            "settings": { "idle_lock_minutes": 5 }
+        });
+
+        let decoded: VaultData = serde_json::from_value(legacy).unwrap();
+        let encoded = serde_json::to_value(decoded).unwrap();
+        assert_eq!(
+            encoded["entries"][0]["password_history"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            encoded["settings"]["password_history_limit"],
+            serde_json::json!(3)
+        );
+    }
+
+    #[test]
+    fn password_changes_archive_only_the_previous_value() {
+        let d = tmp_dir("password-history-change");
+        let p = d.join("vault.db");
+        let _ = fs::remove_file(&p);
+        let mut v = Vault::create(&p, "Pw-12345").unwrap();
+        let id = v
+            .add_entry("example.com", "alice", "old-secret", "")
+            .unwrap();
+
+        v.update_entry(&id, None, None, Some("new-secret"), None)
+            .unwrap();
+        let serialized = serde_json::to_value(&v.entries()[0]).unwrap();
+        let history = serialized["password_history"].as_array();
+        assert_eq!(history.map(Vec::len), Some(1));
+        assert_eq!(history.unwrap()[0]["password"], "old-secret");
+        assert!(history.unwrap()[0]["archived_at"].as_str().is_some());
+
+        v.update_entry(&id, Some("renamed.example"), None, None, None)
+            .unwrap();
+        v.update_entry(&id, None, None, Some("new-secret"), None)
+            .unwrap();
+        let serialized = serde_json::to_value(&v.entries()[0]).unwrap();
+        assert_eq!(
+            serialized["password_history"].as_array().map(Vec::len),
+            Some(1)
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn lowering_password_history_limit_prunes_oldest_and_persists() {
+        let d = tmp_dir("password-history-limit");
+        let p = d.join("vault.db");
+        let _ = fs::remove_file(&p);
+        let mut v = Vault::create(&p, "Pw-12345").unwrap();
+        let id = v.add_entry("example.com", "alice", "p0", "").unwrap();
+        for password in ["p1", "p2", "p3"] {
+            v.update_entry(&id, None, None, Some(password), None)
+                .unwrap();
+        }
+
+        v.set_password_history_limit(2).unwrap();
+        assert_eq!(v.settings().password_history_limit, 2);
+        let history = &v.entries()[0].password_history;
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].password, "p2");
+        assert_eq!(history[1].password, "p1");
+        drop(v);
+
+        let reopened = Vault::open_password(&p, "Pw-12345").unwrap();
+        assert_eq!(reopened.settings().password_history_limit, 2);
+        assert_eq!(reopened.entries()[0].password_history.len(), 2);
+        assert!(!reopened
+            .audit()
+            .iter()
+            .any(|event| event.detail.contains("p0")));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn restoring_password_archives_current_and_removes_selected_history_version() {
+        let d = tmp_dir("password-history-restore");
+        let p = d.join("vault.db");
+        let _ = fs::remove_file(&p);
+        let mut v = Vault::create(&p, "Pw-12345").unwrap();
+        let id = v.add_entry("example.com", "alice", "p0", "").unwrap();
+        v.update_entry(&id, None, None, Some("p1"), None).unwrap();
+        v.update_entry(&id, None, None, Some("p2"), None).unwrap();
+        let selected_id = v.entries()[0].password_history[1].id.clone();
+
+        v.update_entry_with_restore(&id, None, None, Some("p0"), None, Some(&selected_id))
+            .unwrap();
+
+        assert_eq!(v.entries()[0].password, "p0");
+        let history = &v.entries()[0].password_history;
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].password, "p2");
+        assert_eq!(history[1].password, "p1");
+        assert!(!history.iter().any(|item| item.id == selected_id));
+        let _ = fs::remove_dir_all(&d);
     }
 
     #[test]

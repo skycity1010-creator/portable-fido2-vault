@@ -433,10 +433,18 @@ fn update_entry(
     account: Option<String>,
     password: Option<String>,
     notes: Option<String>,
+    restore_history_id: Option<String>,
 ) -> Result<()> {
     with_unlocked(&state, |v| {
-        v.update_entry(&id, site.as_deref(), account.as_deref(), password.as_deref(), notes.as_deref())
-            .map_err(|e| e.to_string())
+        v.update_entry_with_restore(
+            &id,
+            site.as_deref(),
+            account.as_deref(),
+            password.as_deref(),
+            notes.as_deref(),
+            restore_history_id.as_deref(),
+        )
+        .map_err(|e| e.to_string())
     })
 }
 
@@ -477,6 +485,19 @@ fn remove_key(state: tauri::State<VaultState>, credential_id: String) -> Result<
 #[tauri::command]
 fn set_idle_lock(state: tauri::State<VaultState>, minutes: u32) -> Result<()> {
     with_unlocked(&state, |v| v.set_idle_lock(minutes).map_err(|e| e.to_string()))
+}
+
+#[tauri::command]
+fn get_vault_settings(state: tauri::State<VaultState>) -> Result<vault::Settings> {
+    with_unlocked(&state, |v| Ok(v.settings().clone()))
+}
+
+#[tauri::command]
+fn set_password_history_limit(state: tauri::State<VaultState>, limit: u32) -> Result<()> {
+    with_unlocked(&state, |v| {
+        v.set_password_history_limit(limit)
+            .map_err(|e| e.to_string())
+    })
 }
 
 /// 偵測金鑰（註冊前預覽：類型 + label）。**不消耗**後端狀態 → 與緊接的 register_key 一致。
@@ -534,6 +555,8 @@ pub fn run() {
             register_key,
             remove_key,
             set_idle_lock,
+            get_vault_settings,
+            set_password_history_limit,
             detect_key
         ])
         .run(tauri::generate_context!())
