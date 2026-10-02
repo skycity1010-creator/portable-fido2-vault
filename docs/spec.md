@@ -45,7 +45,7 @@ offset   size   field
 ──────── ────── ────────────────────────────────────────────────
 0        6      magic "F2VLT\x01"（version 1）
 6        4      header_len u32 LE
-10       N     header JSON（UTF-8，**明文金鑰包裝區**，不含任何機密值）
+10       N     header JSON（UTF-8，**明文金鑰包裝區**，不含密碼或金鑰機密）
 10+N     12    payload nonce（AES-GCM 96-bit）
 22+N     …     AES-256-GCM(KEK, vault_json) — 含 16B tag 於尾端
 ```
@@ -65,6 +65,10 @@ offset   size   field
   "created_at": "RFC3339"
 }
 ```
+
+`key_slots[].label` 是存於明文 header 的 FidoVault 本機顯示別名，payload 加密不會涵蓋它。註冊對話框會提醒此風險，使用者不應把密碼或敏感個資當作別名。既有 vault 維持相同 v1 header 格式與標籤。
+
+新別名由 Rust 依 Unicode canonical caseless matching 產生唯一建議並驗證；使用者確認後，UI 先透過 Rust 驗證，再進行 authenticator 偵測，註冊方法亦會對實際 vault slots 再驗證一次。
 
 ### payload（vault_json，加密後不可讀）
 ```json
@@ -100,6 +104,8 @@ offset   size   field
 ## 5. FIDO2 偵測與登入流程
 
 ### 5.1 註冊（金庫已解鎖時）
+- 啟動 FIDO 操作前，UI 提示輸入可編輯的 FidoVault 本機別名，預填目前金鑰槽中未使用的建議名稱。別名須先去除首尾空白、不可空白、不可含控制字元、最多 64 個 Unicode scalar value，且以去空白後不分大小寫不可重複；前端提供即時驗證，Rust vault 層在呼叫 authenticator 前再次驗證。取消或驗證失敗不呼叫註冊命令。
+- 別名沿用 `KeySlot.label` 儲存，不改變 authenticator credential 或 Windows Security prompt。別名是明文 header metadata；UI 明確警告勿輸入密碼或敏感個資。Vault v1 格式不變，舊 vault 相容。
 0. **PRF 強制檢查**：CLI raw-CTAP backend 可由 `getInfo.extensions` 預先判定；Windows GUI 的 WebAuthn API 不提供 CTAP `getInfo`，因此在建立 credential 時要求 `hmac-secret`，並檢查 authenticator 的正向 extension output。若未回報支援，拒絕建立 vault slot；因 API 無預查能力，authenticator 端可能留下未被金庫採用的 credential。
 1. **Windows GUI**：使用 WebAuthn API v4+，RP ID 固定 `fido-vault.local`，限制 cross-platform authenticator；Windows broker 顯示 PIN/UV/觸碰 UI。
 2. **CLI/診斷**：raw CTAP2 `getInfo` 取得 AAGUID、hmac-secret 能力與 pin/bio flags；用 flags 分類 fingerprint / pin / touch-only。

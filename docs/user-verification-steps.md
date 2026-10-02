@@ -163,3 +163,18 @@ F: F1 _ / F2 _ / F3 _
 - [ ] 確認複製操作不新增包含密碼的軌跡紀錄；剪貼簿錯誤不能使 App 崩潰。
 
 系統剪貼簿是共用資源，其他桌面程式可能在清除前讀取內容；Windows 剪貼簿歷程/雲端剪貼簿也可能保存或同步，EmptyClipboard 不會移除已保存的歷程項目。請只用測試用密碼，切勿貼到聊天。不要透過 RDP/WinRM 啟動或操作 GUI；本功能不需要實體 FIDO 金鑰。
+
+## 安全性金鑰自訂名稱 — Win11-NB 驗收（PR #9，待部署／本機驗收）
+
+本機候選 Windows GNU Release（`--locked --features real-ctap`）GUI：6,729,216 bytes，SHA-256 `7deba32418fb173d5ada126e600c81a748ffa51bcfe503afc7bed683fb928ed1`；CLI 2,427,392 bytes，SHA-256 `1493ab5d09fb942a61f77cc9e82827b2fa08f60e3e74d81e5d1cd657771ab3c2`。GUI 尚未部署至 NB；部署後會再記錄目標端讀回 hash、舊 EXE/vault 備份資訊及 key-slot baseline。Feature 2、3 的 Win11-NB 本機驗收仍待使用者與 Feature 4 集中測試。
+
+**安全準備：**先按既有備份流程備份 `C:\FidoVault\vault.db`，使用測試金鑰與測試資料；不要以唯一解鎖金鑰做測試。只在 Win11-NB **本機 Console** 以一般權限開啟；RDP 遠端啟動／操作 GUI 不支援。
+
+- [ ] 開啟「金鑰管理 → 註冊新金鑰」：對話框顯示一個未使用的建議別名；可編輯；文字說明此為 FidoVault 本機名稱，且 header 中的名稱是明文資料。
+- [ ] 將名稱留白、輸入已存在名稱的大小寫／空白變體，或輸入 Unicode 大小寫等價名稱（例如既有 `Σ` 時輸入 `ς`）：顯示驗證錯誤、對話框保持開啟，且尚未執行 authenticator 偵測或出現 Windows 安全性註冊提示。
+- [ ] 取消註冊：不出現 Windows 安全性註冊提示；金庫 key-slot 數與 audit 不變。
+- [ ] 以測試別名（例如 `F4 Local Test Key`）完成一支測試金鑰註冊：Windows 安全性視窗照常驗證；成功狀態、金鑰清單與 `key_registered` audit 使用自訂別名。確認提示視窗名稱／authenticator credential 本身不因別名改變。
+- [ ] 上鎖並重新登入：清單仍顯示該別名；確認只新增一個 slot。不要把真實密碼或敏感個資當成別名。
+- [ ] 按前節 Feature 2 步驟驗證舊密碼保留數、歷史檢視／還原；按 Feature 3 步驟驗證複製、60 秒清除、外部替換保留及快速連續複製。
+
+剪貼簿只使用測試用密碼；Windows 剪貼簿歷程／雲端剪貼簿可能保存或同步，條件清除不會刪除歷程項目。FIDO/WebAuthn 必須由使用者在本機 Console 操作，不能透過 RDP 或 WinRM 執行 GUI 驗收。

@@ -26,7 +26,7 @@ Custom security-key labels (Feature 4), changing password display behavior, and 
 
 ## Ordered work
 
-Feature 2 implementation is complete, but its Win11-NB local acceptance was explicitly deferred by the user. The user directed that Feature 3 proceed now. This is sequential work—not parallel implementation—and does not mark Feature 2 as manually accepted. Do not start Feature 4 while Feature 3 is active.
+Feature 2 implementation is complete, but its Win11-NB local acceptance was explicitly deferred by the user. Feature 3 implementation, review, and Windows GNU Release build are complete, but it has not been deployed or locally accepted. The user requested Feature 4 next and one combined Win11-NB Console test after it is ready; none of Features 2/3 is marked manually accepted here. Implementation remains sequential; do not start further features.
 
 ## Implementation sequence
 
@@ -35,14 +35,14 @@ Feature 2 implementation is complete, but its Win11-NB local acceptance was expl
 3. [x] Cover atomic-command invocation, replacement preservation, Win32-command errors, and serial ordering for concurrent copies.
 4. [x] Run targeted/full automated tests, Windows Release GUI/CLI build, and `git diff --check`.
 5. [x] Open draft PR #8 before implementation on `feat/copy-password`, stacked on `feat/password-history` (Feature 2 PR #6).
-6. [ ] Win11-NB local Console acceptance; not deployed yet. Do not use WinRM/RDP to operate the GUI or clipboard.
+6. [ ] Win11-NB local Console acceptance; deploy and test together with deferred Feature 2 and Feature 4 after Feature 4 is built/reviewed. Do not use WinRM/RDP to operate the GUI or clipboard.
 
 ## Verification results
 
 - Targeted clipboard UI tests: 7/7 passed. Full Node UI suite: 19/19; `node --check src/app.js` passed.
 - MSVC Rust library suite (`--locked --features real-ctap`): 60/60. Release backend-mode matrix: 7/7.
 - Windows GNU Release GUI + `vault_cli` build with `--locked --features real-ctap`: passed. GUI artifact is 6,589,440 bytes, SHA-256 `58ba298f7f2bcd5fa4d2c1bdda5ab6e5d2847379af8e282c7ea92e3732838dde`; CLI SHA-256 `d98ce617f19054467818f46df611d4cea6eea723be30000c77102e0a8b134674`.
-- Draft PR: https://github.com/skycity1010-creator/portable-fido2-vault/pull/8. Feature 2 local acceptance remains deferred per user instruction; Feature 4 has not started.
+- Draft PR: https://github.com/skycity1010-creator/portable-fido2-vault/pull/8. Feature 2 and 3 local acceptance remain pending; Feature 4 is being implemented in the sequential follow-up PR #9.
 
 ## Official API references
 

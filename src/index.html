@@ -140,6 +140,19 @@
     </section>
   </div>
 
+  <dialog id="key-name-dialog" aria-labelledby="key-name-title" aria-describedby="key-name-description">
+    <h2 id="key-name-title">為安全性金鑰設定名稱</h2>
+    <p id="key-name-description">此名稱只作為本機 FidoVault 別名，不會更改金鑰本身或 Windows 安全性視窗。</p>
+    <p class="warn">⚠️ 名稱會以明文保存在金庫檔案的標頭中；請勿輸入密碼或敏感個人資料。</p>
+    <label for="key-name-input">辨識名稱</label>
+    <input id="key-name-input" type="text" required autocomplete="off" aria-describedby="key-name-description key-name-status" />
+    <div id="key-name-status" class="error" role="alert" aria-live="assertive"></div>
+    <div class="row">
+      <button id="btn-confirm-key-name" class="primary" type="button">繼續註冊</button>
+      <button id="btn-cancel-key-name" type="button">取消</button>
+    </div>
+  </dialog>
+
   <script src="app.js"></script>
 </body>
 </html>
