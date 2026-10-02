@@ -55,7 +55,7 @@ jobs:
         working-directory: src-tauri
         shell: pwsh
         env:
-          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: '1'
         run: |
           $gateRoot = Join-Path $env:RUNNER_TEMP "fido-vault-gate-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           if (Test-Path -LiteralPath $gateRoot) {
