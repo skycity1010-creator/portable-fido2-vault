@@ -14,6 +14,7 @@
         "title": "可攜式 FIDO2 密碼金庫",
         "width": 1000,
         "height": 660,
+        "maximized": true,
         "minWidth": 820,
         "minHeight": 540,
         "resizable": true
