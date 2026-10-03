@@ -180,3 +180,25 @@ Feature 3 standalone 候選 GUI（6,589,440 bytes，SHA-256 `58ba298f7f2bcd5fa4d
 - [x] 按前節 Feature 2 步驟驗證舊密碼保留數、歷史檢視／還原；按 Feature 3 步驟驗證複製、60 秒清除、外部替換保留及快速連續複製。
 
 剪貼簿只使用測試用密碼；Windows 剪貼簿歷程／雲端剪貼簿可能保存或同步，條件清除不會刪除歷程項目。FIDO/WebAuthn 必須由使用者在本機 Console 操作，不能透過 RDP 或 WinRM 執行 GUI 驗收。
+
+## CSV 批次匯入／更新 — Win11-NB 本機驗收（PR #13，PASS，2026-10-03）
+
+> 使用者於 2026-10-03 回報以下 Win11-NB 本機 Console 驗收項目全部通過。WinRM staging 階段未啟動 GUI，也未操作 WebAuthn。
+
+- Source commit：`f33eea8d24fd77e1a85e9a59e409ba8ddf9cbfa3`；Windows Release 使用 `--locked --features real-ctap`。
+- 新 GUI：`C:\FidoVault\portable-fido-vault.exe`，10,107,392 bytes，SHA-256 `1e2d22aba57f394a7b41e5500fa9deccaf3d414cfa7870699a0c7862ea73db82`；WinRM 部署後另行唯讀回讀，雜湊相符。
+- 替換前 GUI 備份：`C:\FidoVault\portable-fido-vault.exe.pre-batch-csv-20261003-170756-f33eea8.bak`，SHA-256 `7deba32418fb173d5ada126e600c81a748ffa51bcfe503afc7bed683fb928ed1`。
+- Vault 備份：`C:\FidoVault\vault.db.pre-batch-csv-20261003-170756-f33eea8.bak`，SHA-256 `34e7b94de6f04ee207f063b6b2c797b29ef1f7a900c6215851ccb66e19c916df`。
+- staging 前後 live `vault.db` 雜湊相同，key-slot 數維持 1；備份雜湊均與來源一致。前後未發現 FIDO client，user/machine `F2V_AUTHENTICATOR` 均未設定，暫存 `.b64` 已清除。
+- 本次只推送 GUI EXE；未推送 `vault_cli.exe` 或 `WebView2Loader.dll`。使用者已在 Win11-NB **本機 Console** 完成驗收；未透過 RDP/WinRM 操作 GUI 或 WebAuthn。測試使用專用條目，不涉及真實條目或在聊天中傳送密碼。
+
+### 使用者確認通過
+
+- [x] 範本下載成功，檔案為 UTF-8 且只有 `site,account,password,notes` 表頭。
+- [x] 匯入含 BOM、欄位順序不同及標準 quoting（逗號、雙引號、欄位內換行）的測試 CSV；預覽列號正確，且不顯示任何 CSV 欄位值／密碼。
+- [x] 新配對新增；唯一既有配對（忽略首尾空白與大小寫）更新；更新列空白欄位保留原值，非空欄位更新；密碼變更沿用密碼歷史規則。
+- [x] 缺少必填 site、欄數錯誤、CSV 內重複配對及多筆既有匹配等情況，列號與略過原因正確；其他有效列仍可預覽／匯入。
+- [x] 超過 1,000 筆資料列時整檔拒絕，金庫不變；預覽後取消或上鎖不寫入；確認匯入後所有有效列一起保存，重新解鎖後資料與新增／更新／略過計數正確。
+- [x] 確認 UI 有明文 CSV 密碼提醒，預覽、audit、診斷訊息與暫存檔均未暴露 CSV 密碼或整列內容。首次登入可能改寫加密 payload／audit，請保留上述備份，不因雜湊變更而覆寫 vault。
+
+使用者已確認全部項目 PASS；部署紀錄、備份與驗收項目維持可追溯。詳見 PR #13 與 Kanban task `t_1430ad96`。

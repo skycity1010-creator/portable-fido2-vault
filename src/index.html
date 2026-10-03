@@ -72,6 +72,12 @@
         </div>
         <button id="btn-add" class="primary">＋ 新增</button>
       </div>
+      <div class="row csv-import-actions">
+        <button id="btn-save-csv-template" type="button">下載 CSV 範本</button>
+        <button id="btn-import-csv" class="primary csv-import-button" type="button">批次匯入 CSV</button>
+      </div>
+      <p class="warn csv-import-warning">⚠️ CSV 匯入檔包含明文密碼；請妥善保管來源檔。預覽不會顯示密碼。</p>
+      <div id="csv-import-status" class="muted" role="status" aria-live="polite"></div>
       <table id="entries-table">
         <thead><tr><th>網站</th><th>帳號</th><th>建立時間</th><th>更新時間</th><th></th></tr></thead>
         <tbody></tbody>
@@ -139,6 +145,23 @@
       <div class="warn" style="margin-top:16px">⚠️ <b>無復原機制</b>：金鑰全失 + 忘記主密碼 = 資料永久無法取回（設計如此）。</div>
     </section>
   </div>
+
+  <dialog id="csv-import-dialog" aria-labelledby="csv-import-title" aria-describedby="csv-import-description">
+    <h2 id="csv-import-title">批次匯入預覽</h2>
+    <p id="csv-import-description">請確認新增、更新與略過筆數。預覽只顯示資料列號和處理結果，不顯示網站、帳號、密碼或備註。</p>
+    <p class="muted">CSV 範本表頭：<code>site,account,password,notes</code></p>
+    <div id="csv-import-summary" role="status" aria-live="polite"></div>
+    <div class="csv-import-table-wrap">
+      <table id="csv-import-table">
+        <thead><tr><th>CSV 資料列</th><th>處理</th><th>原因</th></tr></thead>
+        <tbody id="csv-import-rows"></tbody>
+      </table>
+    </div>
+    <div class="row csv-import-dialog-actions">
+      <button id="btn-confirm-csv-import" class="primary" type="button">確認匯入</button>
+      <button id="btn-cancel-csv-import" type="button">取消</button>
+    </div>
+  </dialog>
 
   <dialog id="key-name-dialog" aria-labelledby="key-name-title" aria-describedby="key-name-description">
     <h2 id="key-name-title">為安全性金鑰設定名稱</h2>
