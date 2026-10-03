@@ -27,17 +27,17 @@
 
 ## 驗收條件
 
-- [ ] 空查詢顯示所有條目；清除查詢可恢復完整清單。
-- [ ] 網站、帳號及備註欄位皆可部分比對，且英文大小寫不影響結果。
-- [ ] 只有出現在目前密碼或密碼歷史中的查詢字串不會命中該條目。
-- [ ] 結果筆數正確；零筆搜尋與空金庫各自顯示清楚的狀態。
+- [x] 空查詢顯示所有條目；清除查詢可恢復完整清單。
+- [x] 網站、帳號及備註欄位皆可部分比對，且英文大小寫不影響結果。
+- [x] 只有出現在目前密碼或密碼歷史中的查詢字串不會命中該條目。
+- [x] 結果筆數正確；零筆搜尋與空金庫各自顯示清楚的狀態。
 - [ ] 目前查詢下新增、編輯、刪除及 CSV 匯入後，顯示結果正確；各列操作仍指向正確條目。
 - [ ] 搜尋可由鍵盤操作，欄位及結果狀態有可存取標示；惡意標記字串不會被執行或當作 HTML 呈現。
-- [ ] targeted/full Node UI tests、`node --check src/app.js` 及 `git diff --check` 通過；Rust 測試／建置不因純 UI 修改而額外要求。
+- [x] targeted/full Node UI tests、`node --check src/app.js` 及 `git diff --check` 通過；Rust 測試／建置不因純 UI 修改而額外要求。
 - [ ] Win11-NB 本機 Console 手動驗收由使用者逐項回報；回報前不得標記 PASS 或結案。
 
 ## 工作流程
 
-- 本功能獨立一張 Kanban 任務及一支 draft PR；先提交本 scope/acceptance 文件，PR 建立後才修改 production code。
-- 不與其他功能並行；本次需求只要求完成規格確認、Kanban 任務與 draft PR 建立，production-code 實作等待後續明確指示。
+- 本功能獨立一張 Kanban 任務及一支 draft PR；先提交本 scope/acceptance 文件，PR 建立後才修改 production code。使用者後續明確指示「開工」後，才解除任務 blocked 狀態並開始實作。
+- 不與其他功能並行。Automated tests 已覆蓋篩選欄位、清除／空白、密碼排除、狀態筆數、列操作及重新載入；完整 CRUD/CSV 工作流程與 Win11-NB 本機 Console 驗收仍待驗證。
 - draft PR 以 `main` 為 base。建立時 `main` 尚無 GitHub Actions workflow；其他未合併 PR 上的 workflow 不視為本 PR 的 CI。

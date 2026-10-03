@@ -15,6 +15,7 @@ let clipboardOperationQueue = Promise.resolve();
 let keyNameDialogGeneration = 0;
 let activeCsvImportToken = null;
 let csvImportInFlight = false;
+let entrySearchQuery = "";
 
 // ─────────────── 工具 ───────────────
 function show(id) { $(id).classList.remove("hidden"); }
@@ -157,7 +158,18 @@ async function enterMain(entries) {
 function renderEntries(entries) {
   const tb = document.querySelector("#entries-table tbody");
   tb.innerHTML = "";
-  for (const e of entries) {
+  const query = entrySearchQuery.trim().toLowerCase();
+  const visibleEntries = query
+    ? entries.filter((entry) => [entry.site, entry.account, entry.notes]
+      .some((value) => String(value ?? "").toLowerCase().includes(query)))
+    : entries;
+  const status = $("entry-search-status");
+  if (!entries.length) status.textContent = "金庫尚無條目";
+  else if (query && !visibleEntries.length) status.textContent = "沒有符合搜尋條件";
+  else if (query) status.textContent = `符合 ${visibleEntries.length} / ${entries.length} 筆條目`;
+  else status.textContent = `共 ${entries.length} 筆條目`;
+
+  for (const e of visibleEntries) {
     const tr = document.createElement("tr");
     tr.innerHTML = `
       <td>${esc(e.site)}</td>
@@ -630,6 +642,10 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   $("btn-add").onclick = addEntry;
+  $("entry-search").addEventListener("input", () => {
+    entrySearchQuery = $("entry-search").value;
+    renderEntries(window.__lastEntries || []);
+  });
   $("btn-save-csv-template").onclick = saveCsvTemplate;
   $("btn-import-csv").onclick = previewCsvImport;
   $("btn-confirm-csv-import").onclick = confirmCsvImport;

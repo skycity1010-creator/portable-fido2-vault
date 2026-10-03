@@ -129,6 +129,10 @@ button.primary:hover { background: var(--accent-hi); }
 .row input { flex: 1; }
 .row button { width: auto; margin-top: 0; }
 
+.entry-search { max-width: 540px; margin: 16px 0; }
+.entry-search label { display: block; margin-bottom: 6px; color: var(--muted); font-size: 13px; }
+#entry-search-status { min-height: 18px; margin-top: 5px; }
+
 .password-input { position: relative; flex: 1; min-width: 0; }
 .password-input input { width: 100%; padding-right: 42px; }
 .password-toggle {
