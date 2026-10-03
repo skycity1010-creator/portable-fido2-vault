@@ -72,6 +72,11 @@
         </div>
         <button id="btn-add" class="primary">＋ 新增</button>
       </div>
+      <div class="entry-search">
+        <label for="entry-search">搜尋條目</label>
+        <input id="entry-search" type="search" autocomplete="off" aria-describedby="entry-search-status" aria-controls="entries-table" placeholder="依網站、帳號或備註搜尋" />
+        <div id="entry-search-status" class="muted" role="status" aria-live="polite"></div>
+      </div>
       <div class="row csv-import-actions">
         <button id="btn-save-csv-template" type="button">下載 CSV 範本</button>
         <button id="btn-import-csv" class="primary csv-import-button" type="button">批次匯入 CSV</button>
