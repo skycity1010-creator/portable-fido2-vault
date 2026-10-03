@@ -292,8 +292,14 @@ fn ensure_parent_window_ready(
     }
 }
 
-/// Restore and activate the live top-level HWND before entering the blocking
-/// Windows WebAuthn call.
+fn restore_window_if_minimized(is_minimized: bool, restore: impl FnOnce()) {
+    if is_minimized {
+        restore();
+    }
+}
+
+/// Activate the live top-level HWND before entering the blocking Windows
+/// WebAuthn call, restoring it only when it is minimized so maximized state is preserved.
 fn raise_key_operation_window(
     window: &tauri::WebviewWindow,
     require_foreground: bool,
@@ -323,7 +329,10 @@ fn raise_key_operation_window(
         }
 
         let foreground_before = unsafe { GetForegroundWindow() };
-        unsafe { ShowWindow(hwnd.0, SW_RESTORE) };
+        let minimized_before = unsafe { IsIconic(hwnd.0) != 0 };
+        restore_window_if_minimized(minimized_before, || unsafe {
+            ShowWindow(hwnd.0, SW_RESTORE);
+        });
         let set_foreground = unsafe { SetForegroundWindow(hwnd.0) != 0 };
         let foreground_after = unsafe { GetForegroundWindow() };
         let visible = unsafe { IsWindowVisible(hwnd.0) != 0 };
@@ -889,7 +898,19 @@ mod backend_mode_tests {
 
 #[cfg(test)]
 mod focus_window_tests {
-    use super::ensure_parent_window_ready;
+    use super::{ensure_parent_window_ready, restore_window_if_minimized};
+
+    #[test]
+    fn key_operation_activation_only_restores_a_minimized_window() {
+        let mut restore_calls = 0;
+
+        // A maximized window is not minimized and must keep its maximized state.
+        restore_window_if_minimized(false, || restore_calls += 1);
+        assert_eq!(restore_calls, 0);
+
+        restore_window_if_minimized(true, || restore_calls += 1);
+        assert_eq!(restore_calls, 1);
+    }
 
     #[test]
     fn key_operation_requires_a_visible_unminimized_foreground_parent() {

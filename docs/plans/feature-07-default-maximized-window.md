@@ -17,7 +17,8 @@
 - Tauri `src-tauri/tauri.conf.json` 將 `app.windows[label=main].maximized` 設為 `true`，且 `fullscreen` 不設為 `true`。
 - Node 測試會解析 Tauri JSON 並驗證主視窗的最大化預設與非全螢幕設定。
 - 全套 Node UI 測試、`node --check src/app.js`、`git diff --check` 通過；執行 real-ctap Windows Release build 驗證 Tauri config 可建置。
-- 部署後由使用者在 Win11-NB 本機 Console 確認：每次啟動皆最大化、標題列仍可見、可還原／調整大小及再次啟動後仍預設最大化。
+- 金鑰登入前景處理只在視窗已最小化時呼叫 restore；最大化／一般視窗只要求前景，不改變視窗狀態。
+- 部署後由使用者在 Win11-NB 本機 Console 確認：每次啟動皆最大化、按「以金鑰登入」時維持最大化、標題列仍可見、可還原／調整大小及再次啟動後仍預設最大化。
 - 在使用者回報實機結果前，不得把 Win11-NB 手動驗收標記為 PASS。
 
 ## 工作流程
