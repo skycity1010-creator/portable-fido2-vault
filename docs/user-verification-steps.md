@@ -216,9 +216,11 @@ Feature 3 standalone 候選 GUI（6,589,440 bytes，SHA-256 `58ba298f7f2bcd5fa4d
 
 回報格式：搜尋欄位比對 __；清除/空白 __；零結果與空金庫提示 __；目前/舊密碼排除 __；列操作 __；新增/編輯/CSV 重載 __；audit/重啟 __（每項填 PASS/FAIL + 簡短現象）。
 
-## 主視窗預設最大化 — Win11-NB 本機驗收（PR #15，待部署／使用者驗證）
+## 主視窗預設最大化 — Win11-NB 本機驗收（PR #15，已部署／待使用者驗證）
 
-> PR #15 stacked on PR #14。部署後請在 Win11-NB 本機 Console 驗收，不要透過 RDP/WinRM 操作 GUI。PR #14 的條目搜尋手動驗收仍獨立 pending；本節 PASS 不代表 PR #14 驗收通過。
+> PR #15 stacked on PR #14。請在 Win11-NB 本機 Console 驗收，不要透過 RDP/WinRM 操作 GUI。PR #14 的條目搜尋手動驗收仍獨立 pending；本節 PASS 不代表 PR #14 驗收通過。
+>
+> **部署紀錄（2026-10-03）：** 新 GUI `C:\FidoVault\portable-fido-vault.exe` SHA-256 `a874a96026e1c2a6baa7857a9fe3c7b564758347f2458aba5bd254ddd70e2092`（7,171,584 bytes）。部署前備份位於 `C:\FidoVault\backups\maximized-20261003-a7fb6a0`：舊 exe SHA-256 `3873d0701f24ce23272e8633195a98eda6313f67ba7f82505562d6b950f77d1d`；`vault.db` SHA-256 `09ea6c2cc94d4e4ceef3f7d4c201826c7cb3930da9cf6e9909c862d4c8451025`。部署後 vault hash 不變，header 有效、1 個 key slot；未透過 WinRM 啟動 GUI。以下實機項目尚未回報，不代表 PASS。
 
 - [ ] 關閉並重新啟動程式，確認主視窗開啟時已最大化，標題列及工作列仍可見（不是全螢幕）。
 - [ ] 使用還原按鈕，確認視窗可移動、調整大小，最小寬高限制仍生效；再最大化時版面可正常重排。
