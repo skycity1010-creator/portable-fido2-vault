@@ -77,32 +77,43 @@ fn validate_owner_foreground(owner: HWND, foreground: HWND) -> Result<HWND, Fido
     }
 }
 
-fn is_new_windows_security_dialog(
-    title: &str,
-    class_name: &str,
-    process_path: &str,
-    system_directory: &str,
+#[derive(Clone, Copy)]
+struct WindowsSecurityDialogCandidate<'a> {
+    title: &'a str,
+    class_name: &'a str,
+    process_path: &'a str,
+    system_directory: &'a str,
     visible: bool,
     current_session: u32,
     window_session: u32,
     is_new_window: bool,
     is_new_process: bool,
-) -> bool {
-    let title_matches = title.trim().eq_ignore_ascii_case("Windows Security")
-        || title.trim().eq_ignore_ascii_case("Windows 安全性");
+}
+
+fn is_new_windows_security_dialog(candidate: WindowsSecurityDialogCandidate<'_>) -> bool {
+    let title_matches = candidate
+        .title
+        .trim()
+        .eq_ignore_ascii_case("Windows Security")
+        || candidate
+            .title
+            .trim()
+            .eq_ignore_ascii_case("Windows 安全性");
     let normalize_path = |path: &str| path.replace('/', "\\").trim_end_matches('\\').to_owned();
     let expected_path = format!(
         "{}\\CredentialUIBroker.exe",
-        normalize_path(system_directory)
+        normalize_path(candidate.system_directory)
     );
 
-    visible
-        && current_session == window_session
-        && is_new_window
-        && is_new_process
+    candidate.visible
+        && candidate.current_session == candidate.window_session
+        && candidate.is_new_window
+        && candidate.is_new_process
         && title_matches
-        && class_name.eq_ignore_ascii_case("Credential Dialog Xaml Host")
-        && normalize_path(process_path).eq_ignore_ascii_case(&expected_path)
+        && candidate
+            .class_name
+            .eq_ignore_ascii_case("Credential Dialog Xaml Host")
+        && normalize_path(candidate.process_path).eq_ignore_ascii_case(&expected_path)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -183,8 +194,10 @@ fn credential_broker_process_ids() -> Option<HashSet<u32>> {
         return None;
     }
     let _snapshot = ProcessHandle(snapshot);
-    let mut entry = PROCESSENTRY32W::default();
-    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
     if unsafe { Process32FirstW(snapshot, &mut entry) } == 0 {
         return None;
     }
@@ -288,17 +301,17 @@ fn visible_windows_security_dialogs(
             let class_name = window_class(hwnd);
             let window_session = process_session(identity.process_id)?;
             let process_path = process_image_path(identity.process_id)?;
-            is_new_windows_security_dialog(
-                &title,
-                &class_name,
-                &process_path,
+            is_new_windows_security_dialog(WindowsSecurityDialogCandidate {
+                title: &title,
+                class_name: &class_name,
+                process_path: &process_path,
                 system_directory,
-                true,
+                visible: true,
                 current_session,
                 window_session,
                 is_new_window,
                 is_new_process,
-            )
+            })
             .then_some(identity)
         })
         .collect()
@@ -989,15 +1002,17 @@ mod tests {
     #[test]
     fn only_a_new_same_session_system_windows_security_dialog_is_selected() {
         assert!(is_new_windows_security_dialog(
-            "Windows 安全性",
-            "Credential Dialog Xaml Host",
-            r"C:\Windows\System32\CredentialUIBroker.exe",
-            r"C:\Windows\System32",
-            true,
-            2,
-            2,
-            true,
-            true,
+            WindowsSecurityDialogCandidate {
+                title: "Windows 安全性",
+                class_name: "Credential Dialog Xaml Host",
+                process_path: r"C:\Windows\System32\CredentialUIBroker.exe",
+                system_directory: r"C:\Windows\System32",
+                visible: true,
+                current_session: 2,
+                window_session: 2,
+                is_new_window: true,
+                is_new_process: true,
+            }
         ));
 
         let non_candidates = [
@@ -1060,41 +1075,46 @@ mod tests {
             non_candidates
         {
             assert!(!is_new_windows_security_dialog(
-                title,
-                class_name,
-                path,
-                r"C:\Windows\System32",
-                visible,
-                current_session,
-                window_session,
-                is_new,
-                true,
+                WindowsSecurityDialogCandidate {
+                    title,
+                    class_name,
+                    process_path: path,
+                    system_directory: r"C:\Windows\System32",
+                    visible,
+                    current_session,
+                    window_session,
+                    is_new_window: is_new,
+                    is_new_process: true,
+                }
             ));
         }
     }
 
     #[test]
     fn broker_dialog_requires_new_process_and_new_window_identity() {
-        let trusted = (
-            "Windows 安全性",
-            "Credential Dialog Xaml Host",
-            r"C:\Windows\System32\CredentialUIBroker.exe",
-            r"C:\Windows\System32",
-            true,
-            2,
-            2,
-        );
-        assert!(is_new_windows_security_dialog(
-            trusted.0, trusted.1, trusted.2, trusted.3, trusted.4, trusted.5, trusted.6, true,
-            true,
+        let trusted = WindowsSecurityDialogCandidate {
+            title: "Windows 安全性",
+            class_name: "Credential Dialog Xaml Host",
+            process_path: r"C:\Windows\System32\CredentialUIBroker.exe",
+            system_directory: r"C:\Windows\System32",
+            visible: true,
+            current_session: 2,
+            window_session: 2,
+            is_new_window: true,
+            is_new_process: true,
+        };
+        assert!(is_new_windows_security_dialog(trusted));
+        assert!(!is_new_windows_security_dialog(
+            WindowsSecurityDialogCandidate {
+                is_new_process: false,
+                ..trusted
+            }
         ));
         assert!(!is_new_windows_security_dialog(
-            trusted.0, trusted.1, trusted.2, trusted.3, trusted.4, trusted.5, trusted.6, true,
-            false,
-        ));
-        assert!(!is_new_windows_security_dialog(
-            trusted.0, trusted.1, trusted.2, trusted.3, trusted.4, trusted.5, trusted.6, false,
-            true,
+            WindowsSecurityDialogCandidate {
+                is_new_window: false,
+                ..trusted
+            }
         ));
     }
 

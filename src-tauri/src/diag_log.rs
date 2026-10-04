@@ -88,7 +88,7 @@ impl log::Log for FileLogger {
             writeln!(g, "{line}").ok();
         }
         // 控制台一份（UTF-8；codepage 950 console 下中文可能顯示損毀，檔內恆為 UTF-8）。
-        eprint!("{line}\n");
+        eprintln!("{line}");
     }
     fn flush(&self) {}
 }
@@ -98,7 +98,7 @@ impl log::Log for FileLogger {
 /// Session marker 供人工檢視多 process log；程式判斷以 checkpoint 與 PID 過濾為準。
 /// CLI 與 GUI 共用 append log，所有 logger event 均帶 PID。
 /// Earlier operation evidence is deliberately excluded from the retry predicate.
-
+///
 /// 行數 checkpoint：先 force FIDO_LOG 初始化（確保 session marker 落檔），再回傳目前行數。
 pub fn checkpoint() -> usize {
     let guard = FIDO_LOG.lock().unwrap_or_else(|e| e.into_inner());
