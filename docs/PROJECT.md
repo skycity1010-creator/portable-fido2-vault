@@ -8,7 +8,7 @@
 ## 1. 專案概況
 
 Windows 桌面、**完全離線**、**portable 免安裝**的 FIDO2 密碼金庫。
-單一資料夾（`portable-fido-vault.exe + vault.db`）複製到任何 Windows 電腦即可使用。
+可攜資料夾須包含 `portable-fido-vault.exe`、同版 x64 `WebView2Loader.dll` 與既有 `vault.db`；目標電腦另須具備 WebView2 Runtime，硬體版 GUI 需 Windows WebAuthn API v4+。免安裝本程式不代表不需要目標系統執行環境；搬移／排錯流程見 README 的 portable 部署章節。
 
 - 首次執行建立帳號：主密碼經 **Argon2id** 派生金鑰
 - 之後**主密碼或任一支已註冊 FIDO2 金鑰**皆可登入（允許多支）
@@ -113,14 +113,14 @@ offset   size   field
 - Rust **stable-x86_64-pc-windows-gnu** toolchain（WS2 無 MSVC/VS，走 GNU 免 UAC）。
 - **winlibs-mingw**（posix-seh x86_64）提供 dlltool.exe（Rust GNU toolchain 不自帶 binutils）：
   `PATH += $HOME/tools/winlibs-mingw/mingw64/bin`。
-- WebView2（Win11 內建；portable 資料夾需同梱 `WebView2Loader.dll`）。
+- WebView2 Runtime（建置機與目標機均需確認，不以 Windows 11／Edge 已安裝代替檢查）；portable 資料夾另須同梱同次建置的 x64 `WebView2Loader.dll`。兩者是不同元件，不能互相取代。
 
 ```bash
 # bash / git-bash（WS2）
 export PATH="$HOME/.cargo/bin:$HOME/tools/winlibs-mingw/mingw64/bin:$PATH"
 cd C:/project/portable-fido2-vault/src-tauri
 cargo +stable-x86_64-pc-windows-gnu build --release --features real-ctap --bin portable-fido-vault --example vault_cli
-# 產出 target/release/portable-fido-vault.exe + vault_cli.exe
+# GUI 打包須取 target/release/portable-fido-vault.exe 與同目錄 WebView2Loader.dll；vault_cli 為選用工具
 ```
 
 - `--features real-ctap`：編入實體 FIDO2 支援；Windows GUI 使用系統 WebAuthn API，CLI `--authenticator hw` 使用 raw CTAP/HID。
@@ -132,7 +132,9 @@ cargo +stable-x86_64-pc-windows-gnu build --release --features real-ctap --bin p
 
 ## 7. 部署（Win11-NB，WinRM）
 
-- 部署目錄：`C:\FidoVault`（portable 資料夾＝全部資產）。
+- 部署目錄：`C:\FidoVault`；GUI 與既有金庫的最小搬移清單為 `portable-fido-vault.exe`、同版 x64 `WebView2Loader.dll`、`vault.db`。若有 `vault.db.failures`，一併備份／複製以保留未合併軌跡；原資料夾的備份與診斷檔保留，不因最小清單而刪除。
+- 跨機搬移前正常關閉 GUI／CLI、另做金庫備份，使用全新目的資料夾，並在首次登入前核對 EXE／DLL／DB 的來源與目的 SHA-256。不要覆寫另一份金庫，不重新建立 DB；登入寫入 audit 後 DB hash 可能改變。
+- 新目的機須具備 WebView2 Runtime；缺少時依 README 的官方 Runtime 部署說明補齊，離線環境使用 Evergreen Standalone Installer。只帶 EXE＋DB 不完整，安裝 Runtime 也不能補回缺失的 app-local DLL。
 - 推檔：`python scripts/nb_push.py <file> [remote_dir]`
   - WinRM（`Invoke-Command -ComputerName Win11-NB -UseSSL:$false`）+ base64 chunk（200KB/次，
     outer 腳本走 stdin 避開 CreateProcess 8KB 上限）+ 落地 SHA256 驗證。
