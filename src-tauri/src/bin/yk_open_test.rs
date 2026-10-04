@@ -170,8 +170,8 @@ fn log(msg: &str) {
     let line = format!("[{}] {}\n", stamp(), msg);
     // stdout (captured by psexec when run remotely)
     print!("{}", line);
-    use std::io::Write as _;
     use std::fs::OpenOptions as _;
+    use std::io::Write as _;
     // also persist to a file on the NB so it can be retrieved regardless of
     // how the process is launched (interactive / SYSTEM / scheduled task).
     if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -208,12 +208,7 @@ fn enumerate_hid() -> Vec<HidDev> {
     let mut all: Vec<HidDev> = Vec::new();
     unsafe {
         let flags = DIGCF_PRESENT | DIGCF_DEVICEINTERFACE;
-        let set = SetupDiGetClassDevsW(
-            &GUID_DEVINTERFACE_HID,
-            ptr::null(),
-            ptr::null_mut(),
-            flags,
-        );
+        let set = SetupDiGetClassDevsW(&GUID_DEVINTERFACE_HID, ptr::null(), ptr::null_mut(), flags);
         // INVALID_HANDLE_VALUE = !0 as pointer; a null handle is not returned
         // (0) — failure is signaled by -1.
         if set == (-1isize as *mut c_void) || set.is_null() {
@@ -313,7 +308,11 @@ fn enumerate_hid() -> Vec<HidDev> {
                 }
             }
 
-            all.push(HidDev { path_wide, path, hwid });
+            all.push(HidDev {
+                path_wide,
+                path,
+                hwid,
+            });
             index += 1;
         }
         SetupDiDestroyDeviceInfoList(set);
@@ -366,7 +365,10 @@ fn open_raw(path_wide: &[u16], share: u32) -> Result<File, String> {
         );
         if h == -1isize {
             let code = GetLastError();
-            Err(format!("CreateFileW failed win32={} (os error {})", code, code))
+            Err(format!(
+                "CreateFileW failed win32={} (os error {})",
+                code, code
+            ))
         } else {
             // NB: File::from_raw_handle takes ownership; the returned File
             // must outlive any use of the handle (it lives in the caller's
@@ -486,7 +488,12 @@ fn read_frame(file: &mut File) -> Result<Frame, String> {
         data.extend_from_slice(&cbuf[6..6 + take]);
         seq += 1;
     }
-    Ok(Frame { cid, cmd, total, data })
+    Ok(Frame {
+        cid,
+        cmd,
+        total,
+        data,
+    })
 }
 
 /// read frames until one with the given cid and a non-keepalive cmd appears.
@@ -498,7 +505,10 @@ fn read_response(
     let start = now();
     loop {
         if now().duration_since(start).unwrap_or_default() > timeout {
-            return Err(format!("timeout waiting for response ({} ms)", timeout.as_millis()));
+            return Err(format!(
+                "timeout waiting for response ({} ms)",
+                timeout.as_millis()
+            ));
         }
         let f = read_frame(file)?;
         if f.cid != cid {
@@ -575,20 +585,14 @@ fn main() {
     if yubi.is_empty() {
         log("NO YubiKey (VID_1050 & PID_0402) interface found among enumerated HID devices");
         for (i, d) in all.iter().take(40).enumerate() {
-            log(&format!(
-                "   hid[{}] hwid={} path={}",
-                i, d.hwid, d.path
-            ));
+            log(&format!("   hid[{}] hwid={} path={}", i, d.hwid, d.path));
         }
         log("=== RESULT: DEVICE NOT FOUND ===");
         return;
     }
 
     for d in yubi.iter() {
-        log(&format!(
-            "TARGET YubiKey hwid={} path={}",
-            d.hwid, d.path
-        ));
+        log(&format!("TARGET YubiKey hwid={} path={}", d.hwid, d.path));
     }
 
     // use the first matching interface
@@ -656,7 +660,10 @@ fn run_ctap2_probe(file: &mut File, tag: &str) {
             ));
         }
         Err(e) => {
-            log(&format!("[{}] caps check failed (non-blocking): {}", tag, e));
+            log(&format!(
+                "[{}] caps check failed (non-blocking): {}",
+                tag, e
+            ));
         }
     }
 

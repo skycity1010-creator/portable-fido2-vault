@@ -29,11 +29,17 @@ static FIDO_LOG: LazyLock<Mutex<Box<dyn std::io::Write + Send>>> = LazyLock::new
         None => Box::new(std::io::sink()),
     };
     // session marker：多 process append 的人工歸因標記。
-    writeln!(f, "\n===== session start: pid={} ts={} path={} =====",
+    writeln!(
+        f,
+        "\n===== session start: pid={} ts={} path={} =====",
         std::process::id(),
         now_stamp(),
-        LOG_PATH.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "<none>".into()),
-    ).ok();
+        LOG_PATH
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<none>".into()),
+    )
+    .ok();
     Mutex::new(f)
 });
 
@@ -61,7 +67,9 @@ fn count_lines(path: &Path) -> usize {
 
 /// 本地時間戳（毫秒；chrono 為既有依賴）。
 fn now_stamp() -> String {
-    chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string()
+    chrono::Local::now()
+        .format("%Y-%m-%d %H:%M:%S%.3f")
+        .to_string()
 }
 
 /// 安裝 global file logger。失敗（如已安裝）不阻斷執行 — 退化为 null logger。
@@ -117,5 +125,9 @@ pub fn scan_from(start_line: usize) -> Vec<String> {
         Ok(c) => c,
         Err(_) => return Vec::new(),
     };
-    content.lines().skip(start_line).map(str::to_owned).collect()
+    content
+        .lines()
+        .skip(start_line)
+        .map(str::to_owned)
+        .collect()
 }

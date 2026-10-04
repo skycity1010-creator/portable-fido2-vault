@@ -122,7 +122,10 @@ mod tests {
     fn rejects_unparsable_paths() {
         assert_eq!(vid_pid_from_path(r"\\.\keyboard"), None);
         assert_eq!(vid_pid_from_path(""), None);
-        assert_eq!(vid_pid_from_path(r"\\?\hid#unknown&pid?#{4d1e55b2-f16f-11cf-88cb-001111000030}"), None);
+        assert_eq!(
+            vid_pid_from_path(r"\\?\hid#unknown&pid?#{4d1e55b2-f16f-11cf-88cb-001111000030}"),
+            None
+        );
     }
 
     #[test]

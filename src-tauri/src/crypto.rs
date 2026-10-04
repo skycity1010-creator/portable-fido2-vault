@@ -5,9 +5,7 @@ use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
 };
-use argon2::{
-    Argon2, Algorithm, Version,
-};
+use argon2::{Algorithm, Argon2, Version};
 use hkdf::Hkdf;
 use rand::{rngs::OsRng, RngCore};
 use sha2::Sha256;
@@ -72,7 +70,11 @@ pub fn aes_gcm_encrypt(key: &[u8; 32], nonce: &[u8; 12], plaintext: &[u8]) -> Ve
 }
 
 /// AES-256-GCM 解密；ciphertext 含尾端 16B tag。
-pub fn aes_gcm_decrypt(key: &[u8; 32], nonce: &[u8; 12], ciphertext_with_tag: &[u8]) -> Result<Vec<u8>, CryptoError> {
+pub fn aes_gcm_decrypt(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    ciphertext_with_tag: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
     let cipher = Aes256Gcm::new_from_slice(key).expect("32-byte key");
     cipher
         .decrypt(Nonce::from_slice(nonce), ciphertext_with_tag)

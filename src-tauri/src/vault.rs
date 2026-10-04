@@ -13,11 +13,11 @@ use std::path::{Path, PathBuf};
 use chrono::Utc;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::csv_import::{ImportAction, ImportPlan, ImportPreview};
 use crate::crypto::{
     aes_gcm_decrypt, aes_gcm_encrypt, argon2id_derive, base64_decode, base64_encode,
     kek_from_prf_secret, random_kek, random_nonce, CryptoError, VAULT_MAGIC,
 };
+use crate::csv_import::{ImportAction, ImportPlan, ImportPreview};
 use crate::fido2::{FidoBackend, FidoError, KeyKind, RegisteredCredential};
 
 #[derive(Debug)]
@@ -35,7 +35,9 @@ impl std::fmt::Display for VaultError {
         match self {
             Self::Io(e) => write!(f, "檔案錯誤：{e}"),
             Self::Format(m) => write!(f, "金庫格式錯誤：{m}"),
-            Self::Crypto(CryptoError::DecryptFailed) => write!(f, "密碼或金鑰不正確（解密驗證失敗）"),
+            Self::Crypto(CryptoError::DecryptFailed) => {
+                write!(f, "密碼或金鑰不正確（解密驗證失敗）")
+            }
             Self::Crypto(e) => write!(f, "加密錯誤：{e}"),
             Self::WrongPassword => write!(f, "密碼不正確"),
             Self::Fido(e) => write!(f, "{e}"),
@@ -228,8 +230,13 @@ impl Vault {
 
         let header = Header {
             v: 1,
-            argon2: Argon2Params { salt: base64_encode(&salt) },
-            password_slot: Slot { nonce: base64_encode(&nonce), ct: base64_encode(&ct) },
+            argon2: Argon2Params {
+                salt: base64_encode(&salt),
+            },
+            password_slot: Slot {
+                nonce: base64_encode(&nonce),
+                ct: base64_encode(&ct),
+            },
             key_slots: Vec::new(),
             created_at: now_rfc3339(),
         };
@@ -253,7 +260,12 @@ impl Vault {
             },
         };
 
-        let vault = Self { path: path.to_path_buf(), header, data, kek };
+        let vault = Self {
+            path: path.to_path_buf(),
+            header,
+            data,
+            kek,
+        };
         vault.write_file()?;
         Ok(vault)
     }
@@ -395,7 +407,12 @@ impl Vault {
             data.audit.splice(0..0, events);
         }
 
-        let mut vault = Self { path: path.to_path_buf(), header, data, kek };
+        let mut vault = Self {
+            path: path.to_path_buf(),
+            header,
+            data,
+            kek,
+        };
         vault.data.audit.push(AuditEvent {
             ts: now_rfc3339(),
             event: "login_success".into(),
@@ -427,7 +444,10 @@ impl Vault {
             .map_err(|_| VaultError::Format("header 非 UTF-8".into()))?;
         let header: Header = serde_json::from_str(header_json).map_err(VaultError::Json)?;
         if header.v != 1 {
-            return Err(VaultError::Format(format!("不支援的格式版本 v{}", header.v)));
+            return Err(VaultError::Format(format!(
+                "不支援的格式版本 v{}",
+                header.v
+            )));
         }
         let off = 10 + header_len;
         let nonce: [u8; 12] = buf[off..off + 12].try_into().unwrap();
@@ -506,7 +526,13 @@ impl Vault {
 
     // ── CRUD ──
 
-    pub fn add_entry(&mut self, site: &str, account: &str, password: &str, notes: &str) -> Result<String, VaultError> {
+    pub fn add_entry(
+        &mut self,
+        site: &str,
+        account: &str,
+        password: &str,
+        notes: &str,
+    ) -> Result<String, VaultError> {
         let id = hex32(&random_bytes(16));
         let ts = now_rfc3339();
         self.data.entries.push(Entry {
@@ -685,7 +711,11 @@ impl Vault {
 
     pub fn set_idle_lock(&mut self, minutes: u32) -> Result<(), VaultError> {
         self.data.settings.idle_lock_minutes = minutes.clamp(1, 60);
-        self.record("settings_changed", "manual", &format!("idle_lock={}", self.data.settings.idle_lock_minutes))?;
+        self.record(
+            "settings_changed",
+            "manual",
+            &format!("idle_lock={}", self.data.settings.idle_lock_minutes),
+        )?;
         Ok(())
     }
 
@@ -798,7 +828,11 @@ impl Vault {
             .ok_or(VaultError::Fido(FidoError::NoDevice))?;
         let label = self.header.key_slots[idx].label.clone();
         self.header.key_slots.remove(idx);
-        self.record("key_removed", &format!("fido2:{label}"), "金鑰槽已移除（該金鑰無法再解鎖）")?;
+        self.record(
+            "key_removed",
+            &format!("fido2:{label}"),
+            "金鑰槽已移除（該金鑰無法再解鎖）",
+        )?;
         Ok(())
     }
 
@@ -830,7 +864,8 @@ fn random_bytes(n: usize) -> Vec<u8> {
 
 fn slot_nonce(b64: &str) -> Result<[u8; 12], VaultError> {
     let v = base64_decode(b64).map_err(|_| VaultError::Format("slot nonce 解碼失敗".into()))?;
-    v.try_into().map_err(|_| VaultError::Format("slot nonce 長度錯誤".into()))
+    v.try_into()
+        .map_err(|_| VaultError::Format("slot nonce 長度錯誤".into()))
 }
 
 fn hex32(b: &[u8]) -> String {
@@ -869,11 +904,18 @@ fn read_failure_sidecar(path: &Path) -> Vec<FailureStamp> {
 /// 記錄一次登入失敗（未解鎖情境）。
 pub fn record_login_failure(vault_path: &Path, method: &str) -> Result<(), VaultError> {
     let mut list = read_failure_sidecar(vault_path);
-    list.push(FailureStamp { ts: now_rfc3339(), method: method.into() });
+    list.push(FailureStamp {
+        ts: now_rfc3339(),
+        method: method.into(),
+    });
     if list.len() > MAX_LOGIN_FAILURES {
         list.remove(0);
     }
-    fs::write(failures_path(vault_path), serde_json::to_string(&list).unwrap()).map_err(VaultError::Io)
+    fs::write(
+        failures_path(vault_path),
+        serde_json::to_string(&list).unwrap(),
+    )
+    .map_err(VaultError::Io)
 }
 
 #[cfg(test)]
@@ -885,10 +927,22 @@ mod tests {
     /// 不支援 PRF 的金鑰包裝（驗證裁決②：拒絕註冊）。
     struct NoPrfBackend(MockBackend);
     impl FidoBackend for NoPrfBackend {
-        fn detect(&mut self) -> Result<crate::fido2::DetectedKey, FidoError> { self.0.detect() }
-        fn register_credential(&mut self, d: &crate::fido2::DetectedKey, pin: Option<&str>) -> Result<crate::fido2::RegisteredCredential, FidoError> { self.0.register_credential(d, pin) }
-        fn get_prf_secret(&mut self, id: &[u8], pin: Option<&str>) -> Result<[u8; 32], FidoError> { self.0.get_prf_secret(id, pin) }
-        fn prf_supported(&self) -> bool { false }
+        fn detect(&mut self) -> Result<crate::fido2::DetectedKey, FidoError> {
+            self.0.detect()
+        }
+        fn register_credential(
+            &mut self,
+            d: &crate::fido2::DetectedKey,
+            pin: Option<&str>,
+        ) -> Result<crate::fido2::RegisteredCredential, FidoError> {
+            self.0.register_credential(d, pin)
+        }
+        fn get_prf_secret(&mut self, id: &[u8], pin: Option<&str>) -> Result<[u8; 32], FidoError> {
+            self.0.get_prf_secret(id, pin)
+        }
+        fn prf_supported(&self) -> bool {
+            false
+        }
     }
 
     #[test]
@@ -1039,7 +1093,10 @@ mod tests {
         drop(v);
 
         // 錯誤密碼 → 拒絕 + sidecar 記一筆
-        assert!(matches!(Vault::open_password(&p, "wrong"), Err(VaultError::WrongPassword)));
+        assert!(matches!(
+            Vault::open_password(&p, "wrong"),
+            Err(VaultError::WrongPassword)
+        ));
         let fc = read_failure_sidecar(&p);
         assert_eq!(fc.len(), 1);
         assert_eq!(fc[0].method, "password");
@@ -1047,7 +1104,10 @@ mod tests {
         // 正確密碼 → 成功 + sidecar 合併進 audit + 刪除
         let v = Vault::open_password(&p, "Correct-Horse-42").unwrap();
         assert!(v.audit().iter().any(|a| a.event == "login_success"));
-        assert!(v.audit().iter().any(|a| a.event == "login_failed" && a.method == "password"));
+        assert!(v
+            .audit()
+            .iter()
+            .any(|a| a.event == "login_failed" && a.method == "password"));
         assert!(!failures_path(&p).exists());
         let _ = fs::remove_dir_all(&d);
     }
@@ -1067,9 +1127,15 @@ mod tests {
         let k1 = v.register_key(&mut backend, None).unwrap();
         assert_eq!(k1.kind, KeyKind::Fingerprint);
         // PIN 型：註冊時即需提供 PIN
-        assert!(v.register_key(&mut MockBackend::new().with_next_kind(KeyKind::Pin), None)
+        assert!(v
+            .register_key(&mut MockBackend::new().with_next_kind(KeyKind::Pin), None)
             .is_err());
-        let k2 = v.register_key(&mut MockBackend::new().with_next_kind(KeyKind::Pin), Some("1234")).unwrap();
+        let k2 = v
+            .register_key(
+                &mut MockBackend::new().with_next_kind(KeyKind::Pin),
+                Some("1234"),
+            )
+            .unwrap();
         assert_eq!(k2.kind, KeyKind::Pin);
         assert_eq!(v.keys_meta().len(), 2);
         drop(v);
@@ -1077,7 +1143,10 @@ mod tests {
         // 金鑰 1（fingerprint，不需 PIN）登入
         let mut b = MockBackend::new();
         let v = Vault::open_key(&p, &base64_encode(&k1.credential_id), None, &mut b).unwrap();
-        assert!(v.audit().iter().any(|a| a.event == "login_success" && a.method.contains("Mock")));
+        assert!(v
+            .audit()
+            .iter()
+            .any(|a| a.event == "login_success" && a.method.contains("Mock")));
         drop(v);
 
         // 金鑰 2（pin）：無 PIN → PinRequired；有 PIN → 成功
@@ -1087,7 +1156,8 @@ mod tests {
             Err(VaultError::Fido(FidoError::PinRequired(_)))
         ));
         let mut b = MockBackend::new();
-        let v = Vault::open_key(&p, &base64_encode(&k2.credential_id), Some("1234"), &mut b).unwrap();
+        let v =
+            Vault::open_key(&p, &base64_encode(&k2.credential_id), Some("1234"), &mut b).unwrap();
         assert!(!v.entries().iter().any(|_| false)); // 解鎖成功即可
         let _ = fs::remove_dir_all(&d);
     }
@@ -1189,10 +1259,13 @@ mod tests {
         let v = Vault::create(&p, "Pw-12345").unwrap();
         let mut v = v;
 
-        let id = v.add_entry("example.com", "alice", "S3cret!x", "note1").unwrap();
+        let id = v
+            .add_entry("example.com", "alice", "S3cret!x", "note1")
+            .unwrap();
         let before = v.entries()[0].updated_at.clone();
         std::thread::sleep(std::time::Duration::from_millis(5));
-        v.update_entry(&id, None, Some("alice2"), None, Some("note2")).unwrap();
+        v.update_entry(&id, None, Some("alice2"), None, Some("note2"))
+            .unwrap();
         assert_eq!(v.entries()[0].account, "alice2");
         assert_ne!(v.entries()[0].updated_at, before);
         assert_eq!(v.entries()[0].created_at, v.entries()[0].created_at); // 不變

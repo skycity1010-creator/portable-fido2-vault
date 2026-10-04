@@ -164,7 +164,8 @@ fn resolve_backend_mode(
         None if debug_build && mock_compiled => Ok(BackendMode::Mock),
         None if real_ctap_compiled => Ok(BackendMode::Hardware),
         None if !debug_build => Err(
-            "Release GUI build is missing the real-ctap feature; refusing to use MockBackend".into(),
+            "Release GUI build is missing the real-ctap feature; refusing to use MockBackend"
+                .into(),
         ),
         None if mock_compiled => Ok(BackendMode::Mock),
         None => Err("No FIDO backend is compiled; enable real-ctap or mock-fido".into()),
@@ -267,7 +268,10 @@ impl AppInner {
 
 impl VaultState {
     fn with_lock<R>(&self, f: impl FnOnce(&mut AppInner) -> Result<R>) -> Result<R> {
-        let mut g = self.0.lock().map_err(|_| "state lock poisoned".to_string())?;
+        let mut g = self
+            .0
+            .lock()
+            .map_err(|_| "state lock poisoned".to_string())?;
         f(&mut g)
     }
 }
@@ -513,7 +517,10 @@ fn lock(state: tauri::State<VaultState>, reason: Option<String>) -> Result<Login
     })
 }
 
-fn with_unlocked<R>(state: &VaultState, f: impl FnOnce(&mut vault::Vault) -> Result<R>) -> Result<R> {
+fn with_unlocked<R>(
+    state: &VaultState,
+    f: impl FnOnce(&mut vault::Vault) -> Result<R>,
+) -> Result<R> {
     state.with_lock(|g| match g.vault.as_mut() {
         Some(v) => f(v),
         None => Err("金庫未解鎖".to_string()),
@@ -714,12 +721,16 @@ fn suggest_key_label(state: tauri::State<VaultState>) -> Result<String> {
 
 #[tauri::command]
 fn remove_key(state: tauri::State<VaultState>, credential_id: String) -> Result<()> {
-    with_unlocked(&state, |v| v.remove_key(&credential_id).map_err(|e| e.to_string()))
+    with_unlocked(&state, |v| {
+        v.remove_key(&credential_id).map_err(|e| e.to_string())
+    })
 }
 
 #[tauri::command]
 fn set_idle_lock(state: tauri::State<VaultState>, minutes: u32) -> Result<()> {
-    with_unlocked(&state, |v| v.set_idle_lock(minutes).map_err(|e| e.to_string()))
+    with_unlocked(&state, |v| {
+        v.set_idle_lock(minutes).map_err(|e| e.to_string())
+    })
 }
 
 #[tauri::command]
