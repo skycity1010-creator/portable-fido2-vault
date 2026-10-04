@@ -37,9 +37,17 @@ PR #3 commit `ab3d123` 的 Windows GNU Release GUI 已部署至 `C:\FidoVault\po
 | 檔案 | 說明 |
 |---|---|
 | `portable-fido-vault.exe` | 主程式（GUI）；Windows GUI 透過 Windows WebAuthn API v4+ 使用安全金鑰 |
-| `WebView2Loader.dll` | WebView2 載入器（GUI 必備，部署時保留） |
+| `WebView2Loader.dll` | app-local 載入器（GUI 必備）；須與 EXE 同一層、同版 x64，跨機搬移也要複製，不等同 Runtime |
 | `vault.db` | 既有金庫資料；驗證前另做使用者備份，切勿刪除或重建 |
 | `vault_cli.exe` | 選用 CLI；保留 raw CTAP 診斷路徑，本次部署未替換 |
+
+### 跨機搬移前置條件與啟動排錯
+
+- **不能只複製 EXE 與 DB。**目標資料夾須一起攜帶 `portable-fido-vault.exe`、同版 x64 `WebView2Loader.dll` 與原 `vault.db`；有 `vault.db.failures` 時一併備份／複製，保留未合併失敗軌跡。
+- 目標機須有 **WebView2 Runtime**；Windows 11／Edge 已安裝不代替可用性檢查。DLL 與 Runtime 是不同元件，互不取代；缺少 Runtime 的離線電腦可用微軟官方 x64 Evergreen Standalone Installer。官方依據與打包範例見 README 的 portable 部署章節。
+- 在來源機正常關閉 GUI／CLI 後先另做備份，複製至**全新**且可寫入的目的資料夾；不可覆寫目的機另一份金庫。啟動前核對 EXE／DLL／DB 來源與目的 SHA-256，保留來源與備份；登入可能寫入 audit，不用登入後的 DB hash 判斷傳輸是否一致。
+- 遇到「找不到 `WebView2Loader.dll`」：從可信任同版 x64 套件補到 EXE 旁；**不要刪除、覆寫或重建 DB，也不要重新註冊／移除金鑰**。搬移舊 DB 卻顯示首次建立帳號時立即停止，核對該 EXE 同目錄的 `vault.db`。
+- 硬體版 GUI 仍要求 Windows WebAuthn API v4+ 與目標機**本機 Console**；不以 RDP／WinRM 取代驗證。mock Gate 8、PE import 或 DLL 載入檢查不代表實體 GUI 跨機解鎖 PASS；目前沒有該跨機人工 PASS 回報，本次只更新說明，未再部署或操作金庫。
 
 > 2026-10-01 的 NB 部署已有既存 `vault.db`，當時有 3 個 key slots。A–F 是全新測試金庫的舊 Gate 流程；G4–G6 與 H1–H5 的實體驗收已完成，步驟中的槽位數僅為當時紀錄。後續部署快照見 Feature 5/7；不要把舊槽位數當作目前數量，勿建立、清空或重建現有金庫。
 
@@ -81,9 +89,9 @@ PR #3 commit `ab3d123` 的 Windows GNU Release GUI 已部署至 `C:\FidoVault\po
 - [ ] **E3** 選任一金鑰 →「以金鑰登入」→ **預期**：成功進主畫面（多支金鑰任一支皆可解鎖）
 
 ## F. Gate 8 — 可攜性直拷（舊模板，實體 GUI 跨機未回報 PASS）
-- [ ] **F1** 完全關閉 app
-- [ ] **F2** 把整個 `C:\FidoVault` 資料夾複製到別處（例：`D:\FidoVault-copy` 或 USB）
-- [ ] **F3** 到新位置雙擊 exe → 用主密碼登入 → **預期**：條目、金鑰、軌跡全都在（vault.db 隨資料夾走，免安裝免設定）
+- [ ] **F1** 正常關閉來源 GUI／CLI，另做金庫備份；不要強制終止等待金鑰驗證的程式
+- [ ] **F2** 將完整 portable 資料夾複製至全新位置（例：`D:\FidoVault-copy` 或 USB）；確認 EXE、同版 x64 `WebView2Loader.dll`、原 `vault.db` 均在同一層，有 `vault.db.failures` 時一併攜帶。啟動前核對來源／目的 EXE、DLL、DB SHA-256；不覆寫既有目的金庫
+- [ ] **F3** 先確認目標機 Runtime 可用、硬體版 GUI 的 WebAuthn API v4+／本機 Console 條件，再從新位置啟動 EXE，以原主密碼或已註冊金鑰登入 → **預期**：原條目、金鑰與軌跡可用；若變成首次建立帳號，停止並查 DB 路徑，不建立新金庫
 
 ## 舊模板回報格式（保留參考，不要求重跑已確認項目）
 ```
