@@ -1,8 +1,11 @@
 //! Tauri 後端：VaultState（Mutex 包解鎖中的 Vault）＋ commands。
 //! 前端純靜態（src/），透過 window.__TAURI__.core.invoke 呼叫。
 
+use sha2::{Digest, Sha256};
 use std::sync::Mutex;
 use tauri::Manager;
+use tauri_plugin_dialog::DialogExt;
+use zeroize::Zeroizing;
 
 #[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -17,12 +20,13 @@ use crate::fido2::RealBackend;
 use crate::windows_webauthn::WindowsWebAuthnBackend;
 
 pub mod crypto;
+pub mod csv_import;
 #[cfg(feature = "real-ctap")]
 pub mod diag_log;
 pub mod fido2;
+pub mod vault;
 #[cfg(all(windows, feature = "real-ctap"))]
 mod windows_webauthn;
-pub mod vault;
 
 pub type Result<T> = std::result::Result<T, String>;
 
@@ -220,9 +224,35 @@ fn make_backend(window_handle: isize) -> Result<Box<dyn fido2::FidoBackend>> {
 
 struct VaultState(Mutex<AppInner>);
 
+struct PendingCsvImport {
+    token: String,
+    parsed: csv_import::ParsedCsvImport,
+    entries_fingerprint: [u8; 32],
+}
+
+#[derive(serde::Serialize)]
+struct CsvImportPreviewResponse {
+    token: String,
+    preview: csv_import::ImportPreview,
+}
+
 struct AppInner {
     vault: Option<vault::Vault>,
     backend: Box<dyn fido2::FidoBackend>,
+    pending_csv_import: Option<PendingCsvImport>,
+}
+
+fn entries_fingerprint(entries: &[vault::Entry]) -> Result<[u8; 32]> {
+    let serialized =
+        Zeroizing::new(serde_json::to_vec(entries).map_err(|_| "無法建立匯入預覽".to_string())?);
+    Ok(Sha256::digest(serialized.as_slice()).into())
+}
+
+fn new_csv_import_token() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 impl AppInner {
@@ -230,6 +260,7 @@ impl AppInner {
         Ok(Self {
             vault: None,
             backend: make_backend(window_handle)?,
+            pending_csv_import: None,
         })
     }
 }
@@ -261,8 +292,14 @@ fn ensure_parent_window_ready(
     }
 }
 
-/// Restore and activate the live top-level HWND before entering the blocking
-/// Windows WebAuthn call.
+fn restore_window_if_minimized(is_minimized: bool, restore: impl FnOnce()) {
+    if is_minimized {
+        restore();
+    }
+}
+
+/// Activate the live top-level HWND before entering the blocking Windows
+/// WebAuthn call, restoring it only when it is minimized so maximized state is preserved.
 fn raise_key_operation_window(
     window: &tauri::WebviewWindow,
     require_foreground: bool,
@@ -292,7 +329,10 @@ fn raise_key_operation_window(
         }
 
         let foreground_before = unsafe { GetForegroundWindow() };
-        unsafe { ShowWindow(hwnd.0, SW_RESTORE) };
+        let minimized_before = unsafe { IsIconic(hwnd.0) != 0 };
+        restore_window_if_minimized(minimized_before, || unsafe {
+            ShowWindow(hwnd.0, SW_RESTORE);
+        });
         let set_foreground = unsafe { SetForegroundWindow(hwnd.0) != 0 };
         let foreground_after = unsafe { GetForegroundWindow() };
         let visible = unsafe { IsWindowVisible(hwnd.0) != 0 };
@@ -451,14 +491,17 @@ fn lock(state: tauri::State<VaultState>, reason: Option<String>) -> Result<Login
     let (header, brokered_key_login) = state.with_lock(|g| {
         let brokered_key_login = g.backend.uses_brokered_key_selection();
         match g.vault.take() {
-            Some(v) => Ok((
-                if reason.as_deref() == Some("idle") {
-                    v.auto_lock()
-                } else {
-                    v.lock()
-                },
-                brokered_key_login,
-            )),
+            Some(v) => {
+                g.pending_csv_import = None;
+                Ok((
+                    if reason.as_deref() == Some("idle") {
+                        v.auto_lock()
+                    } else {
+                        v.lock()
+                    },
+                    brokered_key_login,
+                ))
+            }
             None => Err("尚未解鎖".to_string()),
         }
     })?;
@@ -480,6 +523,111 @@ fn with_unlocked<R>(state: &VaultState, f: impl FnOnce(&mut vault::Vault) -> Res
 #[tauri::command]
 fn list_entries(state: tauri::State<VaultState>) -> Result<Vec<vault::Entry>> {
     with_unlocked(&state, |v| Ok(v.entries().to_vec()))
+}
+
+#[tauri::command]
+async fn preview_csv_import(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, VaultState>,
+) -> Result<Option<CsvImportPreviewResponse>> {
+    let selected = app
+        .dialog()
+        .file()
+        .set_parent(&window)
+        .add_filter("CSV", &["csv"])
+        .blocking_pick_file();
+    let Some(selected) = selected else {
+        return Ok(None);
+    };
+    let path = selected
+        .into_path()
+        .map_err(|_| "選擇的 CSV 路徑無效".to_string())?;
+    let bytes = Zeroizing::new(std::fs::read(path).map_err(|_| "無法讀取 CSV 檔案".to_string())?);
+    let text =
+        std::str::from_utf8(bytes.as_slice()).map_err(|_| "CSV 必須使用 UTF-8 編碼".to_string())?;
+    let parsed = csv_import::parse_import_csv(text)?;
+
+    state.with_lock(|inner| {
+        let vault = inner
+            .vault
+            .as_ref()
+            .ok_or_else(|| "金庫未解鎖".to_string())?;
+        let preview = csv_import::build_import_plan(vault.entries(), parsed.clone()).preview;
+        let token = new_csv_import_token();
+        inner.pending_csv_import = Some(PendingCsvImport {
+            token: token.clone(),
+            parsed,
+            entries_fingerprint: entries_fingerprint(vault.entries())?,
+        });
+        Ok(Some(CsvImportPreviewResponse { token, preview }))
+    })
+}
+
+#[tauri::command]
+async fn save_csv_template(app: tauri::AppHandle, window: tauri::WebviewWindow) -> Result<bool> {
+    let selected = app
+        .dialog()
+        .file()
+        .set_parent(&window)
+        .set_file_name("fido-vault-template.csv")
+        .add_filter("CSV", &["csv"])
+        .blocking_save_file();
+    let Some(selected) = selected else {
+        return Ok(false);
+    };
+    let path = selected
+        .into_path()
+        .map_err(|_| "選擇的 CSV 路徑無效".to_string())?;
+    std::fs::write(path, csv_import::CSV_TEMPLATE.as_bytes())
+        .map_err(|_| "無法儲存 CSV 範本".to_string())?;
+    Ok(true)
+}
+
+#[tauri::command]
+fn cancel_csv_import(state: tauri::State<VaultState>, token: String) -> Result<()> {
+    state.with_lock(|inner| {
+        if inner
+            .pending_csv_import
+            .as_ref()
+            .is_some_and(|pending| pending.token == token)
+        {
+            inner.pending_csv_import = None;
+        }
+        Ok(())
+    })
+}
+
+#[tauri::command]
+fn apply_csv_import(
+    state: tauri::State<VaultState>,
+    token: String,
+) -> Result<csv_import::ImportPreview> {
+    state.with_lock(|inner| {
+        let (parsed, expected_fingerprint) = inner
+            .pending_csv_import
+            .as_ref()
+            .filter(|pending| pending.token == token)
+            .map(|pending| (pending.parsed.clone(), pending.entries_fingerprint))
+            .ok_or_else(|| "匯入預覽已失效，請重新選擇檔案".to_string())?;
+        let vault = inner
+            .vault
+            .as_ref()
+            .ok_or_else(|| "金庫未解鎖".to_string())?;
+        if entries_fingerprint(vault.entries())? != expected_fingerprint {
+            inner.pending_csv_import = None;
+            return Err("金庫條目已變更，請重新預覽 CSV".into());
+        }
+        let plan = csv_import::build_import_plan(vault.entries(), parsed);
+        let preview = inner
+            .vault
+            .as_mut()
+            .expect("vault was checked above")
+            .import_entries(&plan)
+            .map_err(|error| error.to_string())?;
+        inner.pending_csv_import = None;
+        Ok(preview)
+    })
 }
 
 #[tauri::command]
@@ -632,6 +780,7 @@ pub fn run() {
     diag_log::init();
     tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             #[cfg(windows)]
             let window_handle = app
@@ -659,6 +808,10 @@ pub fn run() {
             login_any_key,
             lock,
             list_entries,
+            preview_csv_import,
+            save_csv_template,
+            cancel_csv_import,
+            apply_csv_import,
             add_entry,
             update_entry,
             delete_entry,
@@ -745,7 +898,19 @@ mod backend_mode_tests {
 
 #[cfg(test)]
 mod focus_window_tests {
-    use super::ensure_parent_window_ready;
+    use super::{ensure_parent_window_ready, restore_window_if_minimized};
+
+    #[test]
+    fn key_operation_activation_only_restores_a_minimized_window() {
+        let mut restore_calls = 0;
+
+        // A maximized window is not minimized and must keep its maximized state.
+        restore_window_if_minimized(false, || restore_calls += 1);
+        assert_eq!(restore_calls, 0);
+
+        restore_window_if_minimized(true, || restore_calls += 1);
+        assert_eq!(restore_calls, 1);
+    }
 
     #[test]
     fn key_operation_requires_a_visible_unminimized_foreground_parent() {

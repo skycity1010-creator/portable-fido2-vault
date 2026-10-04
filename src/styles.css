@@ -129,6 +129,10 @@ button.primary:hover { background: var(--accent-hi); }
 .row input { flex: 1; }
 .row button { width: auto; margin-top: 0; }
 
+.entry-search { max-width: 540px; margin: 16px 0; }
+.entry-search label { display: block; margin-bottom: 6px; color: var(--muted); font-size: 13px; }
+#entry-search-status { min-height: 18px; margin-top: 5px; }
+
 .password-input { position: relative; flex: 1; min-width: 0; }
 .password-input input { width: 100%; padding-right: 42px; }
 .password-toggle {
@@ -203,4 +207,31 @@ td .mono { font-family: Consolas, monospace; color: var(--muted); }
 #key-name-dialog .row { justify-content: flex-end; margin-bottom: 0; }
 #key-name-dialog .row button.primary { width: auto; margin: 0; }
 #key-name-dialog .error { min-height: 18px; }
+#key-name-input[aria-invalid="true"] { border-color: var(--danger); }
+
+.csv-import-actions { justify-content: flex-end; flex-wrap: wrap; }
+.csv-import-actions .csv-import-button { width: auto; margin-top: 0; }
+.csv-import-warning { margin: 0 0 8px; }
+#csv-import-status { min-height: 18px; margin: 4px 0; }
+#csv-import-dialog {
+  width: min(680px, calc(100vw - 32px));
+  max-height: min(80vh, 720px);
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 22px;
+  background: var(--panel);
+  color: var(--text);
+  box-shadow: 0 20px 60px rgba(0, 0, 0, .55);
+}
+#csv-import-dialog::backdrop { background: rgba(4, 8, 16, .72); }
+#csv-import-dialog h2 { margin: 0 0 8px; font-size: 18px; }
+#csv-import-dialog p { line-height: 1.5; }
+#csv-import-summary { margin: 12px 0; font-weight: 600; }
+.csv-import-table-wrap { max-height: 42vh; overflow: auto; }
+#csv-import-table { margin-top: 0; }
+.csv-import-dialog-actions { justify-content: flex-end; margin-bottom: 0; }
+.csv-import-dialog-actions button.primary { width: auto; margin-top: 0; }
+.csv-import-dialog-actions button:disabled { opacity: .65; cursor: wait; }
+
 #key-name-input[aria-invalid="true"] { border-color: var(--danger); }
