@@ -325,9 +325,7 @@ impl AuthenticatorService {
         &mut self,
         timeout: u64,
         status: Sender<crate::StatusUpdate>,
-        callback: StateCallback<
-            crate::Result<crate::ctap2::commands::get_info::AuthenticatorInfo>,
-        >,
+        callback: StateCallback<crate::Result<crate::ctap2::commands::get_info::AuthenticatorInfo>>,
     ) -> crate::Result<()> {
         let iterable_transports = self.transports.clone();
         if iterable_transports.is_empty() {

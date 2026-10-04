@@ -169,9 +169,9 @@ cargo +stable-x86_64-pc-windows-gnu build --release --features real-ctap --bin p
 | 5 | CSV 範本、批次匯入／更新 | ✅ 2026-10-03 全項 PASS（PR #13；§12） |
 | 6 | 條目即時搜尋 | ✅ 2026-10-03 明確 PASS（PR #14；§13） |
 | 7 | 預設最大化與金鑰登入期間維持最大化 | ✅ 2026-10-03 明確 PASS（PR #15 修正版；§14） |
-| 修正 | 主畫面條目刪除確認（PR #17） | ✅ 使用者明確確認 D1–D5 PASS；D6 未測，授權收尾及合併 |
+| 修正 | 主畫面條目刪除確認（PR #17） | ✅ 使用者明確確認 D1–D5 PASS；D6 已免測、不列待辦（歷史 NOT_TESTED 非 PASS） |
 
-先前 PR #13/#14/#15 均已合併，當時 8 張 `[FidoVault]` Kanban 卡已完成；新增刪除確認任務 `t_7001952b` 的使用者結果為 D1–D5 PASS、D6 未測，已授權收尾及合併，實際狀態以 PR #17／該卡片讀回為準。驗收、PR 合併與任務完成不等同所有舊模板都逐項人工 PASS：`user-verification-steps.md` 的 A–C/E/F 保留未勾選，D5 為未回報的選測；Gate 8 仍僅有上述 mock 證據。RDP 為不支援、raw CTAP CLI 實體路線為已退役／由 GUI 驗收取代（superseded），均不是待驗項。
+先前 PR #13/#14/#15 均已合併，當時 8 張 `[FidoVault]` Kanban 卡已完成；新增刪除確認任務 `t_7001952b` 的使用者結果為 D1–D5 PASS，D6 歷史未測、目前已免測且排除待辦，已授權收尾及合併，實際狀態以 PR #17／該卡片讀回為準。驗收、PR 合併與任務完成不等同所有舊模板都逐項人工 PASS：`user-verification-steps.md` 的 A–C/E/F 保留未勾選，D5 為未回報的選測；Gate 8 仍僅有上述 mock 證據。RDP 為不支援、raw CTAP CLI 實體路線為已退役／由 GUI 驗收取代（superseded），均不是待驗項。
 
 ## 9. 2026-09-29 Win11-NB log 問題：根因與修復
 
@@ -239,6 +239,8 @@ cargo +stable-x86_64-pc-windows-gnu build --release --features real-ctap --bin p
 - 當時部署前備份目錄 `C:\FidoVault\backups\key-login-maximized-20261003-1bf77fd`；舊 GUI SHA-256 `a874a96026e1c2a6baa7857a9fe3c7b564758347f2458aba5bd254ddd70e2092`，vault SHA-256 `35b669a0c720314ccb9f602faa89b7e8b5adf82d09f1c43831f40f5968fdf1a1`。當時部署後 GUI hash 相符、vault hash 不變、header 有效且有 1 個 key slot；無相關程序、持久 authenticator override 或傳輸暫存檔，WinRM 未啟動 GUI。較早部署與備份紀錄保留於使用者驗收文件，不把歷史 3-slot 快照當作本次槽位數。
 
 ## 主畫面條目刪除確認 — 使用者驗收與收尾授權（PR #17）
+
+目前裁決（使用者 message `1556265625158946837`）：D6 已免測、不再要求執行，排除於目前待辦；歷史 NOT_TESTED 不改為 PASS，D1–D5 既有結果維持。
 
 - 使用者明確回報：「D1~5通過，D6未測，進行收尾和合併」（Discord message `1556211623264522241`）。D1–D5 為 PASS；D6 保留未測，不因收尾或合併補勾。
 - Codex 實作與兩次獨立審查／修正紀錄、15 個刪除專項／53 個完整 Node 測試及 8 個隔離 Edge 合成 smoke 的證據見 `docs/reports/entry-delete-confirmation-verification.md`；自動化錯誤路徑覆蓋不等於 D6 實機通過。

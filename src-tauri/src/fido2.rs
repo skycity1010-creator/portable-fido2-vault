@@ -320,7 +320,11 @@ impl FidoBackend for MockBackend {
         })
     }
 
-    fn register_credential(&mut self, detected: &DetectedKey, _pin: Option<&str>) -> Result<RegisteredCredential, FidoError> {
+    fn register_credential(
+        &mut self,
+        detected: &DetectedKey,
+        _pin: Option<&str>,
+    ) -> Result<RegisteredCredential, FidoError> {
         Ok(RegisteredCredential {
             credential_id: Self::make_credential_id(detected.kind),
             aaguid: detected.aaguid,
@@ -329,7 +333,11 @@ impl FidoBackend for MockBackend {
         })
     }
 
-    fn get_prf_secret(&mut self, credential_id: &[u8], pin: Option<&str>) -> Result<[u8; 32], FidoError> {
+    fn get_prf_secret(
+        &mut self,
+        credential_id: &[u8],
+        pin: Option<&str>,
+    ) -> Result<[u8; 32], FidoError> {
         if credential_id.is_empty() {
             return Err(FidoError::Internal("credential_id 為空".into()));
         }
@@ -340,7 +348,8 @@ impl FidoBackend for MockBackend {
 
     fn peek_kind(&self) -> KeyKind {
         // 與 detect() 的取值邏輯一致（override 優先，否則循環）→ UI 預覽不偏。
-        self.next_kind_override.unwrap_or_else(|| KeyKind::from_u8((self.detect_count % 3) as u8))
+        self.next_kind_override
+            .unwrap_or_else(|| KeyKind::from_u8((self.detect_count % 3) as u8))
     }
 
     fn prf_supported(&self) -> bool {
@@ -379,16 +388,16 @@ fn mock_aaguid(n: u32) -> [u8; 16] {
 mod real {
     use super::*;
     use authenticator::authenticatorservice::{AuthenticatorService, RegisterArgs, SignArgs};
+    use authenticator::crypto::COSEAlgorithm;
     use authenticator::ctap2::commands::client_pin::Pin;
     use authenticator::ctap2::commands::get_info::AuthenticatorInfo;
-    use authenticator::{BioEnrollmentCmd, BioEnrollmentResult};
     use authenticator::ctap2::server::{
         AuthenticationExtensionsClientInputs, HMACGetSecretInput, PublicKeyCredentialDescriptor,
         PublicKeyCredentialParameters, PublicKeyCredentialUserEntity, RelyingParty,
         ResidentKeyRequirement, UserVerificationRequirement,
     };
-    use authenticator::crypto::COSEAlgorithm;
     use authenticator::statecallback::StateCallback;
+    use authenticator::{BioEnrollmentCmd, BioEnrollmentResult};
     use sha2::{Digest, Sha256};
     use std::sync::mpsc::channel;
     use std::sync::{Arc, Mutex};
@@ -427,12 +436,18 @@ mod real {
             // Init/GetInfo cleanly; the full-scan was the failure. See
             // vendor authenticator-rs `device_filter`.
             authenticator::device_filter::set_target_devices(&[(0x1050, 0)]);
-            Self { service, info: None }
+            Self {
+                service,
+                info: None,
+            }
         }
 
         /// 以既有 AuthenticatorService 建立（測試用：可注入 mock transport）。
         pub fn with_service(service: AuthenticatorService) -> Self {
-            Self { service, info: None }
+            Self {
+                service,
+                info: None,
+            }
         }
 
         /// 同步橋：authenticator-rs 是「callback + status channel」非同步模型；此處以
@@ -526,8 +541,11 @@ mod real {
             use std::sync::atomic::{AtomicBool, Ordering};
 
             let (status_tx, status_rx) = channel::<authenticator::StatusUpdate>();
-            let result: Arc<Mutex<Option<Result<BioEnrollmentResult, authenticator::errors::AuthenticatorError>>>> =
-                Arc::new(Mutex::new(None));
+            let result: Arc<
+                Mutex<
+                    Option<Result<BioEnrollmentResult, authenticator::errors::AuthenticatorError>>,
+                >,
+            > = Arc::new(Mutex::new(None));
             let done = Arc::new(AtomicBool::new(false));
 
             // 泵執行緒：處理互動兩階段 + PIN 要求（drop sender → 函式庫中止，不 hang）。
@@ -540,11 +558,12 @@ mod real {
                                 InteractiveUpdate::StartManagement((tx, _info)),
                             ) => {
                                 // 每個 transport 一個 session → 逐一回覆 probe。
-                                if tx.send(InteractiveRequest::BioEnrollment(
-                                    BioEnrollmentCmd::GetFingerprintSensorInfo,
-                                    None,
-                                ))
-                                .is_err()
+                                if tx
+                                    .send(InteractiveRequest::BioEnrollment(
+                                        BioEnrollmentCmd::GetFingerprintSensorInfo,
+                                        None,
+                                    ))
+                                    .is_err()
                                 {
                                     break;
                                 }
@@ -576,7 +595,11 @@ mod real {
                 }
             }));
 
-            if self.service.manage(DETECT_TIMEOUT_MS, status_tx, cb).is_err() {
+            if self
+                .service
+                .manage(DETECT_TIMEOUT_MS, status_tx, cb)
+                .is_err()
+            {
                 return false; // 無 transport / 非同步錯誤
             }
             // 阻塞直到結果或 callback（transaction timeout 兜底 → 不超過 DETECT_TIMEOUT_MS）。
@@ -596,12 +619,19 @@ mod real {
                     true
                 }
                 other => {
-                    let desc = other.as_ref().map(|r| match r {
-                        Ok(BioEnrollmentResult::FingerprintSensorInfo(_)) => "sensor-info".to_string(),
-                        Ok(BioEnrollmentResult::EnrollmentList(v)) => format!("enroll-list({})", v.len()),
-                        Ok(_) => "other-result".to_string(),
-                        Err(e) => format!("err: {e:?}"),
-                    }).unwrap_or_else(|| "no-result".to_string());
+                    let desc = other
+                        .as_ref()
+                        .map(|r| match r {
+                            Ok(BioEnrollmentResult::FingerprintSensorInfo(_)) => {
+                                "sensor-info".to_string()
+                            }
+                            Ok(BioEnrollmentResult::EnrollmentList(v)) => {
+                                format!("enroll-list({})", v.len())
+                            }
+                            Ok(_) => "other-result".to_string(),
+                            Err(e) => format!("err: {e:?}"),
+                        })
+                        .unwrap_or_else(|| "no-result".to_string());
                     eprintln!("[fido2] getBioEnrollment 0x09 probe 未取得感測器資訊（{desc}）→ 依 getInfo flag 分類");
                     false
                 }
@@ -616,8 +646,11 @@ mod real {
             use std::sync::atomic::{AtomicBool, Ordering};
 
             let (status_tx, status_rx) = channel::<authenticator::StatusUpdate>();
-            let result: Arc<Mutex<Option<Result<BioEnrollmentResult, authenticator::errors::AuthenticatorError>>>> =
-                Arc::new(Mutex::new(None));
+            let result: Arc<
+                Mutex<
+                    Option<Result<BioEnrollmentResult, authenticator::errors::AuthenticatorError>>,
+                >,
+            > = Arc::new(Mutex::new(None));
             let done = Arc::new(AtomicBool::new(false));
 
             {
@@ -628,11 +661,12 @@ mod real {
                             authenticator::StatusUpdate::InteractiveManagement(
                                 InteractiveUpdate::StartManagement((tx, _info)),
                             ) => {
-                                if tx.send(InteractiveRequest::BioEnrollment(
-                                    BioEnrollmentCmd::GetEnrollments,
-                                    None,
-                                ))
-                                .is_err()
+                                if tx
+                                    .send(InteractiveRequest::BioEnrollment(
+                                        BioEnrollmentCmd::GetEnrollments,
+                                        None,
+                                    ))
+                                    .is_err()
                                 {
                                     break;
                                 }
@@ -664,7 +698,11 @@ mod real {
                 }
             }));
 
-            if self.service.manage(DETECT_TIMEOUT_MS, status_tx, cb).is_err() {
+            if self
+                .service
+                .manage(DETECT_TIMEOUT_MS, status_tx, cb)
+                .is_err()
+            {
                 return None; // 無 transport / 非同步錯誤
             }
             while !done.load(Ordering::SeqCst) {
@@ -698,7 +736,11 @@ mod real {
         }
 
         /// makeCredential（resident + hmac-secret create）。PIN 型金鑰需 pin。
-        fn do_register(&mut self, detected: &DetectedKey, pin: Option<&str>) -> Result<RegisteredCredential, FidoError> {
+        fn do_register(
+            &mut self,
+            detected: &DetectedKey,
+            pin: Option<&str>,
+        ) -> Result<RegisteredCredential, FidoError> {
             let args = RegisterArgs {
                 client_data_hash: Self::op_client_data_hash(b"register"),
                 relying_party: RelyingParty::from(RP_ID),
@@ -708,7 +750,9 @@ mod real {
                     name: Some("vault-user".to_string()),
                     display_name: None,
                 },
-                pub_cred_params: vec![PublicKeyCredentialParameters { alg: COSEAlgorithm::ES256 }],
+                pub_cred_params: vec![PublicKeyCredentialParameters {
+                    alg: COSEAlgorithm::ES256,
+                }],
                 exclude_list: vec![],
                 user_verification_req: UserVerificationRequirement::Preferred,
                 resident_key_req: ResidentKeyRequirement::Preferred,
@@ -726,9 +770,14 @@ mod real {
             })?;
 
             // credential_id 來自 att_obj.auth_data.credential_data。
-            let cred = res.att_obj.auth_data.credential_data.as_ref().ok_or_else(|| {
-                FidoError::Internal("makeCredential 未回傳 credential data".into())
-            })?;
+            let cred = res
+                .att_obj
+                .auth_data
+                .credential_data
+                .as_ref()
+                .ok_or_else(|| {
+                    FidoError::Internal("makeCredential 未回傳 credential data".into())
+                })?;
             Ok(RegisteredCredential {
                 credential_id: cred.credential_id.clone(),
                 aaguid: cred.aaguid.0,
@@ -906,12 +955,20 @@ mod real {
             })
         }
 
-        fn register_credential(&mut self, detected: &DetectedKey, pin: Option<&str>) -> Result<RegisteredCredential, FidoError> {
+        fn register_credential(
+            &mut self,
+            detected: &DetectedKey,
+            pin: Option<&str>,
+        ) -> Result<RegisteredCredential, FidoError> {
             // contention-aware retry：makeCredential 前 device open 被拒 → backoff 重試。
             self.retry_on_contention("register", |b: &mut Self| b.do_register(detected, pin))
         }
 
-        fn get_prf_secret(&mut self, credential_id: &[u8], pin: Option<&str>) -> Result<[u8; 32], FidoError> {
+        fn get_prf_secret(
+            &mut self,
+            credential_id: &[u8],
+            pin: Option<&str>,
+        ) -> Result<[u8; 32], FidoError> {
             if credential_id.is_empty() {
                 return Err(FidoError::Internal("credential_id 為空".into()));
             }
@@ -1014,14 +1071,20 @@ mod real {
         use authenticator::ctap2::commands::get_info::{AuthenticatorInfo, AuthenticatorOptions};
 
         fn info_with(opts: AuthenticatorOptions) -> AuthenticatorInfo {
-            AuthenticatorInfo { options: opts, ..Default::default() }
+            AuthenticatorInfo {
+                options: opts,
+                ..Default::default()
+            }
         }
 
         /// YubiKey 5 系列：無 clientPin、無 bioEnroll → touch-only（PM 預先提醒的預期結果）。
         #[test]
         fn real_kind_touch_only_yubikey5_profile() {
             let o = AuthenticatorOptions::default();
-            assert_eq!(RealBackend::kind_from_info(&info_with(o)), KeyKind::TouchOnly);
+            assert_eq!(
+                RealBackend::kind_from_info(&info_with(o)),
+                KeyKind::TouchOnly
+            );
         }
 
         /// 指紋優先於 PIN（YubiKey Bio：兩者皆有）。
@@ -1030,7 +1093,10 @@ mod real {
             let mut o = AuthenticatorOptions::default();
             o.bio_enroll = Some(true);
             o.client_pin = Some(true);
-            assert_eq!(RealBackend::kind_from_info(&info_with(o)), KeyKind::Fingerprint);
+            assert_eq!(
+                RealBackend::kind_from_info(&info_with(o)),
+                KeyKind::Fingerprint
+            );
         }
 
         /// YubiKey Bio（PM 回報的實際型號）：bioEnroll=true + clientPin=absent → Fingerprint。
@@ -1043,7 +1109,10 @@ mod real {
                 user_verification: Some(true),
                 ..Default::default()
             };
-            assert_eq!(RealBackend::kind_from_info(&info_with(o)), KeyKind::Fingerprint);
+            assert_eq!(
+                RealBackend::kind_from_info(&info_with(o)),
+                KeyKind::Fingerprint
+            );
         }
 
         /// 有 clientPin（含「已支援但未設定」=Some(false)）→ PIN 型。
@@ -1101,8 +1170,14 @@ mod tests {
     #[test]
     fn mock_prf_deterministic() {
         let id = vec![0u8, 2, 3, 4];
-        assert_eq!(MockBackend::prf_for_credential(&id), MockBackend::prf_for_credential(&id));
-        assert_ne!(MockBackend::prf_for_credential(&id), MockBackend::prf_for_credential(&[0, 9]));
+        assert_eq!(
+            MockBackend::prf_for_credential(&id),
+            MockBackend::prf_for_credential(&id)
+        );
+        assert_ne!(
+            MockBackend::prf_for_credential(&id),
+            MockBackend::prf_for_credential(&[0, 9])
+        );
     }
 
     #[test]
@@ -1135,9 +1210,17 @@ mod tests {
         assert_eq!(d2.kind, KeyKind::Pin);
         let reg2 = b2.register_credential(&d2, None).unwrap();
         let mut fresh = MockBackend::new(); // 模擬重啟
-        assert!(matches!(fresh.get_prf_secret(&reg2.credential_id, None), Err(FidoError::PinRequired(_))));
-        assert!(matches!(fresh.get_prf_secret(&reg2.credential_id, Some("12")), Err(FidoError::PinRejected)));
-        let s = fresh.get_prf_secret(&reg2.credential_id, Some("1234")).unwrap();
+        assert!(matches!(
+            fresh.get_prf_secret(&reg2.credential_id, None),
+            Err(FidoError::PinRequired(_))
+        ));
+        assert!(matches!(
+            fresh.get_prf_secret(&reg2.credential_id, Some("12")),
+            Err(FidoError::PinRejected)
+        ));
+        let s = fresh
+            .get_prf_secret(&reg2.credential_id, Some("1234"))
+            .unwrap();
         assert_eq!(s, MockBackend::prf_for_credential(&reg2.credential_id));
     }
 

@@ -47,9 +47,7 @@ enum QueueAction {
     GetInfo {
         timeout: u64,
         status: Sender<crate::StatusUpdate>,
-        callback: StateCallback<
-            crate::Result<crate::ctap2::commands::get_info::AuthenticatorInfo>,
-        >,
+        callback: StateCallback<crate::Result<crate::ctap2::commands::get_info::AuthenticatorInfo>>,
     },
 }
 
@@ -238,9 +236,7 @@ impl AuthenticatorTransport for Manager {
         &mut self,
         timeout: u64,
         status: Sender<crate::StatusUpdate>,
-        callback: StateCallback<
-            crate::Result<crate::ctap2::commands::get_info::AuthenticatorInfo>,
-        >,
+        callback: StateCallback<crate::Result<crate::ctap2::commands::get_info::AuthenticatorInfo>>,
     ) -> Result<(), AuthenticatorError> {
         Ok(self.tx.send(QueueAction::GetInfo {
             timeout,
