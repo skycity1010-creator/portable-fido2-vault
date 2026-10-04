@@ -181,6 +181,18 @@
     </div>
   </dialog>
 
+  <dialog id="entry-delete-dialog" aria-labelledby="entry-delete-title" aria-describedby="entry-delete-description entry-delete-status">
+    <h2 id="entry-delete-title">確認刪除條目</h2>
+    <p id="entry-delete-description" class="warn">刪除後不可復原。請確認網站與帳號。</p>
+    <p>網站：<span id="entry-delete-site"></span></p>
+    <p>帳號：<span id="entry-delete-account"></span></p>
+    <div id="entry-delete-status" role="status" aria-live="polite"></div>
+    <div class="row">
+      <button id="btn-cancel-entry-delete" type="button" autofocus>取消</button>
+      <button id="btn-confirm-entry-delete" type="button">確認刪除</button>
+    </div>
+  </dialog>
+  <div id="entry-delete-result" role="status" aria-live="polite"></div>
   <script src="app.js"></script>
 </body>
 </html>
