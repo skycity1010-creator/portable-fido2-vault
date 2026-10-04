@@ -1,13 +1,13 @@
 # 可攜式 FIDO2 密碼金庫 v0.1 — 技術規格書
 
 > 專案：`portable-fido2-vault`｜卡：t_31e9ef5e｜語言介面：繁體中文
-> 目標平台：Windows 10/11 x64（WebView2 內建於 Win11）
+> 目標平台：Windows 10/11 x64；目標機須確認 WebView2 Runtime 可用，硬體版 GUI 需 Windows WebAuthn API v4+ 及本機 Console。Windows 11／Edge 已安裝不代替 Runtime 檢查。
 
 ## 1. 目標 / 非目標
 
 **目標**
 - Windows 桌面 App，完全離線（零網路呼叫；Tauri 不啟用任何 http 插件）。
-- 可攜：單一資料夾 `exe + vault.db`，複製到別台電腦免安裝即可執行。
+- 可攜：GUI EXE、同一發行套件的 x64 `WebView2Loader.dll` 與既有 `vault.db` 同資料夾攜帶；目標機另須 WebView2 Runtime。免安裝本程式，不代表無系統 prerequisites；Loader 與 Runtime 不可互相取代。既有金庫須正常關閉後備份／搬移，不刪除或重建 DB；完整程序見 README 的 portable 部署章節。
 - 首次執行建立帳號（主密碼）；之後**主密碼或任一支已註冊 FIDO2 金鑰**皆可登入（允許多支）。
 - 金鑰類型自動偵測：指紋型 / PIN 型 / touch-only；登入時依類型給正確提示。
 - 加密儲存：Argon2id + AES-256-GCM，整個金庫加密為單一檔案。

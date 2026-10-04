@@ -1,7 +1,7 @@
 # 可攜式 FIDO2 密碼金庫（portable-fido2-vault）v0.1
 
 Windows 桌面、**完全離線**、**portable 免安裝**的 FIDO2 密碼金庫。
-單一資料夾（`portable-fido-vault.exe + vault.db`）複製到任何 Windows 電腦即可使用。
+可攜資料夾須包含 `portable-fido-vault.exe`、同版 x64 `WebView2Loader.dll` 與既有 `vault.db`；目標電腦另須具備 WebView2 Runtime，硬體版 GUI 需 Windows WebAuthn API v4+。**免安裝本程式，不代表目標電腦不需要系統執行環境。**
 
 - 首次執行建立帳號：主密碼經 **Argon2id** 派生金鑰
 - 之後**主密碼或任一支已註冊 FIDO2 金鑰**皆可登入（允許多支）
@@ -35,14 +35,14 @@ portable-fido2-vault/
 前置：
 - Rust stable + **GNU toolchain**（`rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal`；本機無 MSVC/VS，走 GNU 免 UAC）。
 - **dlltool.exe**（Rust GNU toolchain 不自帶 binutils）：下載 [winlibs-mingw](https://github.com/brechtsanders/winlibs_mingw/releases) x86_64-posix-seh zip，把其 `bin/` 加進 PATH。
-- WebView2（Win11 內建）。
+- WebView2 Runtime（建置機與目標電腦均需確認）；Windows 11 通常已具備，仍不可跳過檢查。GUI 打包時另須帶上同次建置輸出的 x64 `WebView2Loader.dll`。[1]
 
 ```bash
 # bash / git-bash（WS2）
 export PATH="$HOME/.cargo/bin:$HOME/tools/winlibs-x86_64-posix-seh-gcc-14.2.0-mingw-w64ucrt-12.0.0-r2/bin:$PATH"
 cd C:/project/portable-fido2-vault/src-tauri
 cargo +stable-x86_64-pc-windows-gnu build --release --features real-ctap --bin portable-fido-vault
-# 產出硬體版 GUI；target/release/portable-fido-vault.exe
+# 產出硬體版 GUI；打包須取 target/release/portable-fido-vault.exe 及同目錄 WebView2Loader.dll
 ```
 
 Windows Release GUI（`real-ctap`）從檔案總管啟動時使用 Windows WebAuthn API；PIN、指紋與觸碰提示由 Windows 安全性視窗處理，無需設定 `F2V_AUTHENTICATOR` 或以系統管理員身分啟動。目標系統需提供 WebAuthn API v4 或更新版本。Debug 建置仍預設 MockBackend；若需在 Release 明確執行 mock 測試，可設定 `F2V_AUTHENTICATOR=mock`。未設定覆寫值且 Release 缺少 `real-ctap` 時會拒絕啟動。`vault_cli --authenticator hw` 保留 raw CTAP/HID 診斷路徑，與 GUI 使用的 Windows API 不同。
@@ -51,8 +51,7 @@ Windows Release GUI（`real-ctap`）從檔案總管啟動時使用 Windows WebAu
 
 目前**不支援從 RDP 遠端桌面 session 啟動 FidoVault，也不支援在 RDP session 中操作硬體金鑰流程**。請在目標 Windows 電腦的本機 Console session 啟動程式，並在該 session 完成 Windows 安全性提示。Win11-NB 的 RDP session 曾回報 WebAuthn API v1，低於本程式要求的 v4+；程式會 fail closed，不會為了支援 RDP 而降低版本檢查。RDP／WebAuthn redirection 不屬於目前支援的使用情境。
 
-> portable 部署：將 `target\release\portable-fido-vault.exe` 複製到任意資料夾即完成安裝；
-> 首次執行後該資料夾會多出 `vault.db`（你的金庫）。整個資料夾＝全部資產。
+> portable 部署必須一起攜帶 GUI EXE 與同版 `WebView2Loader.dll`；搬移既有金庫時，還須攜帶 EXE 同目錄的 `vault.db`。首次建立新金庫才會產生 DB；搬移舊金庫**不得刪除或重建 DB**。完整檔案清單與目標環境見下方部署說明。
 
 ## 使用流程
 
@@ -69,13 +68,62 @@ Windows Release 硬體模式以單一通用「以金鑰登入」入口呼叫 Win
 
 Win11-NB 本機 Console 已確認通用登入不需先選金鑰，Windows 安全性操作提示也出現在前景。Windows WebAuthn API v4+ 仍是硬體 GUI 的必要條件；較舊 API 版本會 fail closed。
 
-## portable 部署到別台電腦（Win11-NB）
+## portable 部署到別台電腦（含 Win11-NB）
+
+### 必須一起複製的檔案
+
+現行 Windows GUI 為 x64；既有金庫搬移時，以下三個檔案須放在**同一層資料夾**：
+
+```text
+FidoVault\
+├─ portable-fido-vault.exe   GUI 主程式（Release + real-ctap）
+├─ WebView2Loader.dll        同一發行套件／同次建置的 x64 載入器
+└─ vault.db                 使用者原本的加密金庫，不是新建的空白 DB
+```
+
+- `WebView2Loader.dll` 是應用程式旁的載入器，**不是 WebView2 Runtime**；安裝 Runtime 不能取代漏帶的 DLL，單獨補 DLL 也不能取代缺少的 Runtime。不要使用 x86/ARM64 DLL，或從不明 DLL 下載網站取檔。[1]
+- `vault_cli.exe` 是選用診斷工具，不是 GUI 啟動必備檔。若有 `vault.db.failures`，為保留尚未合併的失敗登入軌跡，請在程式關閉後一併備份／複製。
+- 舊備份與診斷紀錄不是最小啟動清單的一部分，但**不得據此刪除原資料夾其他檔案**。請保留原金庫及備份，勿把 DB、PIN、主密碼或未清理的診斷紀錄上傳到聊天或公開發行套件。
+
+### 目標電腦 prerequisites
+
+1. Windows x64，硬體版 GUI 需 Windows WebAuthn API v4+；使用目標機**本機 Console**，不使用 RDP／WinRM 操作 GUI 或金鑰。
+2. **Microsoft WebView2 Runtime** 可用。不要只因 Windows 11 或已安裝 Edge 瀏覽器就假定 Runtime 可用；若缺少，依微軟官方說明安裝 Evergreen Runtime。離線電腦可由其他電腦先下載 x64 **Evergreen Standalone Installer** 再搬入安裝；Bootstrapper 需要連網下載，不適合完全離線安裝。[1]
+3. 可寫入的本機資料夾；需要以金鑰登入時，使用原金庫已註冊的實體安全金鑰。補啟動依賴不需要重新註冊或移除金鑰。
+
+官方 Runtime 部署、離線安裝及隨附檔案說明與下載入口，見文末 Sources 的 Microsoft Learn 文件。[1]
+
+### 打包程式檔案（不包含使用者 DB）
+
+下例在 `src-tauri` 目錄執行，使用**全新**目的資料夾；若設定了 `CARGO_TARGET_DIR` 或額外的 target triple，請把 `$releaseDir` 改成該次建置的實際 Release 輸出位置。不可混用舊 EXE 與別次建置的 DLL。
 
 ```powershell
-# 本機打包
-Copy-Item target\release\portable-fido-vault.exe C:\deploy\fido-vault\
-# 把整個 fido-vault 資料夾（含 vault.db）複製/USB 到 NB，雙擊 exe 即可
+$ErrorActionPreference = 'Stop'
+$releaseDir = Join-Path (Get-Location).Path 'target/release'
+$packageDir = 'C:\deploy\fido-vault-portable'
+$programFiles = @('portable-fido-vault.exe', 'WebView2Loader.dll')
+if (Test-Path -LiteralPath $packageDir) { throw '請選擇全新資料夾，勿覆寫既有部署。' }
+foreach ($name in $programFiles) {
+    if (-not (Test-Path -LiteralPath (Join-Path $releaseDir $name) -PathType Leaf)) {
+        throw "缺少建置輸出：$name；不要只打包 EXE。"
+    }
+}
+New-Item -ItemType Directory -Path $packageDir | Out-Null
+foreach ($name in $programFiles) {
+    Copy-Item -LiteralPath (Join-Path $releaseDir $name) -Destination $packageDir
+}
 ```
+
+### 搬移既有金庫與啟動排錯
+
+1. 在來源機**正常關閉** GUI／CLI，先另做金庫備份；不要強制終止正在等待 PIN/UV/觸碰的程式。
+2. 將 EXE、同版 DLL、原 `vault.db`（以及存在的 `vault.db.failures`）複製至新機的全新資料夾。不要覆寫新機已有的另一份金庫；來源檔案與備份保留不動。
+3. 在啟動前，以 `Get-FileHash -Algorithm SHA256` 分別核對來源與目的 EXE、DLL、DB 的雜湊相同；正常登入會寫入 audit，登入後 DB hash 改變不等於搬移損毀。
+4. 確認 Runtime 與本機 Console 條件後，雙擊**新資料夾內**的 EXE，以既有主密碼或原已註冊金鑰登入；不要把搬移當成首次建立帳號。
+
+若 Windows 提示**找不到 `WebView2Loader.dll`**，先從可信任的同版 x64 套件補到 EXE 旁，再重試；**不要刪除、覆寫或重建 `vault.db`**。若 DLL 已補齊但仍提示 Runtime 不可用，再處理 Runtime 安裝。若搬移既有 DB 後卻顯示「首次執行／建立帳號」，立即停止，檢查啟動的 EXE 路徑及其同目錄的 `vault.db`，不要建立空白金庫來排錯。
+
+驗證範圍：mock Gate 8、PE imports／DLL 架構或載入檢查，都不等同實體 GUI 跨電腦啟動／金鑰解鎖 PASS；目前未收到該跨機人工 PASS 回報。本次說明更新不修改程式或金庫，也不代表重新部署。
 
 ## 測試 / Gate 驗證
 
@@ -121,3 +169,6 @@ $P audit        --path $V --pw Test1234!
 - 離線：程式不開啟任何網路連線。
 - 軌跡紀錄、複製成功/失敗提示與 app 診斷 log 絕不含密碼/PIN/金流明文。複製時密碼會暫存在系統共用剪貼簿；60 秒自動清除僅在內容仍相同時執行。其他桌面程式或 Windows 剪貼簿歷程/雲端剪貼簿可能在此期間讀取、保存或同步內容；清除不會刪除已保存的歷程項目。
 - 無復原機制（設計如此）。詳見 `docs/spec.md` §8。
+
+Sources:
+[1] https://learn.microsoft.com/zh-tw/microsoft-edge/webview2/concepts/distribution — Microsoft Learn: Distribute WebView2 applications and Runtime
