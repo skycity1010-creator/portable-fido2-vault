@@ -142,7 +142,7 @@ cargo +stable-x86_64-pc-windows-gnu build --release --features real-ctap --bin p
 - 注意：PS 5.1 讀無 BOM 腳本會當 ANSI(950) 解碼 → 所有遠端 PS 腳本純 ASCII（nb_push.py 已用 base64 內層迴避）。
 - **GUI／實體 FIDO2 驗證僅由使用者在本機 Console 互動 session 操作**；WinRM 僅供唯讀檢查、備份與核准部署，不啟動 GUI 或執行 WebAuthn。RDP／WebAuthn redirection 不支援，不是待驗項。
 
-## 8. Gate 與功能驗收狀態（彙整至 2026-10-04；最新功能驗收為 2026-10-03）
+## 8. Gate 與功能驗收狀態（既有與新增驗收分項記錄）
 
 | Gate | 內容 | 狀態 |
 |---|---|---|
@@ -169,8 +169,9 @@ cargo +stable-x86_64-pc-windows-gnu build --release --features real-ctap --bin p
 | 5 | CSV 範本、批次匯入／更新 | ✅ 2026-10-03 全項 PASS（PR #13；§12） |
 | 6 | 條目即時搜尋 | ✅ 2026-10-03 明確 PASS（PR #14；§13） |
 | 7 | 預設最大化與金鑰登入期間維持最大化 | ✅ 2026-10-03 明確 PASS（PR #15 修正版；§14） |
+| 修正 | 主畫面條目刪除確認（PR #17） | ✅ 使用者明確確認 D1–D5 PASS；D6 未測，授權收尾及合併 |
 
-PR #13/#14/#15 均已合併；8 張 `[FidoVault]` Kanban 卡均為 done。驗收、PR 合併與任務完成不等同所有舊模板都逐項人工 PASS：`user-verification-steps.md` 的 A–C/E/F 保留未勾選，D5 為未回報的選測；Gate 8 仍僅有上述 mock 證據。RDP 為不支援、raw CTAP CLI 實體路線為已退役／由 GUI 驗收取代（superseded），均不是待驗項。
+先前 PR #13/#14/#15 均已合併，當時 8 張 `[FidoVault]` Kanban 卡已完成；新增刪除確認任務 `t_7001952b` 的使用者結果為 D1–D5 PASS、D6 未測，已授權收尾及合併，實際狀態以 PR #17／該卡片讀回為準。驗收、PR 合併與任務完成不等同所有舊模板都逐項人工 PASS：`user-verification-steps.md` 的 A–C/E/F 保留未勾選，D5 為未回報的選測；Gate 8 仍僅有上述 mock 證據。RDP 為不支援、raw CTAP CLI 實體路線為已退役／由 GUI 驗收取代（superseded），均不是待驗項。
 
 ## 9. 2026-09-29 Win11-NB log 問題：根因與修復
 
@@ -236,6 +237,13 @@ PR #13/#14/#15 均已合併；8 張 `[FidoVault]` Kanban 卡均為 done。驗收
 - 初次版本 commit `a7fb6a0` 曾在金鑰登入時還原視窗，已由修正版取代（superseded），不是待驗收候選。前景處理僅在視窗已最小化時 restore，不改變可見最大化／一般視窗的狀態；規格見 `docs/plans/feature-07-default-maximized-window.md`。
 - 最近一次已記錄 GUI 部署（2026-10-03）來源 fix commit `1bf77fd23d27dcea2235821fc36bc74a21c269db`；`C:\FidoVault\portable-fido-vault.exe` 為 7,172,096 bytes，SHA-256 `0910d0cd5f29518e83c5ebd60b562572165adda91fae335f4771a386f52570f6`。來源 commit、雜湊、大小與下列備份紀錄皆逐字取自 `docs/user-verification-steps.md`，本次未部署或重新回讀目標機。
 - 當時部署前備份目錄 `C:\FidoVault\backups\key-login-maximized-20261003-1bf77fd`；舊 GUI SHA-256 `a874a96026e1c2a6baa7857a9fe3c7b564758347f2458aba5bd254ddd70e2092`，vault SHA-256 `35b669a0c720314ccb9f602faa89b7e8b5adf82d09f1c43831f40f5968fdf1a1`。當時部署後 GUI hash 相符、vault hash 不變、header 有效且有 1 個 key slot；無相關程序、持久 authenticator override 或傳輸暫存檔，WinRM 未啟動 GUI。較早部署與備份紀錄保留於使用者驗收文件，不把歷史 3-slot 快照當作本次槽位數。
+
+## 主畫面條目刪除確認 — 使用者驗收與收尾授權（PR #17）
+
+- 使用者明確回報：「D1~5通過，D6未測，進行收尾和合併」（Discord message `1556211623264522241`）。D1–D5 為 PASS；D6 保留未測，不因收尾或合併補勾。
+- Codex 實作與兩次獨立審查／修正紀錄、15 個刪除專項／53 個完整 Node 測試及 8 個隔離 Edge 合成 smoke 的證據見 `docs/reports/entry-delete-confirmation-verification.md`；自動化錯誤路徑覆蓋不等於 D6 實機通過。
+- 已驗收 GUI 的來源為 `c2409fa3f71eda9c228aabfb26e45600a88875f2`，SHA-256 `615378235e2f73752f39db5b85f0149f3401e4a5488935a545d5913b76ac97f0`。獨立讀回、舊 EXE／金庫備份及部署前後 baseline 見 `docs/reports/entry-delete-confirmation-deployment.json`；它們是部署當時快照，不是驗收後再次讀回金庫的結論。
+- 本輪僅同步明確回報項目及進行已授權 PR 收尾，不重建、部署或操作既有金庫／WebAuthn。PR #17 與 Kanban `t_7001952b` 保留實際合併及完成狀態。
 
 ## 15. 2026-10-04 工程收尾紀錄（區分既有驗證讀回與本輪檢查）
 

@@ -52,7 +52,10 @@ function element(tag = "") {
       if (this.tag === "tbody") return this.children.flatMap((child) => child.buttons ?? []);
       return this.buttons ?? [];
     },
-    focus() {},
+    focus() { this.focused = true; },
+    open: false,
+    showModal() { this.open = true; },
+    close() { this.open = false; this.dispatch("close"); },
   };
   Object.defineProperty(node, "innerHTML", {
     get() { return html; },
@@ -81,6 +84,7 @@ function element(tag = "") {
 
 function loadSearchUi() {
   const elements = new Map([
+    ["entry-delete-result", element("div")],
     ["entries-body", element("tbody")],
     ["audit-body", element("tbody")],
     ["entry-search", element("input")],
@@ -91,6 +95,8 @@ function loadSearchUi() {
   const prompts = [];
   const clipboardWrites = [];
   let entries = [];
+  let intercept = () => undefined;
+  const timers = [];
   const document = {
     getElementById(id) {
       if (!elements.has(id)) elements.set(id, element());
@@ -113,6 +119,8 @@ function loadSearchUi() {
       core: {
         async invoke(command, args) {
           calls.push({ command, args });
+          const intercepted = intercept(command, args);
+          if (intercepted !== undefined) return intercepted;
           if (command === "boot_info") return { has_vault: true, keys: [], brokered_key_login: true };
           if (command === "get_vault_settings") return { idle_lock_minutes: 5, password_history_limit: 3 };
           if (command === "list_audit") return [];
@@ -135,12 +143,14 @@ function loadSearchUi() {
     alert() {},
     confirm() { return true; },
     prompt(...args) { prompts.push(args); return null; },
-    setTimeout() { return 1; },
+    setTimeout(callback) { timers.push(callback); return timers.length; },
     clearTimeout() {},
   });
   vm.runInContext(source, context, { filename: "src/app.js" });
   return {
     context,
+    timers,
+    set intercept(value) { intercept = value; },
     elements,
     calls,
     logs,
@@ -253,6 +263,8 @@ test("show, copy, edit, and delete actions on a filtered row target the matching
   assert.equal(ui.elements.get("ed-account").value, "bob");
 
   await buttonFor("del").onclick();
+  assert.ok(!ui.calls.some((call) => call.command === "delete_entry"));
+  await ui.elements.get("btn-confirm-entry-delete").onclick();
   const deletion = ui.calls.find((call) => call.command === "delete_entry");
   assert.equal(deletion.args.id, "entry-b");
 });

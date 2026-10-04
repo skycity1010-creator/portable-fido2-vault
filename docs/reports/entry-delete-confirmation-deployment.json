@@ -1,0 +1,72 @@
+{
+  "runtime_baseline_and_readback": {
+    "loader_sha256": "86545b66cdb0603bc26b626fb9ad610cb6e71f28d468f5ea66df23b03dda96d5",
+    "cli_sha256": "5ec48b343ef77e209275aa9886cd67e8a2487cb1b14ce63a919cc2b62d47e541"
+  },
+  "source_commit": "c2409fa3f71eda9c228aabfb26e45600a88875f2",
+  "deployed_at": "2026-10-04T15:35:44+08:00",
+  "build_toolchain": "stable-x86_64-pc-windows-gnu",
+  "build_features": [
+    "real-ctap"
+  ],
+  "local_artifact": "C:\\Users\\skycity1010\\AppData\\Local\\hermes\\cache\\scratch\\pfv-entry-delete-c2409fa-release\\release\\portable-fido-vault.exe",
+  "artifact_sha256": "615378235e2f73752f39db5b85f0149f3401e4a5488935a545d5913b76ac97f0",
+  "artifact_bytes": 7172608,
+  "target": "Win11-NB:C:\\FidoVault\\portable-fido-vault.exe",
+  "baseline": {
+    "computer": "WIN11-NB",
+    "exeExists": true,
+    "exeSha256": "0910d0cd5f29518e83c5ebd60b562572165adda91fae335f4771a386f52570f6",
+    "exeBytes": 7172096,
+    "exeB64TempExists": false,
+    "vaultExists": true,
+    "vaultSha256": "6aadc34c034f8ac76d963e15506accae28a2be215197aaaf538d4fae6340cd80",
+    "vaultHeaderValid": true,
+    "vaultKeySlots": 1,
+    "userOverridePresent": false,
+    "machineOverridePresent": false,
+    "processes": []
+  },
+  "backups": {
+    "source_commit": "c2409fa3f71eda9c228aabfb26e45600a88875f2",
+    "verified_at": "2026-10-04T15:21:30+08:00",
+    "backup_dir": "C:\\FidoVault\\backup-entry-delete-c2409fa-20261004-152126-53367eed",
+    "exe_backup": "C:\\FidoVault\\backup-entry-delete-c2409fa-20261004-152126-53367eed\\portable-fido-vault.exe",
+    "vault_backup": "C:\\FidoVault\\backup-entry-delete-c2409fa-20261004-152126-53367eed\\vault.db",
+    "exe_backup_sha256": "0910d0cd5f29518e83c5ebd60b562572165adda91fae335f4771a386f52570f6",
+    "vault_backup_sha256": "6aadc34c034f8ac76d963e15506accae28a2be215197aaaf538d4fae6340cd80",
+    "target_baseline_unchanged": true
+  },
+  "readback": {
+    "computer": "WIN11-NB",
+    "exeExists": true,
+    "exeSha256": "615378235e2f73752f39db5b85f0149f3401e4a5488935a545d5913b76ac97f0",
+    "exeBytes": 7172608,
+    "exeB64TempExists": false,
+    "vaultExists": true,
+    "vaultSha256": "6aadc34c034f8ac76d963e15506accae28a2be215197aaaf538d4fae6340cd80",
+    "vaultHeaderValid": true,
+    "vaultKeySlots": 1,
+    "userOverridePresent": false,
+    "machineOverridePresent": false,
+    "processes": []
+  },
+  "rollback_readback": {
+    "exe_backup_sha256": "0910d0cd5f29518e83c5ebd60b562572165adda91fae335f4771a386f52570f6",
+    "vault_backup_sha256": "6aadc34c034f8ac76d963e15506accae28a2be215197aaaf538d4fae6340cd80"
+  },
+  "staging_removed": true,
+  "manual_acceptance_at_deployment": "PENDING",
+  "manual_acceptance": "D1-D5_PASS_D6_NOT_TESTED",
+  "manual_acceptance_results": {"D1": "PASS", "D2": "PASS", "D3": "PASS", "D4": "PASS", "D5": "PASS", "D6": "NOT_TESTED"},
+  "user_report_message_id": "1556211623264522241",
+  "user_report": "D1~5通過，D6未測，進行收尾和合併",
+  "closeout_and_merge_authorized": true,
+  "pr": 17,
+  "ci": {
+    "conclusion": "success",
+    "head_sha": "c2409fa3f71eda9c228aabfb26e45600a88875f2",
+    "id": 37184895566,
+    "status": "completed"
+  }
+}

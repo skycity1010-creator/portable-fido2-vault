@@ -140,6 +140,7 @@ async function doLoginKey() {
 }
 
 async function enterMain(entries) {
+  const session = ++entryDeleteSession;
   hide("screen-login");
   show("screen-main");
   if (!entries) entries = await invoke("list_entries");
@@ -148,10 +149,96 @@ async function enterMain(entries) {
   $("idle-minutes").value = idleMinutes;
   $("password-history-limit").value = Math.min(20, Math.max(1, Number(settings.password_history_limit) || 3));
   const audit = await invoke("list_audit");
+  if (session !== entryDeleteSession) return;
+  entryDeleteLocking = false;
   renderEntries(entries);
   renderAudit(audit);
   renderKeys();
   startIdleTimer(idleMinutes);
+}
+
+let entryDeleteTarget = null;
+let entryDeleteInFlight = false;
+let entryDeleteLocking = false;
+let entryDeleteSession = 0;
+function lockEntryDeleteSession() {
+  entryDeleteLocking = true;
+  entryDeleteSession += 1;
+  cancelEntryDelete();
+}
+function cancelEntryDelete() {
+  entryDeleteTarget = null;
+  $("entry-delete-site").textContent = "";
+  $("entry-delete-account").textContent = "";
+  $("entry-delete-status").textContent = "";
+  $("entry-delete-result").textContent = "";
+  if ($("entry-delete-dialog").open) $("entry-delete-dialog").close();
+}
+async function confirmEntryDelete() {
+  const target = entryDeleteTarget;
+  if (entryDeleteLocking || !target || entryDeleteInFlight || !$("entry-delete-dialog").open) return;
+  const session = entryDeleteSession;
+  // Submitted work belongs to the vault session, independently of modal dismissal.
+  entryDeleteInFlight = true;
+  try {
+    $("btn-confirm-entry-delete").disabled = true;
+    $("btn-cancel-entry-delete").disabled = true;
+    try {
+      await invoke("delete_entry", { id: target.id });
+    } catch {
+      if (entryDeleteLocking || session !== entryDeleteSession) return;
+      if (entryDeleteTarget === target && $("entry-delete-dialog").open) {
+        $("entry-delete-status").textContent = "刪除失敗，請重試或取消。";
+        $("btn-confirm-entry-delete").disabled = false;
+        $("btn-cancel-entry-delete").disabled = false;
+      } else {
+        $("entry-delete-result").textContent = "刪除失敗，請稍後再試。";
+      }
+      return;
+    }
+    if (entryDeleteLocking || session !== entryDeleteSession) return;
+    if (editingId === target.id) {
+      editingId = null;
+      editingRestoreHistory = null;
+      hide("entry-edit");
+      for (const id of ["ed-site", "ed-account", "ed-pass", "ed-notes"]) $(id).value = "";
+      setPasswordVisibility("ed-pass", "btn-toggle-ed-pass", false);
+      $("ed-pass-history").innerHTML = "";
+      $("ed-pass-history-status").textContent = "";
+    }
+    cancelEntryDelete();
+    // Remove the completed target even if the backend list refresh fails.
+    renderEntries((window.__lastEntries || []).filter((entry) => entry.id !== target.id));
+    try {
+      const entries = await invoke("list_entries");
+      if (entryDeleteLocking || session !== entryDeleteSession) return;
+      renderEntries(entries);
+      $("entry-delete-result").textContent = "刪除完成。";
+    } catch {
+      if (entryDeleteLocking || session !== entryDeleteSession) return;
+      $("entry-delete-result").textContent = "刪除完成，清單重載失敗。請重新載入清單。";
+    }
+  } finally {
+    entryDeleteInFlight = false;
+  }
+}
+function openEntryDelete(entry) {
+  if (entryDeleteLocking || entryDeleteInFlight || (entryDeleteTarget && $("entry-delete-dialog").open)) return;
+  if (!entry) { $("entry-delete-result").textContent = "無法開啟刪除確認。"; return; }
+  $("entry-delete-result").textContent = "";
+  entryDeleteTarget = { id: entry.id };
+  $("btn-confirm-entry-delete").disabled = false;
+  $("btn-cancel-entry-delete").disabled = false;
+  $("entry-delete-status").textContent = "";
+  $("entry-delete-site").textContent = entry.site;
+  $("entry-delete-account").textContent = entry.account;
+  try {
+    $("entry-delete-dialog").showModal();
+    $("btn-cancel-entry-delete").focus();
+  } catch {
+    cancelEntryDelete();
+    $("entry-delete-result").textContent = "無法開啟刪除確認，請稍後再試。";
+  }
 }
 
 // ─────────────── 條目 CRUD ───────────────
@@ -188,8 +275,7 @@ function renderEntries(entries) {
     b.onclick = async () => {
       const id = b.dataset.id;
       if (b.dataset.act === "del") {
-        if (!confirm("確定刪除該條目？（不可復原）")) return;
-        await invoke("delete_entry", { id }).then(() => refreshEntries()).catch((e) => alert(String(e)));
+        openEntryDelete(entries.find((entry) => entry.id === id));
       } else if (b.dataset.act === "edit") {
         openEdit(id);
       } else if (b.dataset.act === "show") {
@@ -610,12 +696,14 @@ function resetIdle() {
 function startIdleTimer(mins) {
   if (idleTimer) clearTimeout(idleTimer);
   idleTimer = setTimeout(async () => {
+    lockEntryDeleteSession();
     try { await invoke("lock", { reason: "idle" }); } catch {}
     location.reload();
   }, mins * 60 * 1000);
 }
 
 async function doLock() {
+  lockEntryDeleteSession();
   try { await invoke("lock", { reason: null }); } catch {}
   location.reload();
 }
@@ -651,6 +739,18 @@ document.addEventListener("DOMContentLoaded", () => {
   $("btn-confirm-csv-import").onclick = confirmCsvImport;
   $("btn-cancel-csv-import").onclick = cancelCsvImport;
   bindCsvImportDialog();
+  $("btn-confirm-entry-delete").onclick = confirmEntryDelete;
+  $("btn-cancel-entry-delete").onclick = cancelEntryDelete;
+  $("entry-delete-dialog").addEventListener("cancel", cancelEntryDelete);
+  $("entry-delete-dialog").addEventListener("close", () => {
+    // A queued close from an earlier opening must not invalidate a new modal.
+    if (!$("entry-delete-dialog").open) {
+      entryDeleteTarget = null;
+      $("entry-delete-site").textContent = "";
+      $("entry-delete-account").textContent = "";
+      $("entry-delete-status").textContent = "";
+    }
+  });
   $("btn-save-entry").onclick = saveEntry;
   $("btn-cancel-entry").onclick = () => {
     hide("entry-edit");
