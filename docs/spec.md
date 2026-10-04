@@ -24,6 +24,7 @@
 │  前端 (src/): index.html + app.js + styles.css — 純靜態、無 npm、繁中   │
 │    window.__TAURI__.core.invoke(...) → commands                        │
 │    window.__TAURI__.clipboardManager → text copy / conditional clear   │
+│    native Rust dialog → choose CSV / save header-only template         │
 ├─────────────────────────────────────────────────────────────────────────┤
 │  src-tauri/src/lib.rs      — Tauri commands + VaultState (Mutex)        │
 │  src-tauri/src/vault.rs    — 金庫檔案格式 / 載入 / 建立 / 加密落盤       │
@@ -132,9 +133,9 @@ offset   size   field
 
 ## 6. 軌跡紀錄（audit）
 
-事件集：`vault_created, login_success, login_failed, key_registered, key_removed, entry_added, entry_updated, entry_deleted, auto_lock, manual_lock`。
-- `method`：`password` / `fido2:<label>` / `setup` / `idle` / `manual`。
-- `detail`：**僅非機密資訊**（如 site 名稱、失敗原因代碼 wrong_password/no_device/decrypt_failed）。**永不記錄密碼、PIN、金流、credentialId 明文值以外的敏感資料。**
+事件集：`vault_created, login_success, login_failed, key_registered, key_removed, entry_added, entry_updated, entry_deleted, entries_imported, auto_lock, manual_lock`。
+- `method`：`password` / `fido2:<label>` / `setup` / `idle` / `manual` / `csv`。
+- `detail`：**僅非機密資訊**（如 site 名稱、失敗原因代碼 wrong_password/no_device/decrypt_failed）。**永不記錄密碼、PIN、金流、credentialId 明文值以外的敏感資料。**`entries_imported` 僅記新增／更新／略過數量，不記錄 CSV 欄位或資料列內容。
 - 儲存於加密 payload 內；UI「軌跡紀錄」頁可查（最新在前，上限 1000 筆，超出丟最舊）。
 
 ## 7. 閒置自動上鎖
@@ -160,12 +161,20 @@ offset   size   field
 - Capability 僅授予 `clipboard-manager:allow-write-text`；條件清除使用本機 Win32 API，不授予 plugin 的讀取或清除權限，也不開放圖片或 HTML 剪貼簿命令。
 - Windows API 參考：[`OpenClipboard`](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-openclipboard)（阻止其他程式修改）、[`EmptyClipboard`](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-emptyclipboard)。
 
+### 7.3 CSV 批次匯入／更新
+
+- 解鎖後條目介面提供 CSV 範本下載與匯入；範本為 UTF-8、只有 `site,account,password,notes` 表頭，不附示範資料。
+- 匯入支援 UTF-8（可有 BOM）、標準 CSV quoting、欄位順序不拘；`site` 必填，最多 1,000 筆資料列。超出上限或檔案格式無效時整檔拒絕。
+- 以 trim 後、不區分大小寫的 `(site, account)` 配對；唯一既有命中更新，無命中新增。更新的空欄位保留原值，非空欄位套用；新增的空欄位存空字串。密碼變更沿用既有歷史上限。
+- CSV 中重複配對鍵的相關列全部略過；多重既有命中、缺少 site 或欄數錯誤的資料列略過並在預覽說明。預覽只顯示新增／更新／略過數量、列號與非機密原因，不顯示欄位內容。
+- 使用者確認後所有有效列以一次加密落盤，寫入失敗不改變金庫。Audit `entries_imported` 僅記計數；CSV 密碼或整列內容不寫入 log、錯誤、audit 或暫存檔。選檔與儲存範本使用本機原生對話框，不進行網路呼叫。
+
 ## 8. 安全模型 / 威脅說明
 
 - 金庫檔案外洩（無任何解鎖因子）→ payload 為 AES-256-GCM，header 僅含包裝槽位，無法取得 KEK。
 - **無復原**：主密碼遺忘 + 全部 FIDO2 金鑰全失 = 永久無法取回（UI 於建立帳號與設定頁明示）。
 - 移除金鑰 = 刪該槽；該金鑰即無法再解鎖（不可逆，需確認對話框）。
-- 離線：程式不開啟任何 socket；Tauri 未加 http/fs 外部插件。Clipboard Manager 僅寫入本機系統剪貼簿，條件清除為本機 Win32 呼叫。
+- 離線：程式不開啟任何 socket；Tauri 未啟用 http 或一般檔案系統 plugin。Dialog plugin 僅提供使用者選擇 CSV 來源與範本儲存位置；選取後由 Rust 直接讀寫該路徑，不把 CSV 複製到暫存檔。
 - 複製密碼會短暫暴露於系統共用剪貼簿；其他桌面程式可能在 60 秒清除前讀取。Windows 剪貼簿歷程/雲端剪貼簿也可能在此期間擷取或同步內容；EmptyClipboard 不負責清除已另行保存的歷程項目。
 - 已知限制（v0.1）：單機單使用者；檔案權限依賴 OS 使用者權限；不防執行中記憶體 dump（與一般密碼管理程式同級）。
 

@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use chrono::Utc;
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::csv_import::{ImportAction, ImportPlan, ImportPreview};
 use crate::crypto::{
     aes_gcm_decrypt, aes_gcm_encrypt, argon2id_derive, base64_decode, base64_encode,
     kek_from_prf_secret, random_kek, random_nonce, CryptoError, VAULT_MAGIC,
@@ -438,9 +439,13 @@ impl Vault {
 
     /// 以目前 KEK 重新加密 payload + 原子寫入（tmp + rename）。
     fn write_file(&self) -> Result<(), VaultError> {
+        self.write_data(&self.data)
+    }
+
+    fn write_data(&self, data: &VaultData) -> Result<(), VaultError> {
         let header_json = serde_json::to_vec(&self.header).map_err(VaultError::Json)?;
         let nonce = random_nonce();
-        let pt = serde_json::to_vec(&self.data).map_err(VaultError::Json)?;
+        let pt = serde_json::to_vec(data).map_err(VaultError::Json)?;
         let ct = aes_gcm_encrypt(&self.kek, &nonce, &pt);
 
         let mut out = Vec::with_capacity(6 + 4 + header_json.len() + 12 + ct.len());
@@ -585,6 +590,81 @@ impl Vault {
         let site = e.site.clone(); // 先取值，避免與 record() 的 &mut self 重疊借用
         self.record("entry_updated", "manual", &site)?;
         Ok(())
+    }
+
+    /// Apply a reviewed CSV plan in one encrypted write; memory changes only after persistence succeeds.
+    pub fn import_entries(&mut self, plan: &ImportPlan) -> Result<ImportPreview, VaultError> {
+        let mut next_data = self.data.clone();
+        let history_limit = next_data.settings.password_history_limit.clamp(1, 20) as usize;
+
+        for action in &plan.actions {
+            match action {
+                ImportAction::Add(row) => {
+                    let site = row.site.trim();
+                    if site.is_empty() {
+                        return Err(VaultError::Format("網站欄位必填".into()));
+                    }
+                    let timestamp = now_rfc3339();
+                    next_data.entries.push(Entry {
+                        id: hex32(&random_bytes(16)),
+                        site: site.to_owned(),
+                        account: row.account.trim().to_owned(),
+                        password: row.password.clone(),
+                        password_history: Vec::new(),
+                        notes: row.notes.clone(),
+                        created_at: timestamp.clone(),
+                        updated_at: timestamp,
+                    });
+                }
+                ImportAction::Update { entry_id, row } => {
+                    let site = row.site.trim();
+                    if site.is_empty() {
+                        return Err(VaultError::Format("網站欄位必填".into()));
+                    }
+                    let entry = next_data
+                        .entries
+                        .iter_mut()
+                        .find(|entry| entry.id == *entry_id)
+                        .ok_or_else(|| {
+                            VaultError::Format("匯入預覽已失效，請重新選擇檔案".into())
+                        })?;
+                    entry.site = site.to_owned();
+                    if !row.account.trim().is_empty() {
+                        entry.account = row.account.trim().to_owned();
+                    }
+                    if !row.password.is_empty() && row.password != entry.password {
+                        let previous = std::mem::replace(&mut entry.password, row.password.clone());
+                        entry.password_history.insert(
+                            0,
+                            PasswordHistoryEntry {
+                                id: hex32(&random_bytes(16)),
+                                password: previous,
+                                archived_at: now_rfc3339(),
+                            },
+                        );
+                        entry.password_history.truncate(history_limit);
+                    }
+                    if !row.notes.is_empty() {
+                        entry.notes = row.notes.clone();
+                    }
+                    entry.updated_at = now_rfc3339();
+                }
+            }
+        }
+
+        next_data.audit.push(AuditEvent {
+            ts: now_rfc3339(),
+            event: "entries_imported".into(),
+            method: "csv".into(),
+            detail: format!(
+                "added={} updated={} skipped={}",
+                plan.preview.added, plan.preview.updated, plan.preview.skipped
+            ),
+        });
+        trim_audit(&mut next_data.audit);
+        self.write_data(&next_data)?;
+        self.data = next_data;
+        Ok(plan.preview.clone())
     }
 
     pub fn delete_entry(&mut self, id: &str) -> Result<(), VaultError> {
@@ -1256,6 +1336,113 @@ mod tests {
             Err(VaultError::Format(_))
         ));
         assert!(!detected.load(Ordering::SeqCst));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn batch_import_updates_preserve_blank_fields_and_keep_password_history() {
+        let d = tmp_dir("batch-import-update");
+        let p = d.join("vault.db");
+        let _ = fs::remove_file(&p);
+        let mut v = Vault::create(&p, "Pw-12345").unwrap();
+        let existing_id = v
+            .add_entry("example.com", "alice", "old-import-password", "old note")
+            .unwrap();
+
+        let parsed = crate::csv_import::parse_import_csv(
+            "site,account,password,notes\n EXAMPLE.com , Alice ,new-import-password,new note\nnew.example,bob,,\n",
+        )
+        .unwrap();
+        let plan = crate::csv_import::build_import_plan(v.entries(), parsed);
+        let preview = v.import_entries(&plan).unwrap();
+
+        assert_eq!((preview.added, preview.updated, preview.skipped), (1, 1, 0));
+        let updated = v
+            .entries()
+            .iter()
+            .find(|entry| entry.id == existing_id)
+            .unwrap();
+        assert_eq!(updated.site, "EXAMPLE.com");
+        assert_eq!(updated.account, "Alice");
+        assert_eq!(updated.password, "new-import-password");
+        assert_eq!(updated.password_history.len(), 1);
+        assert_eq!(updated.password_history[0].password, "old-import-password");
+        assert_eq!(updated.notes, "new note");
+        let added = v
+            .entries()
+            .iter()
+            .find(|entry| entry.site == "new.example")
+            .unwrap();
+        assert_eq!(added.account, "bob");
+        assert_eq!(added.password, "");
+        assert_eq!(added.notes, "");
+
+        let blank_update = crate::csv_import::parse_import_csv(
+            "site,account,password,notes\nexample.com,alice,,\n",
+        )
+        .unwrap();
+        let plan = crate::csv_import::build_import_plan(v.entries(), blank_update);
+        v.import_entries(&plan).unwrap();
+        let updated = v
+            .entries()
+            .iter()
+            .find(|entry| entry.id == existing_id)
+            .unwrap();
+        assert_eq!(updated.password, "new-import-password");
+        assert_eq!(updated.notes, "new note");
+        assert_eq!(updated.password_history.len(), 1);
+
+        let audit = serde_json::to_string(v.audit()).unwrap();
+        assert!(audit.contains("entries_imported"));
+        assert!(!audit.contains("old-import-password"));
+        assert!(!audit.contains("new-import-password"));
+        assert!(!audit.contains("new note"));
+        drop(v);
+        let reopened = Vault::open_password(&p, "Pw-12345").unwrap();
+        assert_eq!(reopened.entries().len(), 2);
+        assert_eq!(
+            reopened
+                .entries()
+                .iter()
+                .find(|entry| entry.id == existing_id)
+                .unwrap()
+                .password,
+            "new-import-password"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn failed_batch_import_keeps_memory_and_persisted_vault_unchanged() {
+        let d = tmp_dir("batch-import-atomic");
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        let p = d.join("vault.db");
+        let mut v = Vault::create(&p, "Pw-12345").unwrap();
+        let existing_id = v
+            .add_entry("example.com", "alice", "persisted-password", "old")
+            .unwrap();
+        let parsed = crate::csv_import::parse_import_csv(
+            "site,account,password,notes\nexample.com,alice,changed-password,new\nnew.example,bob,secret,\n",
+        )
+        .unwrap();
+        let plan = crate::csv_import::build_import_plan(v.entries(), parsed);
+        let temp_path = p.with_extension("db.tmp");
+        fs::create_dir(&temp_path).unwrap();
+
+        assert!(v.import_entries(&plan).is_err());
+        assert_eq!(v.entries().len(), 1);
+        assert_eq!(v.entries()[0].password, "persisted-password");
+        assert!(!v
+            .audit()
+            .iter()
+            .any(|event| event.event == "entries_imported"));
+        drop(v);
+        fs::remove_dir(&temp_path).unwrap();
+        let reopened = Vault::open_password(&p, "Pw-12345").unwrap();
+        assert_eq!(reopened.entries().len(), 1);
+        assert_eq!(reopened.entries()[0].id, existing_id);
+        assert_eq!(reopened.entries()[0].password, "persisted-password");
         let _ = fs::remove_dir_all(&d);
     }
 

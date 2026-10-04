@@ -1,6 +1,6 @@
 # 可攜式 FIDO2 密碼金庫（portable-fido2-vault）— 專案彙整文件
 
-> 彙整日期：2026-10-02｜建置機：WS2｜部署/驗證機：Win11-NB（`C:\FidoVault`）
+> 彙整日期：2026-10-03｜建置機：WS2｜部署/驗證機：Win11-NB（`C:\FidoVault`）
 > 本檔彙整 README.md、docs/spec.md、docs/user-verification-steps.md 與近期修復紀錄（§9），
 > 作為單一入口文件；細節以各原始文件為準。
 
@@ -15,7 +15,7 @@ Windows 桌面、**完全離線**、**portable 免安裝**的 FIDO2 密碼金庫
 - **僅接受支援 CTAP2 hmac-secret/PRF 的金鑰**（如 YubiKey 5+）；不支援者拒絕註冊並顯示原因
 - 新增安全性金鑰時可設定 FidoVault 本機別名；沿用明文 header `KeySlot.label`，Rust 以 Unicode canonical caseless matching 提供唯一建議並在 authenticator 偵測前驗證，UI 警告勿輸入敏感資料
 - 加密：Argon2id + **AES-256-GCM**，整個金庫加密為單一檔案 `vault.db`
-- CRUD ＋ created_at/updated_at ＋ 每筆條目舊密碼歷史（預設 3 代，可設 1–20）＋ 條目密碼複製（60 秒後僅在剪貼簿內容仍相同時清除）＋ 軌跡紀錄（絕不明文記錄密碼）＋ 閒置自動上鎖
+- CRUD ＋ created_at/updated_at ＋ 每筆條目舊密碼歷史（預設 3 代，可設 1–20）＋ 條目密碼複製（60 秒後僅在剪貼簿內容仍相同時清除）＋ CSV 範本下載與批次匯入／更新（上限 1,000 列）＋ 軌跡紀錄（絕不明文記錄密碼）＋ 閒置自動上鎖
 - ⚠️ **無復原機制**：主密碼遺忘且所有 FIDO2 金鑰全失 = 資料永久無法取回（設計如此，UI 明示）
 
 **非目標（v0.1）**：TOTP、密碼產生器、雲端同步、多使用者、行動裝置。
@@ -200,3 +200,9 @@ cargo +stable-x86_64-pc-windows-gnu build --release --features real-ctap --bin p
 - `keycloak-fido2-logon-s4u-poc`（`C:\project\keycloak-fido2-logon-s4u-poc`，
   GitHub: skycity1010-creator/keycloak-fido2-logon-s4u-poc）：FIDO2 logon + S4U PoC（Windows CP/LSA AP）。
   本專案（portable-fido2-vault）為獨立密碼金庫應用，與之共用建置機（WS2）與測試機（Win11-NB）。
+
+## 12. Feature 5 — CSV 批次匯入／更新與範本下載
+
+- 使用者於 2026-10-03 確認 Win11-NB 本機 Console 驗收項目全部通過；逐項結果見 `docs/user-verification-steps.md` 的 Feature 5 區段。
+- Release GUI 來源 commit `f33eea8d24fd77e1a85e9a59e409ba8ddf9cbfa3`，Win11-NB 目標 SHA-256 `1e2d22aba57f394a7b41e5500fa9deccaf3d414cfa7870699a0c7862ea73db82`。舊 GUI 與 vault 均已建立並驗證備份；部署前後 live vault hash 相同、key-slot 數為 1。
+- 驗證：Rust 74/74、Node 29/29、Release backend-mode 7/7、vendor 6/6；Release GUI/CLI build、scoped rustfmt 與 `git diff --check` 通過。`clippy -D warnings` 有 11 項既有、非本次變更檔案的診斷；此 PR head 未找到 hosted Actions run。

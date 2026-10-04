@@ -13,6 +13,9 @@ let clipboardCopyGeneration = 0;
 let clipboardOperationQueue = Promise.resolve();
 
 let keyNameDialogGeneration = 0;
+let activeCsvImportToken = null;
+let csvImportInFlight = false;
+let entrySearchQuery = "";
 
 // ─────────────── 工具 ───────────────
 function show(id) { $(id).classList.remove("hidden"); }
@@ -155,7 +158,18 @@ async function enterMain(entries) {
 function renderEntries(entries) {
   const tb = document.querySelector("#entries-table tbody");
   tb.innerHTML = "";
-  for (const e of entries) {
+  const query = entrySearchQuery.trim().toLowerCase();
+  const visibleEntries = query
+    ? entries.filter((entry) => [entry.site, entry.account, entry.notes]
+      .some((value) => String(value ?? "").toLowerCase().includes(query)))
+    : entries;
+  const status = $("entry-search-status");
+  if (!entries.length) status.textContent = "金庫尚無條目";
+  else if (query && !visibleEntries.length) status.textContent = "沒有符合搜尋條件";
+  else if (query) status.textContent = `符合 ${visibleEntries.length} / ${entries.length} 筆條目`;
+  else status.textContent = `共 ${entries.length} 筆條目`;
+
+  for (const e of visibleEntries) {
     const tr = document.createElement("tr");
     tr.innerHTML = `
       <td>${esc(e.site)}</td>
@@ -228,6 +242,121 @@ async function copyEntryPassword(id) {
 
 async function refreshEntries() {
   renderEntries(await invoke("list_entries"));
+}
+
+async function saveCsvTemplate() {
+  const button = $("btn-save-csv-template");
+  if (button.disabled) return;
+  button.disabled = true;
+  $("csv-import-status").textContent = "請選擇 CSV 範本的儲存位置…";
+  try {
+    const saved = await invoke("save_csv_template");
+    $("csv-import-status").textContent = saved ? "CSV 範本已儲存。" : "已取消儲存 CSV 範本。";
+  } catch (error) {
+    $("csv-import-status").textContent = String(error);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function renderCsvImportPreview(preview) {
+  const added = Number(preview?.added) || 0;
+  const updated = Number(preview?.updated) || 0;
+  const skipped = Number(preview?.skipped) || 0;
+  $("csv-import-summary").textContent = `新增 ${added} 筆、更新 ${updated} 筆、略過 ${skipped} 筆`;
+
+  const body = $("csv-import-rows");
+  body.replaceChildren();
+  const actionLabels = { add: "新增", update: "更新", skip: "略過" };
+  for (const item of Array.isArray(preview?.rows) ? preview.rows : []) {
+    const row = document.createElement("tr");
+    const numberCell = document.createElement("td");
+    numberCell.textContent = `第 ${Number(item.row_number) || "?"} 列`;
+    const actionCell = document.createElement("td");
+    actionCell.textContent = actionLabels[item.action] || "略過";
+    const reasonCell = document.createElement("td");
+    reasonCell.textContent = typeof item.reason === "string" ? item.reason : "—";
+    row.appendChild(numberCell);
+    row.appendChild(actionCell);
+    row.appendChild(reasonCell);
+    body.appendChild(row);
+  }
+}
+
+async function previewCsvImport() {
+  const button = $("btn-import-csv");
+  if (button.disabled) return;
+  button.disabled = true;
+  $("csv-import-status").textContent = "請選擇要匯入的 CSV 檔案…";
+  try {
+    const result = await invoke("preview_csv_import");
+    if (!result) {
+      $("csv-import-status").textContent = "已取消選擇 CSV 檔案。";
+      return;
+    }
+    activeCsvImportToken = result.token;
+    renderCsvImportPreview(result.preview);
+    const dialog = $("csv-import-dialog");
+    dialog.returnValue = "";
+    $("btn-confirm-csv-import").disabled = !activeCsvImportToken;
+    $("btn-cancel-csv-import").disabled = false;
+    dialog.showModal();
+    $("csv-import-status").textContent = "";
+  } catch (error) {
+    $("csv-import-status").textContent = String(error);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function cancelCsvImport() {
+  const dialog = $("csv-import-dialog");
+  if (dialog.open) dialog.close("cancel");
+}
+
+function bindCsvImportDialog() {
+  $("csv-import-dialog").addEventListener("close", () => {
+    const token = activeCsvImportToken;
+    activeCsvImportToken = null;
+    if (token) invoke("cancel_csv_import", { token }).catch(() => {});
+    if ($("csv-import-dialog").returnValue !== "applied") {
+      $("csv-import-status").textContent = "已取消 CSV 匯入預覽。";
+    }
+  });
+}
+
+async function confirmCsvImport() {
+  const token = activeCsvImportToken;
+  if (!token || csvImportInFlight) return;
+  csvImportInFlight = true;
+  $("btn-confirm-csv-import").disabled = true;
+  $("btn-cancel-csv-import").disabled = true;
+  try {
+    const result = await invoke("apply_csv_import", { token });
+    activeCsvImportToken = null;
+    $("csv-import-dialog").close("applied");
+    const success = `匯入完成：新增 ${Number(result.added) || 0} 筆、更新 ${Number(result.updated) || 0} 筆、略過 ${Number(result.skipped) || 0} 筆。`;
+    try {
+      await refreshEntries();
+      renderAudit(await invoke("list_audit"));
+      $("csv-import-status").textContent = success;
+    } catch {
+      $("csv-import-status").textContent = `${success} 條目清單重新載入失敗。`;
+    }
+  } catch (error) {
+    const message = String(error);
+    $("csv-import-status").textContent = `匯入失敗：${message}`;
+    if (message.includes("預覽已失效") || message.includes("條目已變更")) {
+      activeCsvImportToken = null;
+      $("csv-import-dialog").close("stale");
+    }
+  } finally {
+    csvImportInFlight = false;
+    if ($("csv-import-dialog").open) {
+      $("btn-confirm-csv-import").disabled = !activeCsvImportToken;
+      $("btn-cancel-csv-import").disabled = false;
+    }
+  }
 }
 
 let editingId = null;
@@ -513,6 +642,15 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   $("btn-add").onclick = addEntry;
+  $("entry-search").addEventListener("input", () => {
+    entrySearchQuery = $("entry-search").value;
+    renderEntries(window.__lastEntries || []);
+  });
+  $("btn-save-csv-template").onclick = saveCsvTemplate;
+  $("btn-import-csv").onclick = previewCsvImport;
+  $("btn-confirm-csv-import").onclick = confirmCsvImport;
+  $("btn-cancel-csv-import").onclick = cancelCsvImport;
+  bindCsvImportDialog();
   $("btn-save-entry").onclick = saveEntry;
   $("btn-cancel-entry").onclick = () => {
     hide("entry-edit");
