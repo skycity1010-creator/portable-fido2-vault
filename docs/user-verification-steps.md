@@ -1,16 +1,30 @@
 # 可攜式 FIDO2 密碼金庫 v0.1 — NB 桌面驗證步驟（使用者用）
 
-> 適用：Win11-NB，`C:\FidoVault`（portable 資料夾）。完成約 15–20 分鐘。
+> 適用：Win11-NB，`C:\FidoVault`（portable 資料夾）。本文保留部署與已確認驗收紀錄，不是要求重新執行全部舊模板。
 > Windows Release GUI 必須以 `--features real-ctap` 建置；一般權限的檔案總管直接啟動時使用 Windows WebAuthn API，無需環境變數或系統管理員提升。Windows 安全性視窗負責 PIN/UV/觸碰；目標系統需 WebAuthn API v4+。Debug build 預設為 MockBackend；明確跑 mock 流程時設定 `F2V_AUTHENTICATOR=mock`。
 > **RDP 不支援：**目前不支援從 RDP 遠端桌面 session 啟動或操作 FidoVault 硬體金鑰流程；請使用目標機本機 Console session。Win11-NB 的 RDP session 回報 WebAuthn API v1，低於 v4+ 要求，程式會 fail closed；勿降低 API 版本檢查。
 
-## 部署後驗證前確認（2026-10-01）
+## 已確認驗收彙整（文件同步：2026-10-04）
+
+| 項目 | 已確認結果（Win11-NB 本機 Console） |
+|---|---|
+| Feature 1 — 密碼欄位遮罩 | 2026-10-01 PASS |
+| Feature 2/3/4 — 舊密碼歷史、60 秒條件清除、本機金鑰別名 | 2026-10-02 集中驗收整體 PASS |
+| Feature 5 — CSV 範本與批次匯入／更新 | 2026-10-03 全項 PASS（PR #13 已合併） |
+| Feature 6 — 條目即時搜尋 | 2026-10-03 明確 PASS（PR #14 已合併） |
+| Feature 7 — 預設最大化與金鑰登入期間維持最大化 | 2026-10-03 明確 PASS（PR #15 修正版，已合併） |
+
+各節部署雜湊、備份、槽位數與操作說明保留為**當時快照**；2026-10-01 的 3 slots 不代表後續部署數量。最近一次已記錄部署是下方最大化修正版（fix commit `1bf77fd23d27dcea2235821fc36bc74a21c269db`）；本次僅同步文件，未重新回讀或部署目標機。
+
+A–C/E/F 是舊模板，沒有逐項人工 PASS 回報，不因功能／任務結案而補勾；D1–D4 已確認，D5 為選測且未回報。Gate 8 目前僅有 mock E2E copy-test，未見實體 GUI 跨機人工 PASS。H1–H5 與下方 Feature 1–7 的既有確認維持完成；RDP 不支援、raw CTAP CLI 實體 register/login 路線已由 GUI 驗收取代（superseded），不是待驗項。
+
+## 部署後驗證前確認（2026-10-01，歷史部署／已取代）
 已部署 PR #3 的 Windows GNU Release GUI，SHA256：`E9A28C81C73456800E3F1FAF0E8F1A9F6576146C8A675F5AB125FF9135ED8503`。替換前舊 exe 已備份為 `C:\FidoVault\portable-fido-vault.exe.pre-single-key-20261001-112834.bak`（SHA256 `06B1C5BE7A5E760D28D594B128A1B5BC681C31A6FD26D672E942E5F1062F0EA2`）。`vault.db` 未替換，SHA256 `848F961C4C5CB741EF1ADE452008F1D3F17649D06582B4809CEBFC4E16877B99`，3 個 key slots；備份 `C:\FidoVault\vault.db.pre-single-key-20261001-112834.bak` SHA256 相同。部署前 WinRM read-only process check 為 0 個 FIDO client，`F2V_AUTHENTICATOR` 使用者/系統變數均未設定。
 
-## H2 焦點修正候選部署（2026-10-01）
-PR #3 commit `ab3d123` 的 Windows GNU Release GUI 已部署至 `C:\FidoVault\portable-fido-vault.exe`，SHA256 `42D6DB566BEA217282D5BB487FA5DFB207B9252D2F3B1349938C4BB658AB2B58`（6,121,472 bytes）。部署前 exe 備份：`C:\FidoVault\portable-fido-vault.exe.pre-focusfix-20261001-203755-e9759808.bak`，SHA256 `E9A28C81C73456800E3F1FAF0E8F1A9F6576146C8A675F5AB125FF9135ED8503`。vault 備份：`C:\FidoVault\vault.db.pre-focusfix-20261001-203755-e9759808.bak`，SHA256 `EB3A9271259DE1A0348DFF031F922456248C5A21A5B387000F6B03B6E4488C46`。部署後遠端回讀確認 exe hash 相符；`vault.db` 保持相同 hash、3 個 key slots；FIDO client process 為 0，user/machine `F2V_AUTHENTICATOR` 均未設定。尚待使用者於本機 Console 驗收 H2 前景；WinRM 未啟動 GUI、未執行 WebAuthn。
+## H2 焦點修正候選部署（2026-10-01，歷史候選／superseded）
+PR #3 commit `ab3d123` 的 Windows GNU Release GUI 已部署至 `C:\FidoVault\portable-fido-vault.exe`，SHA256 `42D6DB566BEA217282D5BB487FA5DFB207B9252D2F3B1349938C4BB658AB2B58`（6,121,472 bytes）。部署前 exe 備份：`C:\FidoVault\portable-fido-vault.exe.pre-focusfix-20261001-203755-e9759808.bak`，SHA256 `E9A28C81C73456800E3F1FAF0E8F1A9F6576146C8A675F5AB125FF9135ED8503`。vault 備份：`C:\FidoVault\vault.db.pre-focusfix-20261001-203755-e9759808.bak`，SHA256 `EB3A9271259DE1A0348DFF031F922456248C5A21A5B387000F6B03B6E4488C46`。部署後遠端回讀確認 exe hash 相符；`vault.db` 保持相同 hash、3 個 key slots；FIDO client process 為 0，user/machine `F2V_AUTHENTICATOR` 均未設定。當時尚待使用者於本機 Console 驗收 H2 前景；此候選後續已由 `45d3aa6` 取代，H2 已在下節確認通過，不是目前待驗項。WinRM 未啟動 GUI、未執行 WebAuthn。
 
-## H2 broker 對話框前景候選部署（2026-10-01）
+## H2 broker 對話框前景候選部署（2026-10-01，H2 已通過／歷史部署）
 唯讀 Console 探測確認：擷取時 FidoVault HWND `0x1D056C` 是 foreground、z-order 17；`CredentialUIBroker` HWND `0x1203CE`（PID 1492，Session 2）顯示「Windows 安全性」、class `Credential Dialog Xaml Host`，z-order 18，`OWNER=0`、`ROOTOWNER` 為自身。這證實 broker 對話框是獨立的 unowned top-level window；主窗置前不會自動提升它。
 
 新候選在 GetAssertion/MakeCredential 等待期間監測；只有唯一、同 session、新建立的 System32 `CredentialUIBroker.exe` 安全性視窗才嘗試一次 `SetForegroundWindow`，並要求使用者仍把 FidoVault 留在 foreground。基線包含隱藏 top-level 視窗及既有 broker PID；不改對話框 owner、不設 topmost、不使用 `ASFW_ANY`。前景交接仍是 best-effort，Windows 在檢查與呼叫間仍可能切換焦點。
@@ -26,9 +40,9 @@ PR #3 commit `ab3d123` 的 Windows GNU Release GUI 已部署至 `C:\FidoVault\po
 | `vault.db` | 既有金庫資料；驗證前另做使用者備份，切勿刪除或重建 |
 | `vault_cli.exe` | 選用 CLI；保留 raw CTAP 診斷路徑，本次部署未替換 |
 
-> 這台 NB 已有既存 `vault.db`，目前有 3 個 key slots。A–F 是全新測試金庫的舊 Gate 流程；G4–G6 是先前已完成的實體驗收（其步驟中的槽位數是當時紀錄，不代表目前數量）。本次請驗收 **H1–H5**，勿建立、清空或重建現有金庫。
+> 2026-10-01 的 NB 部署已有既存 `vault.db`，當時有 3 個 key slots。A–F 是全新測試金庫的舊 Gate 流程；G4–G6 與 H1–H5 的實體驗收已完成，步驟中的槽位數僅為當時紀錄。後續部署快照見 Feature 5/7；不要把舊槽位數當作目前數量，勿建立、清空或重建現有金庫。
 
-## A. Gate 1 — 雙擊免安裝執行
+## A. Gate 1 — 雙擊免安裝執行（舊模板，未逐項回報）
 - [ ] **A1** 雙擊 `C:\FidoVault\portable-fido-vault.exe`
   - 若出現 Windows SmartScreen「未識別應用程式」→ 點「其他資訊」→「仍要執行」（exe 未簽章，預期行為）
   - **預期**：數秒內跳出視窗「🔐 可攜式 FIDO2 密碼金庫 — 請輸入主密碼登入」
@@ -36,20 +50,20 @@ PR #3 commit `ab3d123` 的 Windows GNU Release GUI 已部署至 `C:\FidoVault\po
   - **預期**：跳回登入畫面
 - [ ] **A3** 確認 `C:\FidoVault` 下多了一個 `vault.db`（金庫檔；之後所有資料都在這裡）
 
-## B. Gate 2 — 密碼登入 + 錯誤計軌跡
+## B. Gate 2 — 密碼登入 + 錯誤計軌跡（舊模板，未逐項回報）
 - [ ] **B1** 輸入**錯**主密碼 → 按「以主密碼登入」→ **預期**：顯示錯誤、留在登入畫面
 - [ ] **B2** 到 `C:\FidoVault` 確認出現 `vault.db.failures`（失敗軌跡 sidecar；只有時間+方式，無機密）
 - [ ] **B3** 輸入**正確**主密碼 → 登入成功 → **預期**：進主畫面（頂欄「已解鎖」+ 四個分頁）
 - [ ] **B4**（選用）進「軌跡紀錄」分頁：應看到 `login_failed`、`login_success`、`vault_created`；且**任何一列都不含密碼明文**
 
-## C. Gate 5 — 條目 CRUD + 時間戳
+## C. Gate 5 — 條目 CRUD + 時間戳（舊模板，未逐項回報）
 - [ ] **C1** 「條目」分頁：網站=`example.com`、帳號=`alice` →「＋ 新增」→ 彈出框輸入密碼 `S3cret!`
   - **預期**：表格出現該列，含建立/更新時間
 - [ ] **C2** 點該列「編輯」→ 改備註或密碼 →「儲存」→ **預期**：「更新時間」變新、「建立時間」不變
 - [ ] **C3** 點「顯示」→ 彈出框應回顯 `S3cret!`（可讀回）
 - [ ] **C4**（選用）新增第二條再「刪除」（會問確認）→ 表格少一列
 
-## D. Gate 7 — 閒置自動上鎖 ⭐（本卡重點）
+## D. Gate 7 — 閒置自動上鎖（D1–D4 已通過；D5 選測未回報）
 - [x] **D1** 「設定」分頁：輸入 `1` →「套用」→ **預期**：彈出「已套用：閒置 1 分鐘自動上鎖」
 - [x] **D2** 切到**其他視窗或桌面**，**完全不要碰滑鼠與鍵盤超過 60 秒**
   - ⚠️ 注意：**只要滑鼠在 app 視窗內移動、或在它上面按鍵/打字，計時器就會重算**。最保險：切走後去泡杯咖啡，別回頭動滑鼠。
@@ -57,7 +71,7 @@ PR #3 commit `ab3d123` 的 Windows GNU Release GUI 已部署至 `C:\FidoVault\po
 - [x] **D4** 重新登入 →「軌跡紀錄」→ **預期**：最新一列是 `auto_lock`（方式欄 idle）
 - [ ] **D5**（對照組，選測）再上鎖一次前點右上「上鎖」手動按鈕 → 回登入畫面 → 軌跡多一列 `lock`
 
-## E. Gate 3/4 — FIDO2 金鑰流程（mock）
+## E. Gate 3/4 — FIDO2 金鑰流程（mock 舊模板，未逐項回報）
 
 > 此節只測 MockBackend。若由 PowerShell 啟動 mock GUI，僅在該視窗設定 `$env:F2V_AUTHENTICATOR='mock'`；關閉 app 後用 `Remove-Item Env:F2V_AUTHENTICATOR -ErrorAction SilentlyContinue` 清除，勿用 `setx` 持久設定。
 
@@ -65,12 +79,12 @@ PR #3 commit `ab3d123` 的 Windows GNU Release GUI 已部署至 `C:\FidoVault\po
 - [ ] **E2** 再註冊第二支（型別會不同）→「上鎖」→ 登入畫面應列出已註冊金鑰
 - [ ] **E3** 選任一金鑰 →「以金鑰登入」→ **預期**：成功進主畫面（多支金鑰任一支皆可解鎖）
 
-## F. Gate 8 — 可攜性直拷
+## F. Gate 8 — 可攜性直拷（舊模板，實體 GUI 跨機未回報 PASS）
 - [ ] **F1** 完全關閉 app
 - [ ] **F2** 把整個 `C:\FidoVault` 資料夾複製到別處（例：`D:\FidoVault-copy` 或 USB）
 - [ ] **F3** 到新位置雙擊 exe → 用主密碼登入 → **預期**：條目、金鑰、軌跡全都在（vault.db 隨資料夾走，免安裝免設定）
 
-## 回報格式（做完貼回即可）
+## 舊模板回報格式（保留參考，不要求重跑已確認項目）
 ```
 A: A1 _ / A2 _ / A3 _
 B: B1 _ / B2 _ / B3 _ / B4 _
@@ -90,7 +104,7 @@ F: F1 _ / F2 _ / F3 _
 - [x] **G3** 用一般權限（非系統管理員）的檔案總管直接啟動 `C:\FidoVault\portable-fido-vault.exe`；不設 `F2V_AUTHENTICATOR`。啟動診斷應顯示 `GUI FIDO backend selected: windows-webauthn`。
 - [x] **G4（舊槽相容性；先前已驗收）** 以原有實體金鑰完成 Windows 安全性提示，確認舊 raw-CTAP 槽能由 Windows WebAuthn backend 解鎖；驗收當時槽位數為 1。若本次 H 驗收遇到登入失敗，不要移除或覆寫任何槽位。
 - [x] **G5（註冊；先前已驗收）** 「金鑰管理」→「＋ 註冊新金鑰」註冊 YubiKey Bio；Windows 安全性提示與觸碰／指紋流程已通過，PIN 只在本機提示輸入。
-- [x] **G6（新槽登入；先前已驗收）** 新槽登入已通過；第二支 YubiKey NFC 亦已註冊並完成交叉登入。這些完成當時的槽位數紀錄不代表目前數量；目前部署前 baseline 為 3 個 key slots。
+- [x] **G6（新槽登入；先前已驗收）** 新槽登入已通過；第二支 YubiKey NFC 亦已註冊並完成交叉登入。這些完成當時的槽位數紀錄不代表目前數量；2026-10-01 部署前 baseline 為 3 個 key slots。
 
 若視窗未啟動或金鑰未要求互動，保留目前 vault 備份並回報 UI 狀態；不要移除任何無法辨識的槽位。
 
@@ -111,7 +125,7 @@ F: F1 _ / F2 _ / F3 _
 | D3 沒自動上鎖 | 多半是滑鼠/鍵盤在 app 視窗內動過 → 計時器被重算；再試一次、切走後別碰輸入設備 |
 | 雙擊完全無反應 | 回傳訊息給 Coder（查 WebView2 / 事件紀錄） |
 
-## 密碼欄位遮罩 — Win11-NB 驗收（2026-10-01）
+## 密碼欄位遮罩 — Win11-NB 驗收（通過，2026-10-01）
 
 本次以 PR #5 功能分支 commit `a651a12` 建置 Windows GNU Release（`--features real-ctap`），已部署至 `C:\FidoVault\portable-fido-vault.exe`。
 使用者已確認 Win11-NB 本機 Console 實機驗收通過。
@@ -203,7 +217,7 @@ Feature 3 standalone 候選 GUI（6,589,440 bytes，SHA-256 `58ba298f7f2bcd5fa4d
 
 使用者已確認全部項目 PASS；部署紀錄、備份與驗收項目維持可追溯。詳見 PR #13 與 Kanban task `t_1430ad96`。
 
-## 條目介面即時搜尋 — Win11-NB 本機驗收（PR #14，使用者確認通過）
+## 條目介面即時搜尋 — Win11-NB 本機驗收（PR #14，PASS，2026-10-03）
 
 > 僅使用專用測試條目與假資料；不要修改或刪除既有真實條目。Win11-NB GUI 驗收由使用者在本機 Console 完成；使用者於 2026-10-03 確認本節驗證通過，勿透過 RDP/WinRM 操作 GUI。
 
@@ -216,13 +230,13 @@ Feature 3 standalone 候選 GUI（6,589,440 bytes，SHA-256 `58ba298f7f2bcd5fa4d
 
 回報格式：搜尋欄位比對 __；清除/空白 __；零結果與空金庫提示 __；目前/舊密碼排除 __；列操作 __；新增/編輯/CSV 重載 __；audit/重啟 __（每項填 PASS/FAIL + 簡短現象）。
 
-## 主視窗預設最大化 — Win11-NB 本機驗收（PR #15，已部署／待使用者驗證）
+## 主視窗預設最大化 — Win11-NB 本機驗收（PR #15，PASS，2026-10-03）
 
-> PR #15 原先 stacked on PR #14；兩項功能皆由使用者於 2026-10-03 確認本機 Console 驗證通過。驗收由使用者在本機完成，未透過 RDP/WinRM 操作 GUI。
+> PR #15 原先 stacked on PR #14；兩項功能皆由使用者於 2026-10-03 確認本機 Console 驗證通過，PR #14/#15 均已合併。驗收由使用者在本機完成，未透過 RDP/WinRM 操作 GUI。
 >
 > **部署歷史（2026-10-03）：** 初次最大化版本（commit `a7fb6a0`）GUI SHA-256 `a874a96026e1c2a6baa7857a9fe3c7b564758347f2458aba5bd254ddd70e2092`（7,171,584 bytes），曾部署至 `C:\FidoVault\portable-fido-vault.exe`。當時備份在 `C:\FidoVault\backups\maximized-20261003-a7fb6a0`；其前一版 exe SHA-256 `3873d0701f24ce23272e8633195a98eda6313f67ba7f82505562d6b950f77d1d`，vault SHA-256 `09ea6c2cc94d4e4ceef3f7d4c201826c7cb3930da9cf6e9909c862d4c8451025`。使用者回報點「以金鑰登入」會還原視窗；此版本已由下列修正版取代。
 >
-> **目前部署（2026-10-03，fix commit `1bf77fd23d27dcea2235821fc36bc74a21c269db`）：** GUI SHA-256 `0910d0cd5f29518e83c5ebd60b562572165adda91fae335f4771a386f52570f6`（7,172,096 bytes）。部署前備份位於 `C:\FidoVault\backups\key-login-maximized-20261003-1bf77fd`：舊 exe SHA-256 `a874a96026e1c2a6baa7857a9fe3c7b564758347f2458aba5bd254ddd70e2092`，vault SHA-256 `35b669a0c720314ccb9f602faa89b7e8b5adf82d09f1c43831f40f5968fdf1a1`。部署後 exe hash 與建置檔相符，vault hash 不變、header 有效且有 1 個 key slot；沒有相關程序、持久 authenticator override 或傳輸暫存檔。未透過 WinRM 啟動 GUI。使用者於 2026-10-03 確認本節驗收通過。
+> **最近一次已記錄部署（2026-10-03，fix commit `1bf77fd23d27dcea2235821fc36bc74a21c269db`）：** GUI SHA-256 `0910d0cd5f29518e83c5ebd60b562572165adda91fae335f4771a386f52570f6`（7,172,096 bytes）。部署前備份位於 `C:\FidoVault\backups\key-login-maximized-20261003-1bf77fd`：舊 exe SHA-256 `a874a96026e1c2a6baa7857a9fe3c7b564758347f2458aba5bd254ddd70e2092`，vault SHA-256 `35b669a0c720314ccb9f602faa89b7e8b5adf82d09f1c43831f40f5968fdf1a1`。部署後 exe hash 與建置檔相符，vault hash 不變、header 有效且有 1 個 key slot；沒有相關程序、持久 authenticator override 或傳輸暫存檔。未透過 WinRM 啟動 GUI。使用者於 2026-10-03 確認本節驗收通過。
 
 - [x] 關閉並重新啟動程式，確認主視窗開啟時已最大化，標題列及工作列仍可見（不是全螢幕）。
 - [x] 按「以金鑰登入」，確認 Windows 安全性提示出現時主視窗不會縮回一般視窗；完成或取消金鑰操作後，主視窗仍維持最大化。
