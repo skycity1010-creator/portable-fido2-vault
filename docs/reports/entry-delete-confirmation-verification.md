@@ -134,3 +134,18 @@ After approval, parent synchronized only this review/evidence documentation and
 the manual checklist evidence description; production and test blobs remain
 identical to the reviewed tree. Publication state is tracked in PR #17 and
 Kanban t_7001952b, not inferred from these pre-commit snapshots.
+
+## Parent release deployment — local acceptance remains PENDING
+
+- User authorized Win11-NB delivery after verification and confirmed graceful GUI closure. No process was force-terminated.
+- Source revision: `c2409fa3f71eda9c228aabfb26e45600a88875f2`; subsequent handoff edits are documentation only.
+- Windows CI run `37184895566` for that source completed `success`: frontend tests, real-CTAP Rust units without hardware, and mock Gate E2E. This is not physical-device or Console acceptance.
+- Fresh GNU release command: `cargo +stable-x86_64-pc-windows-gnu build --release --locked --features real-ctap --bin portable-fido-vault -j 1`; exit 0, 10m 19s. Artifact fingerprint contains `real-ctap`.
+- Artifact bytes: `7172608`; new GUI SHA-256: `615378235e2f73752f39db5b85f0149f3401e4a5488935a545d5913b76ac97f0`.
+- Deployed at `2026-10-04T15:35:44+08:00` to `Win11-NB:C:\FidoVault\portable-fido-vault.exe`; independent target read-back matched artifact hash and size.
+- Non-overwriting rollback directory: `C:\FidoVault\backup-entry-delete-c2409fa-20261004-152126-53367eed`. Both backup hashes were independently verified before and after deployment.
+- Old EXE SHA-256: `0910d0cd5f29518e83c5ebd60b562572165adda91fae335f4771a386f52570f6`; vault SHA-256: `6aadc34c034f8ac76d963e15506accae28a2be215197aaaf538d4fae6340cd80`; key-slot count remained `1`. The existing vault was never replaced, recreated, or decrypted.
+- Existing `vault_cli.exe` and `WebView2Loader.dll` hashes were unchanged. No persistent authenticator override, leftover staging, or FIDO client was present at pre-launch read-back.
+- Transfer used a unique staging directory; staged SHA-256 was checked before same-volume replacement. The first replacement attempt failed because PowerShell 5.1 passed `$null` as an invalid string path. Immediate read-back confirmed old EXE/vault unchanged; synthetic-file probes reproduced the failure and verified `[System.Management.Automation.Language.NullString]::Value`. Resume used only the exact verified staging path; corrected replacement and independent final checks passed. No application source changed for this deployment-only correction.
+- Durable structured metadata: `docs/reports/entry-delete-confirmation-deployment.json`.
+- No remote GUI launch, WebAuthn/FIDO operation, real entry deletion, PR merge, or task completion. D1–D6 remain PENDING until explicit user PASS/FAIL reports.

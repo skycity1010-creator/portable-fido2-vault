@@ -247,7 +247,7 @@ Feature 3 standalone 候選 GUI（6,589,440 bytes，SHA-256 `58ba298f7f2bcd5fa4d
 
 ## 條目刪除確認 — Win11-NB 本機 Console 驗收（PENDING）
 
-僅使用可拋棄的合成測試條目；不得刪除真實資料或將密碼傳至聊天。自動化證據包含 Node VM 與隔離 headless Edge，皆使用合成 IPC／記憶體條目，不操作真實金庫或驗證器；尚未建置、部署或完成 Tauri／Win11-NB 實機驗收，保留既有已接受 gates。
+僅使用可拋棄的合成測試條目；不得刪除真實資料或將密碼傳至聊天。自動化證據包含 Node VM 與隔離 headless Edge，皆使用合成 IPC／記憶體條目，不操作真實金庫或驗證器。來源 `c2409fa` 的 Windows CI 已通過，parent 已於 2026-10-04T15:35:44+08:00 建置 `real-ctap` Release GUI 並部署至 `C:\FidoVault\portable-fido-vault.exe`；獨立讀回 EXE SHA-256 `615378235e2f73752f39db5b85f0149f3401e4a5488935a545d5913b76ac97f0` 與本機新建 artifact 相符。原金庫 hash 與 1 個 key slot 均未變動，舊 EXE／金庫非覆寫備份已驗證。詳細 metadata 見 `docs/reports/entry-delete-confirmation-deployment.json`。未透過 WinRM 啟動 GUI 或操作金鑰；Tauri／Win11-NB 本機實機驗收維持 PENDING，保留既有已接受 gates。
 
 - [ ] D1：一般權限開啟待驗版本，刪除測試列只開啟「確認刪除條目」，網站／帳號與不可復原警告正確，無密碼／歷史／備註；初始焦點在取消，Tab 留在 modal。
 - [ ] D2：取消、Esc 各一次，條目保留；重開選另一測試列正常，取消焦點下 Enter 不會批准刪除。
