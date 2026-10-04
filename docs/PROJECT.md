@@ -1,8 +1,9 @@
 # 可攜式 FIDO2 密碼金庫（portable-fido2-vault）— 專案彙整文件
 
-> 彙整日期：2026-10-03｜建置機：WS2｜部署/驗證機：Win11-NB（`C:\FidoVault`）
+> 彙整日期：2026-10-04｜建置機：WS2｜部署/驗證機：Win11-NB（`C:\FidoVault`）
 > 本檔彙整 README.md、docs/spec.md、docs/user-verification-steps.md 與近期修復紀錄（§9），
 > 作為單一入口文件；細節以各原始文件為準。
+> 本次同步已確認驗收、讀回既有工程驗證紀錄，並執行全庫格式只讀檢查及本機 Node sanity checks；未重新建置、部署或重跑 Rust／Clippy。歷史部署雜湊與槽位數僅代表各次部署的快照，不代表本次重新回讀目標機。
 
 ## 1. 專案概況
 
@@ -16,6 +17,8 @@ Windows 桌面、**完全離線**、**portable 免安裝**的 FIDO2 密碼金庫
 - 新增安全性金鑰時可設定 FidoVault 本機別名；沿用明文 header `KeySlot.label`，Rust 以 Unicode canonical caseless matching 提供唯一建議並在 authenticator 偵測前驗證，UI 警告勿輸入敏感資料
 - 加密：Argon2id + **AES-256-GCM**，整個金庫加密為單一檔案 `vault.db`
 - CRUD ＋ created_at/updated_at ＋ 每筆條目舊密碼歷史（預設 3 代，可設 1–20）＋ 條目密碼複製（60 秒後僅在剪貼簿內容仍相同時清除）＋ CSV 範本下載與批次匯入／更新（上限 1,000 列）＋ 軌跡紀錄（絕不明文記錄密碼）＋ 閒置自動上鎖
+- 條目分頁即時搜尋網站、帳號及備註（不分大小寫的部分比對），不搜尋目前或舊密碼；清除查詢恢復完整清單。
+- 主視窗每次啟動預設最大化（非全螢幕）；金鑰登入提示出現、完成或取消後維持最大化，仍可還原、移動及調整大小。
 - ⚠️ **無復原機制**：主密碼遺忘且所有 FIDO2 金鑰全失 = 資料永久無法取回（設計如此，UI 明示）
 
 **非目標（v0.1）**：TOTP、密碼產生器、雲端同步、多使用者、行動裝置。
@@ -27,7 +30,7 @@ portable-fido2-vault/
 ├─ README.md                  簡易說明
 ├─ docs/
 │  ├─ spec.md                 技術規格（本檔細化來源）
-│  ├─ user-verification-steps.md  NB 桌面驗證步驟（使用者用，Gate 1–8）
+│  ├─ user-verification-steps.md  NB 桌面驗證步驟（既有 Gate 流程與 Feature 1–7 驗收紀錄）
 │  └─ PROJECT.md              ← 本檔（彙整）
 ├─ src/                       前端（純靜態 HTML/JS/CSS，繁中 UI）
 ├─ src-tauri/                 Tauri v2 (Rust) 後端
@@ -122,9 +125,9 @@ cargo +stable-x86_64-pc-windows-gnu build --release --features real-ctap --bin p
 
 - `--features real-ctap`：編入實體 FIDO2 支援；Windows GUI 使用系統 WebAuthn API，CLI `--authenticator hw` 使用 raw CTAP/HID。
 - Windows Release GUI 無需 `F2V_AUTHENTICATOR` 或系統管理員權限即可走 brokered backend；Debug 預設 mock，mock demo 可明確設 `F2V_AUTHENTICATOR=mock`。
-- 驗證（截至 2026-10-02）：MSVC `cargo test --lib --locked --features real-ctap` 64/64；Release backend-mode 7/7；Node UI 24/24（Feature 4 targeted 5/5）；`node --check src/app.js`、`git diff --check` 通過。Windows GNU Release GUI + CLI（`--locked --features real-ctap`）建置成功；GUI 6,729,216 bytes，SHA-256 `7deba32418fb173d5ada126e600c81a748ffa51bcfe503afc7bed683fb928ed1`；CLI 2,427,392 bytes，SHA-256 `1493ab5d09fb942a61f77cc9e82827b2fa08f60e3e74d81e5d1cd657771ab3c2`。`cargo clippy -D warnings` 仍受 11 個既有其他模組警告阻擋，新增別名路徑無相關警告。Feature 4 獨立 review 已通過並部署至 Win11-NB（GUI 目標端 SHA-256 `7deba32418fb173d5ada126e600c81a748ffa51bcfe503afc7bed683fb928ed1`）；舊 EXE 與 vault 均有驗證備份，部署前後 live vault hash 不變、3 slots。使用者於 2026-10-02 確認 Feature 2、3、4 集中 Win11-NB 本機 Console 驗收全部通過；Feature 1 先前亦已通過。
+- 歷史驗證與部署（截至 2026-10-02）：MSVC `cargo test --lib --locked --features real-ctap` 64/64；Release backend-mode 7/7；Node UI 24/24（Feature 4 targeted 5/5）；`node --check src/app.js`、`git diff --check` 通過。Windows GNU Release GUI + CLI（`--locked --features real-ctap`）建置成功；GUI 6,729,216 bytes，SHA-256 `7deba32418fb173d5ada126e600c81a748ffa51bcfe503afc7bed683fb928ed1`；CLI 2,427,392 bytes，SHA-256 `1493ab5d09fb942a61f77cc9e82827b2fa08f60e3e74d81e5d1cd657771ab3c2`。當時 `cargo clippy -D warnings` 受 11 個既有其他模組警告阻擋，新增別名路徑無相關警告；此歷史限制已由後續 PR #12 處理，PR #11/#12 已合併，既有整合驗證與 main CI 讀回結果見 §15（本次未重跑）。Feature 4 獨立 review 已通過並部署至 Win11-NB（GUI 目標端 SHA-256 `7deba32418fb173d5ada126e600c81a748ffa51bcfe503afc7bed683fb928ed1`）；舊 EXE 與 vault 均有驗證備份，部署前後 live vault hash 不變、3 slots。使用者於 2026-10-02 確認 Feature 2、3、4 集中 Win11-NB 本機 Console 驗收全部通過；Feature 1 先前亦已通過。此 GUI 部署快照已由後續 Feature 5–7 部署取代（superseded）。
 - 實體驗收已由使用者在 Win11-NB 互動桌面通過：舊 raw-CTAP 槽可由 Windows WebAuthn 解鎖、新金鑰註冊與登入成功，第二支 YubiKey NFC 交叉登入亦通過；不再執行原 Kanban 規劃的 raw-CTAP CLI 實體路線。
-- 本次單一登入入口/提示前景修改：使用者確認 Console 啟動正常；H1、H3、H4、H5 通過。H2 通用按鈕免選金鑰通過；上一候選的安全性視窗仍在背景。Console 唯讀 EnumWindows 探測確認 FidoVault 前景 z-order 17，獨立 `CredentialUIBroker`「Windows 安全性」視窗 z-order 18、`OWNER=0`。新增窄範圍 best-effort broker-window monitor：baseline 所有 top-level HWND 與既有 broker PID，只針對唯一的新同-session System32 CredentialUIBroker 視窗，在 FidoVault 仍為 foreground 時嘗試一次 SetForegroundWindow；不設 topmost、不用 ASFW_ANY。程式碼獨立審查通過；commit `45d3aa6` 已推至 PR #3 branch；Rust 53/53、UI 4/4、Windows GNU Release build 成功。該 commit 的新 GUI 已部署至 Win11-NB，SHA256 `59BBAB25C21A419702D02FA7E97242392C388149432BAF733AC0C715F06085D8`，6,140,928 bytes；舊 exe 備份 `C:\FidoVault\portable-fido-vault.exe.pre-H2focus-20261001-223428-2985cea4.bak`。vault 備份 `C:\FidoVault\vault.db.pre-H2focus-20261001-223428-2985cea4.bak`；部署前後均為 3 slots、SHA256 `58A1D4877C2274B3D403E1D87CD1E9BA7C5404D450C3F69E1D9486501F02D780`。本機 Console H2 測試已由使用者確認 OK：通用登入免選金鑰，Windows 安全性操作提示置前；H2 驗收通過並結案。前景交接仍是 best-effort。RDP-Tcp#0 Session 2 曾回報 WebAuthn API v1，維持 v4+ fail-closed；RDP／WebAuthn redirection 不支援，並已在 README 明確說明；硬體驗收使用本機 Console session。
+- 2026-10-01 單一登入入口/提示前景修改（歷史紀錄，GUI 版本已由後續功能部署取代）：使用者確認 Console 啟動正常；H1、H3、H4、H5 通過。H2 通用按鈕免選金鑰通過；上一候選的安全性視窗仍在背景。Console 唯讀 EnumWindows 探測確認 FidoVault 前景 z-order 17，獨立 `CredentialUIBroker`「Windows 安全性」視窗 z-order 18、`OWNER=0`。新增窄範圍 best-effort broker-window monitor：baseline 所有 top-level HWND 與既有 broker PID，只針對唯一的新同-session System32 CredentialUIBroker 視窗，在 FidoVault 仍為 foreground 時嘗試一次 SetForegroundWindow；不設 topmost、不用 ASFW_ANY。程式碼獨立審查通過；commit `45d3aa6` 已推至 PR #3 branch；Rust 53/53、UI 4/4、Windows GNU Release build 成功。該 commit 的新 GUI 已部署至 Win11-NB，SHA256 `59BBAB25C21A419702D02FA7E97242392C388149432BAF733AC0C715F06085D8`，6,140,928 bytes；舊 exe 備份 `C:\FidoVault\portable-fido-vault.exe.pre-H2focus-20261001-223428-2985cea4.bak`。vault 備份 `C:\FidoVault\vault.db.pre-H2focus-20261001-223428-2985cea4.bak`；部署前後均為 3 slots、SHA256 `58A1D4877C2274B3D403E1D87CD1E9BA7C5404D450C3F69E1D9486501F02D780`。本機 Console H2 測試已由使用者確認 OK：通用登入免選金鑰，Windows 安全性操作提示置前；H2 驗收通過並結案。前景交接仍是 best-effort。RDP-Tcp#0 Session 2 曾回報 WebAuthn API v1，維持 v4+ fail-closed；RDP／WebAuthn redirection 不支援，並已在 README 明確說明；硬體驗收使用本機 Console session。
 - 建置檔參數：release `strip + lto`。
 
 ## 7. 部署（Win11-NB，WinRM）
@@ -133,13 +136,13 @@ cargo +stable-x86_64-pc-windows-gnu build --release --features real-ctap --bin p
 - 推檔：`python scripts/nb_push.py <file> [remote_dir]`
   - WinRM（`Invoke-Command -ComputerName Win11-NB -UseSSL:$false`）+ base64 chunk（200KB/次，
     outer 腳本走 stdin 避開 CreateProcess 8KB 上限）+ 落地 SHA256 驗證。
-- Gate 1 驗證：`python scripts/nb_gate.py <exe> [vault_cli.exe]`
-  - 推檔 → 啟動 GUI → 10s 存活檢查（過程 + WebView2 子程序當證據；session-0 無互動桌面，截圖仅供参考）
-  - 有 vault_cli 時順帶 NB CLI E2E（Gate 8 跨機：create/register/login/add/list）。
+- 歷史 Gate 1 腳本：`python scripts/nb_gate.py <exe> [vault_cli.exe]`
+  - 當時流程為推檔 → session-0 啟動 GUI → 10s 存活檢查（程序 + WebView2 子程序；截圖僅供參考）。此流程已由本機 Console GUI 驗收取代（superseded），不可作為目前的 GUI／WebAuthn 操作方式。
+  - 腳本有 vault_cli 時會在 NB 新建測試金庫並執行 mock CLI E2E；此腳本本身未搬移既有金庫，不構成既有金庫或實體 GUI 跨機人工驗收證據。
 - 注意：PS 5.1 讀無 BOM 腳本會當 ANSI(950) 解碼 → 所有遠端 PS 腳本純 ASCII（nb_push.py 已用 base64 內層迴避）。
-- **實體 FIDO2 驗證需互動 session**（WinRM session-0 下 HID 存取行為不同，見 §9 根因）。
+- **GUI／實體 FIDO2 驗證僅由使用者在本機 Console 互動 session 操作**；WinRM 僅供唯讀檢查、備份與核准部署，不啟動 GUI 或執行 WebAuthn。RDP／WebAuthn redirection 不支援，不是待驗項。
 
-## 8. Gate 狀態（截至 2026-10-02）
+## 8. Gate 與功能驗收狀態（彙整至 2026-10-04；最新功能驗收為 2026-10-03）
 
 | Gate | 內容 | 狀態 |
 |---|---|---|
@@ -149,11 +152,25 @@ cargo +stable-x86_64-pc-windows-gnu build --release --features real-ctap --bin p
 | 4 | 第二支金鑰/任一支可登入 | ✅ 第二支 YubiKey NFC 交叉登入通過 |
 | 5 | CRUD + 時間戳 | ✅（mock E2E） |
 | 6 | 軌跡完整/無明文密碼 | ✅（mock E2E） |
-| 7 | 閒置自動上鎖 | ✅ 使用者確認 G7 驗收通過（D1–D4） |
-| 8 | 加密檔直拷別機可解密 | ✅（mock E2E copy-test） |
-| 9 | 每筆條目舊密碼歷史（預設 3，可設 1–20） | 🟡 Rust/UI/E2E 測試與建置通過；使用者明確延後 Win11-NB 本機 Console 實機驗收 |
-| 10 | 條目複製密碼（60 秒 Win32 原子條件清除） | 🟡 Rust 60/60、Node UI 19/19、GNU Release build 通過；待 Win11-NB 本機 Console 驗收 |
-| 11 | 註冊時設定安全性金鑰本機別名 | 🟡 自動化測試及 GNU Release build 完成後，與 Gate 9/10 一併交由使用者於 Win11-NB 本機 Console 驗收 |
+| 7 | 閒置自動上鎖 | ✅ 使用者確認驗收通過（D1–D4） |
+| 8 | 加密檔直拷別機可解密 | ✅ mock E2E copy-test 通過；此結論限於 mock 測試，未見實體 GUI 跨機人工 PASS 回報 |
+| 9 | 每筆條目舊密碼歷史（預設 3，可設 1–20） | ✅ 使用者於 2026-10-02 確認 Feature 2/3/4 集中本機 Console 驗收全部 PASS，已取代先前延後狀態 |
+| 10 | 條目複製密碼（60 秒 Win32 原子條件清除） | ✅ 同次 2026-10-02 集中驗收全部 PASS；60 秒清除、外部替換保留與連續複製結果見使用者驗收文件 |
+| 11 | 註冊時設定安全性金鑰本機別名 | ✅ 同次 2026-10-02 集中驗收全部 PASS；別名驗證、註冊與重登入結果見使用者驗收文件 |
+
+### 已確認功能彙整
+
+| Feature | 內容 | 使用者確認（Win11-NB 本機 Console） |
+|---|---|---|
+| 1 | 密碼欄位遮罩 | ✅ 2026-10-01 PASS |
+| 2 | 舊密碼歷史 | ✅ 2026-10-02，Feature 2/3/4 整體 PASS |
+| 3 | 密碼複製與 60 秒條件清除 | ✅ 2026-10-02，Feature 2/3/4 整體 PASS |
+| 4 | 安全性金鑰本機別名 | ✅ 2026-10-02，Feature 2/3/4 整體 PASS |
+| 5 | CSV 範本、批次匯入／更新 | ✅ 2026-10-03 全項 PASS（PR #13；§12） |
+| 6 | 條目即時搜尋 | ✅ 2026-10-03 明確 PASS（PR #14；§13） |
+| 7 | 預設最大化與金鑰登入期間維持最大化 | ✅ 2026-10-03 明確 PASS（PR #15 修正版；§14） |
+
+PR #13/#14/#15 均已合併；8 張 `[FidoVault]` Kanban 卡均為 done。驗收、PR 合併與任務完成不等同所有舊模板都逐項人工 PASS：`user-verification-steps.md` 的 A–C/E/F 保留未勾選，D5 為未回報的選測；Gate 8 仍僅有上述 mock 證據。RDP 為不支援、raw CTAP CLI 實體路線為已退役／由 GUI 驗收取代（superseded），均不是待驗項。
 
 ## 9. 2026-09-29 Win11-NB log 問題：根因與修復
 
@@ -203,6 +220,28 @@ cargo +stable-x86_64-pc-windows-gnu build --release --features real-ctap --bin p
 
 ## 12. Feature 5 — CSV 批次匯入／更新與範本下載
 
-- 使用者於 2026-10-03 確認 Win11-NB 本機 Console 驗收項目全部通過；逐項結果見 `docs/user-verification-steps.md` 的 Feature 5 區段。
+- 使用者於 2026-10-03 確認 Win11-NB 本機 Console 驗收項目全部通過；PR #13 已合併。逐項結果見 `docs/user-verification-steps.md` 的 Feature 5 區段。
 - Release GUI 來源 commit `f33eea8d24fd77e1a85e9a59e409ba8ddf9cbfa3`，Win11-NB 目標 SHA-256 `1e2d22aba57f394a7b41e5500fa9deccaf3d414cfa7870699a0c7862ea73db82`。舊 GUI 與 vault 均已建立並驗證備份；部署前後 live vault hash 相同、key-slot 數為 1。
-- 驗證：Rust 74/74、Node 29/29、Release backend-mode 7/7、vendor 6/6；Release GUI/CLI build、scoped rustfmt 與 `git diff --check` 通過。`clippy -D warnings` 有 11 項既有、非本次變更檔案的診斷；此 PR head 未找到 hosted Actions run。
+- 歷史驗證（Feature 5 候選當時）：Rust 74/74、Node 29/29、Release backend-mode 7/7、vendor 6/6；Release GUI/CLI build、scoped rustfmt 與 `git diff --check` 通過。當時 `clippy -D warnings` 有 11 項既有、非本次變更檔案的診斷；當時此 PR head 未找到 hosted Actions run。這些是候選當時的紀錄，已由 PR #11/#12 後續工程收尾與 §15 的精確 main CI 讀回結果取代（superseded），不是目前的 Clippy／CI 結論；本次未重跑。上述部署快照亦已由後續 Feature 6/7 部署取代，保留來源與雜湊供追溯。
+
+## 13. Feature 6 — 條目介面即時搜尋
+
+- 使用者於 2026-10-03 明確確認 Win11-NB 本機 Console 驗收 PASS；PR #14 已合併。規格與既有測試結果見 `docs/plans/feature-06-entry-search.md`，人工驗收紀錄見 `docs/user-verification-steps.md` 的條目介面即時搜尋區段。
+- 已解鎖條目分頁以記憶體資料即時比對網站、帳號及備註，不分大小寫；不讀取或比對目前／舊密碼，也不持久化查詢或寫入 audit。
+- 清除／空白查詢恢復全列表；零結果與空金庫分開提示；列操作仍作用於正確條目，CRUD／CSV 重載後保留目前查詢。既有 Node UI、語法與 diff 檢查結果是當時驗證，本次僅同步文件。
+
+## 14. Feature 7 — 主視窗預設最大化與金鑰登入狀態保持
+
+- 使用者於 2026-10-03 明確確認 Win11-NB 本機 Console 驗收 PASS：啟動最大化（非全螢幕）、金鑰登入提示出現與完成／取消後維持最大化、可還原／移動／調整大小、重新啟動仍預設最大化。PR #15 原先 stacked on PR #14，兩者均已合併。
+- 初次版本 commit `a7fb6a0` 曾在金鑰登入時還原視窗，已由修正版取代（superseded），不是待驗收候選。前景處理僅在視窗已最小化時 restore，不改變可見最大化／一般視窗的狀態；規格見 `docs/plans/feature-07-default-maximized-window.md`。
+- 最近一次已記錄 GUI 部署（2026-10-03）來源 fix commit `1bf77fd23d27dcea2235821fc36bc74a21c269db`；`C:\FidoVault\portable-fido-vault.exe` 為 7,172,096 bytes，SHA-256 `0910d0cd5f29518e83c5ebd60b562572165adda91fae335f4771a386f52570f6`。來源 commit、雜湊、大小與下列備份紀錄皆逐字取自 `docs/user-verification-steps.md`，本次未部署或重新回讀目標機。
+- 當時部署前備份目錄 `C:\FidoVault\backups\key-login-maximized-20261003-1bf77fd`；舊 GUI SHA-256 `a874a96026e1c2a6baa7857a9fe3c7b564758347f2458aba5bd254ddd70e2092`，vault SHA-256 `35b669a0c720314ccb9f602faa89b7e8b5adf82d09f1c43831f40f5968fdf1a1`。當時部署後 GUI hash 相符、vault hash 不變、header 有效且有 1 個 key slot；無相關程序、持久 authenticator override 或傳輸暫存檔，WinRM 未啟動 GUI。較早部署與備份紀錄保留於使用者驗收文件，不把歷史 3-slot 快照當作本次槽位數。
+
+## 15. 2026-10-04 工程收尾紀錄（區分既有驗證讀回與本輪檢查）
+
+- 文件維護基準為 main `18134cbe5ae603dd502f5be59b6cbb8520933dd3`（Merge PR #12: verified Clippy baseline cleanup）；本輪文件變更不修改 Rust／前端程式碼，不部署或操作 WebAuthn。
+- 工程收尾流程已重新讀回：PR #11 為 MERGED，merge commit `8f34ccd10a24d9561fa09d10500e1ef7fff6c34e`；PR #12 為 MERGED，merge commit `18134cbe5ae603dd502f5be59b6cbb8520933dd3`。兩者由其他授權流程完成合併，並非本次文件維護執行。
+- PR #12 既有整合收尾紀錄針對 exact-head `66d18317`：測試 75/75、Clippy 無 diagnostics、local Node 38/38。這是已完成驗證的讀回紀錄，不宣稱本次重新執行，亦不將該 exact-head 測試冒充為 main commit 的本機重跑。
+- 工程收尾流程以 Actions REST 對精確 main `18134cbe5ae603dd502f5be59b6cbb8520933dd3` 讀回 1 個 run：`37177652514`，event=`push`、status=`completed`、conclusion=`success`、updated_at=`2026-10-04T04:55:56Z`。此結果僅對應該 main SHA，不延伸為其他 revision 或所有品質檢查的證據。
+- 本輪在該 main SHA 的獨立 worktree 實跑 `cargo fmt --all -- --check`：exit code 1，14 個檔案、94 個 Diff blocks（src-tauri：7 檔／83 blocks；vendor：7 檔／11 blocks），未通過。未執行格式修正；歷史 scoped rustfmt 不等同全庫格式檢查。
+- 同一 SHA 的本機 Node suite 38/38、`node --check src/app.js` 與 `git diff --check` 通過；文件另核對原有驗收勾選及部署雜湊未遭改動。本機 main／origin/main 已同步，計畫與建置 log 原位保留並加入本機 ignore；整理前 17 個檔案已備份並逐檔驗證。完整盤點見 `docs/reports/2026-10-04-maintenance-audit.md`。
