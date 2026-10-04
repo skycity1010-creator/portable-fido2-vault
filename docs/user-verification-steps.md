@@ -15,7 +15,7 @@
 | Feature 7 — 預設最大化與金鑰登入期間維持最大化 | 2026-10-03 明確 PASS（PR #15 修正版，已合併） |
 | 主畫面條目刪除確認（PR #17） | 使用者確認 D1–D5 PASS；D6 已免測、不列待辦（歷史 NOT_TESTED 非 PASS） |
 
-各節部署雜湊、備份、槽位數與操作說明保留為**當時快照**；2026-10-01 的 3 slots 不代表後續部署數量。最近一次已記錄部署是下方條目刪除確認版本（來源 `c2409fa3f71eda9c228aabfb26e45600a88875f2`）；本輪收尾僅同步使用者驗收紀錄，未再部署或重新回讀目標機。
+各節部署雜湊、備份、槽位數與操作說明保留為**當時快照**；2026-10-01 的 3 slots 不代表後續部署數量。最新已記錄部署為本文末尾的 Rust 格式維護版本（來源 `99ff0e5e537c5485f6fb65819f45662c2769c0a1`），使用者已回報整體驗證成功並授權收尾與合併；本輪文件收尾不再部署或操作目標金庫。
 
 A–C/E/F 是舊模板，沒有逐項人工 PASS 回報，不因功能／任務結案而補勾；D1–D4 已確認，D5 為選測且未回報。Gate 8 目前僅有 mock E2E copy-test，未見實體 GUI 跨機人工 PASS。H1–H5 與下方 Feature 1–7 的既有確認維持完成；RDP 不支援、raw CTAP CLI 實體 register/login 路線已由 GUI 驗收取代（superseded），不是待驗項。
 
@@ -260,3 +260,11 @@ Feature 3 standalone 候選 GUI（6,589,440 bytes，SHA-256 `58ba298f7f2bcd5fa4d
 使用者回報（Discord message `1556211623264522241`）：「D1~5通過，D6未測，進行收尾和合併」。D1–D5 已勾選；D6 保留未勾選／未測，不推定失敗路徑實機通過。依此授權進行收尾與合併；僅更新明確回報項目，不延伸為其他 Gate 的人工 PASS。
 
 目前裁決（使用者 message `1556265625158946837`）：條目刪除 D6 已免測、不再要求執行，排除於目前待辦；上述歷史未測紀錄不改為 PASS。
+
+## 全庫 Rust 格式維護 — Win11-NB 使用者驗收（PR #18，整體 PASS）
+
+- 已驗收 GUI 來源：`99ff0e5e537c5485f6fb65819f45662c2769c0a1`，Windows GNU Release（`--release --locked --features real-ctap`）。
+- 目標：`C:\FidoVault\portable-fido-vault.exe`；7,173,120 bytes，SHA-256 `be089077c6a37d578e036338c77f4870d2c526c07dbb7e010f117873e6d214c2`。部署完成後、使用者啟動前獨立讀回相符。
+- 備份：`C:\FidoVault\backup-rustfmt-99ff0e5-20261004-204309-c3957955`，舊 EXE／金庫備份雜湊均已驗證。部署前後 exact sibling `vault.db` hash 及 1 個 key slot 不變，既有 CLI／WebView2Loader 未替換；這些是部署時快照，非人工登入後即時狀態。
+- 交接要求由使用者在 Win11-NB 本機 Console、一般權限操作，確認正常啟動／最大化、既有金鑰解鎖及 Windows 安全性提示前景、鎖定後主密碼解鎖。使用者於 `2026-10-04T21:03:42.075+08:00` 回報：「我驗證成功，進行收尾與合併」（message `1556290719763665058`）。據此記錄本次版本的**整體使用者驗收 PASS**及收尾／合併授權；回報未逐項展開，因此不新增逐項勾選或延伸其他歷史／跨機 gates。
+- 詳細 metadata／provenance：`docs/reports/rust-format-deployment.json`；格式、測試、獨立審查與發布邊界見 `docs/reports/rust-format-verification.md`。本輪後續僅更新文件及已授權合併，不再部署、啟動 GUI、操作 WebAuthn 或覆寫金庫。

@@ -3,7 +3,7 @@
 > 彙整日期：2026-10-04｜建置機：WS2｜部署/驗證機：Win11-NB（`C:\FidoVault`）
 > 本檔彙整 README.md、docs/spec.md、docs/user-verification-steps.md 與近期修復紀錄（§9），
 > 作為單一入口文件；細節以各原始文件為準。
-> 本次同步已確認驗收、讀回既有工程驗證紀錄，並執行全庫格式只讀檢查及本機 Node sanity checks；未重新建置、部署或重跑 Rust／Clippy。歷史部署雜湊與槽位數僅代表各次部署的快照，不代表本次重新回讀目標機。
+> 本檔保留各次工程驗證、部署與使用者回報的歷史快照；最新全庫 Rust 格式維護、Release 部署與使用者驗收見 §16。歷史雜湊／槽位數不代表驗收後目標金庫的即時狀態；本輪收尾不再部署或操作金庫。
 
 ## 1. 專案概況
 
@@ -255,3 +255,12 @@ cargo +stable-x86_64-pc-windows-gnu build --release --features real-ctap --bin p
 - 工程收尾流程以 Actions REST 對精確 main `18134cbe5ae603dd502f5be59b6cbb8520933dd3` 讀回 1 個 run：`37177652514`，event=`push`、status=`completed`、conclusion=`success`、updated_at=`2026-10-04T04:55:56Z`。此結果僅對應該 main SHA，不延伸為其他 revision 或所有品質檢查的證據。
 - 本輪在該 main SHA 的獨立 worktree 實跑 `cargo fmt --all -- --check`：exit code 1，14 個檔案、94 個 Diff blocks（src-tauri：7 檔／83 blocks；vendor：7 檔／11 blocks），未通過。未執行格式修正；歷史 scoped rustfmt 不等同全庫格式檢查。
 - 同一 SHA 的本機 Node suite 38/38、`node --check src/app.js` 與 `git diff --check` 通過；文件另核對原有驗收勾選及部署雜湊未遭改動。本機 main／origin/main 已同步，計畫與建置 log 原位保留並加入本機 ignore；整理前 17 個檔案已備份並逐檔驗證。完整盤點見 `docs/reports/2026-10-04-maintenance-audit.md`。
+
+## 16. 全庫 Rust stable 格式維護 — 部署及使用者驗收（PR #18）
+
+- §15 的全庫格式失敗是修正前歷史快照。全庫維護包含自有與 vendored Rust；111 個追蹤 Rust 檔案（自有 11、vendor 100）均通過 stable 格式檢查與獨立 formatter 重現。Node 53/53、Rust 75/75、vendor 6/6、Clippy 與 18 檔獨立審查通過；未改功能、安全行為、依賴、金庫 schema、UI 或 CI workflow。詳見 `docs/reports/rust-format-verification.md`。
+- 已發布程式來源 `99ff0e5e537c5485f6fb65819f45662c2769c0a1`；該 exact-head Windows CI `37200443116` completed/success。本輪收尾僅更新文件，新的文件 head／合併後 main CI 另行讀回，不能把上述舊 run 當作其他 head 的成功證據。
+- 使用者另行核准 build／推送後，Windows GNU Release（`--release --locked --features real-ctap`）建置 exit 0；GUI 於 `2026-10-04T20:57:50.653578+08:00` 部署至 Win11-NB 的 `C:\FidoVault\portable-fido-vault.exe`，7,173,120 bytes，SHA-256 `be089077c6a37d578e036338c77f4870d2c526c07dbb7e010f117873e6d214c2`，獨立目標讀回一致。
+- 舊 EXE／exact sibling vault 非覆寫備份位於 `C:\FidoVault\backup-rustfmt-99ff0e5-20261004-204309-c3957955`。部署前後 vault hash 與 1 個 key slot 不變；CLI、已簽章 x64 WebView2Loader 未替換。這是使用者啟動前的部署快照，不代表登入／audit 後的即時金庫 hash；詳細 metadata 見 `docs/reports/rust-format-deployment.json`。
+- 使用者於 `2026-10-04T21:03:42.075+08:00` 明確回報：「我驗證成功，進行收尾與合併」（message `1556290719763665058`）。本次已部署格式維護版本記為使用者整體驗收 PASS，並已授權 PR #18 收尾／合併；不補造逐項檢查結果或延伸其他歷史／跨機 gates。
+- 本輪不再建置、部署或操作 Win11-NB GUI／WebAuthn／金庫；收尾僅補充部署與使用者回報文件。已驗收 production source 不變；PR／Kanban 的實際合併及結案狀態以後續讀回為準，原始證據與 release artifact 保留於 `D:/project/_archives/portable-fido2-vault/20261004-rustfmt-maintenance`。
