@@ -123,8 +123,8 @@ found zero Edge processes using the smoke profile prefix.
 
 Already submitted IPC cannot be canceled retroactively. Node and synthetic browser
 checks do not prove Tauri/WebView integration, physical GUI acceptance or deployment.
-Win11-NB Console gate remains PENDING in docs/user-verification-steps.md, using disposable
-synthetic entries only. Codex performed no Rust build, CI, production GUI launch,
+Win11-NB Console acceptance is now reported in docs/user-verification-steps.md:
+D1–D5 PASS, D6 NOT_TESTED, with explicit user authorization to close and merge. Codex performed no Rust build, CI, production GUI launch,
 deployment, real vault/authenticator interaction, commit, push or merge. Parent
 independent specification and code-quality re-review PASSED on staged tree
 `4b3bfefff6ea3860dd774e5fbfc35da1ea59b110`, with zero security concerns and zero
@@ -135,7 +135,7 @@ the manual checklist evidence description; production and test blobs remain
 identical to the reviewed tree. Publication state is tracked in PR #17 and
 Kanban t_7001952b, not inferred from these pre-commit snapshots.
 
-## Parent release deployment — local acceptance remains PENDING
+## Parent release deployment — pre-acceptance snapshot
 
 - User authorized Win11-NB delivery after verification and confirmed graceful GUI closure. No process was force-terminated.
 - Source revision: `c2409fa3f71eda9c228aabfb26e45600a88875f2`; subsequent handoff edits are documentation only.
@@ -148,4 +148,12 @@ Kanban t_7001952b, not inferred from these pre-commit snapshots.
 - Existing `vault_cli.exe` and `WebView2Loader.dll` hashes were unchanged. No persistent authenticator override, leftover staging, or FIDO client was present at pre-launch read-back.
 - Transfer used a unique staging directory; staged SHA-256 was checked before same-volume replacement. The first replacement attempt failed because PowerShell 5.1 passed `$null` as an invalid string path. Immediate read-back confirmed old EXE/vault unchanged; synthetic-file probes reproduced the failure and verified `[System.Management.Automation.Language.NullString]::Value`. Resume used only the exact verified staging path; corrected replacement and independent final checks passed. No application source changed for this deployment-only correction.
 - Durable structured metadata: `docs/reports/entry-delete-confirmation-deployment.json`.
-- No remote GUI launch, WebAuthn/FIDO operation, real entry deletion, PR merge, or task completion. D1–D6 remain PENDING until explicit user PASS/FAIL reports.
+- At deployment handoff, parent performed no remote GUI launch, WebAuthn/FIDO operation, real entry deletion, PR merge, or task completion; acceptance was PENDING at that time.
+
+## User acceptance and closeout authorization
+
+- User statement (Discord message `1556211623264522241`): 「D1~5通過，D6未測，進行收尾和合併」。
+- D1–D5 are explicitly PASS; D6 remains NOT_TESTED/unchecked. Error/retry paths have synthetic automated coverage, not a physical D6 PASS.
+- User authorized closeout and merge with that declared limitation. Checklist, deployment metadata, and project roll-up reflect only these confirmed results.
+- Source of the accepted executable remains `c2409fa3f71eda9c228aabfb26e45600a88875f2`; closeout edits are documentation only. No redeployment or live-vault manipulation is needed.
+- Actual merge/CI/task state is verified separately in PR #17 and Kanban `t_7001952b`; this authorization record does not predeclare a merge.

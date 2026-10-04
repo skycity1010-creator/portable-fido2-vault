@@ -56,7 +56,12 @@
     "vault_backup_sha256": "6aadc34c034f8ac76d963e15506accae28a2be215197aaaf538d4fae6340cd80"
   },
   "staging_removed": true,
-  "manual_acceptance": "PENDING",
+  "manual_acceptance_at_deployment": "PENDING",
+  "manual_acceptance": "D1-D5_PASS_D6_NOT_TESTED",
+  "manual_acceptance_results": {"D1": "PASS", "D2": "PASS", "D3": "PASS", "D4": "PASS", "D5": "PASS", "D6": "NOT_TESTED"},
+  "user_report_message_id": "1556211623264522241",
+  "user_report": "D1~5通過，D6未測，進行收尾和合併",
+  "closeout_and_merge_authorized": true,
   "pr": 17,
   "ci": {
     "conclusion": "success",
