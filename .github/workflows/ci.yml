@@ -1,0 +1,67 @@
+name: Windows CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fido-vault-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-tests:
+    name: UI, Rust, and mock Gate E2E
+    runs-on: windows-2025
+    timeout-minutes: 40
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Record toolchain versions
+        run: |
+          node --version
+          rustc --version
+          cargo --version
+          python --version
+
+      - name: Run frontend tests
+        run: node --test
+
+      - name: Run Rust unit tests (real CTAP feature, no hardware)
+        working-directory: src-tauri
+        env:
+          CARGO_BUILD_JOBS: 1
+          CARGO_PROFILE_TEST_DEBUG: 0
+          CARGO_PROFILE_DEV_DEBUG: 0
+          CARGO_INCREMENTAL: 0
+        run: cargo test --lib --locked --features real-ctap -j 1
+
+      - name: Build mock CLI for offline Gate E2E
+        working-directory: src-tauri
+        run: cargo build --release --locked --example vault_cli
+
+      - name: Run mock Gate E2E
+        working-directory: src-tauri
+        shell: pwsh
+        env:
+          PYTHONUTF8: '1'
+        run: |
+          $gateRoot = Join-Path $env:RUNNER_TEMP "fido-vault-gate-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          if (Test-Path -LiteralPath $gateRoot) {
+            throw "Refusing to use a pre-existing test directory: $gateRoot"
+          }
+          python ../scripts/gate_e2e.py $gateRoot
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
