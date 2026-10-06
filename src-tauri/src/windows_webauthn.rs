@@ -2,6 +2,9 @@
 //! The raw CTAP backend remains available for the CLI and diagnostics.
 
 use crate::fido2::{DetectedKey, FidoBackend, FidoError, KeyKind, RegisteredCredential};
+use crate::webauthn_diagnostics::{
+    capability_record, diagnose, FailureStage, Operation, OperationDiagnostics,
+};
 use std::{
     collections::HashSet,
     ffi::c_void,
@@ -509,6 +512,15 @@ pub struct WindowsWebAuthnBackend {
 impl WindowsWebAuthnBackend {
     pub fn new(hwnd: isize) -> Result<Self, FidoError> {
         let api_version = unsafe { WebAuthNGetApiVersionNumber() };
+        let process_id = unsafe { GetCurrentProcessId() };
+        log::info!(
+            "[WebAuthN-capability] {}",
+            capability_record(
+                Some(api_version),
+                Some(process_id),
+                process_session(process_id)
+            ),
+        );
         if !hmac_secret_api_supported(api_version) {
             return Err(FidoError::NotSupported(format!(
                 "Windows WebAuthn API v{api_version} lacks HMAC-secret assertion support (requires v4+)"
@@ -546,6 +558,19 @@ impl WindowsWebAuthnBackend {
     }
 
     fn make_credential(&self, detected: &DetectedKey) -> Result<RegisteredCredential, FidoError> {
+        diagnose(
+            Operation::MakeCredential,
+            |diagnostic| self.make_credential_with_diagnostics(detected, diagnostic),
+            |record| log::info!("[WebAuthN-operation] {}", record),
+        )
+    }
+
+    fn make_credential_with_diagnostics(
+        &self,
+        detected: &DetectedKey,
+        diagnostic: &mut OperationDiagnostics,
+    ) -> Result<RegisteredCredential, FidoError> {
+        diagnostic.failure_stage = Some(FailureStage::Preflight);
         let challenge = random_bytes(32);
         let mut client_json = client_data_json(ClientDataOperation::Create, &challenge);
         let client_data = make_client_data(&mut client_json)?;
@@ -626,12 +651,14 @@ impl WindowsWebAuthnBackend {
             owner_hwnd,
             foreground_before_api,
         );
+        diagnostic.failure_stage = Some(FailureStage::Api);
         if hr < 0 {
             if !attestation.is_null() {
                 unsafe { WebAuthNFreeCredentialAttestation(attestation) };
             }
             return Err(api_error("makeCredential", hr));
         }
+        diagnostic.failure_stage = Some(FailureStage::Response);
         if attestation.is_null() {
             return Err(FidoError::Internal(
                 "Windows WebAuthn API returned no credential attestation".into(),
@@ -639,7 +666,9 @@ impl WindowsWebAuthnBackend {
         }
         let attestation = AttestationGuard(attestation);
         let att = unsafe { &*attestation.0 };
-        if !hmac_secret_enabled(&att.Extensions) {
+        let hmac_creation_confirmed = hmac_secret_enabled(&att.Extensions);
+        diagnostic.hmac_creation_confirmed = Some(hmac_creation_confirmed);
+        if !hmac_creation_confirmed {
             return Err(FidoError::PrfNotConfirmed);
         }
         let credential_id =
@@ -675,6 +704,19 @@ impl WindowsWebAuthnBackend {
         &self,
         credential_ids: &[Vec<u8>],
     ) -> Result<(Vec<u8>, [u8; 32]), FidoError> {
+        diagnose(
+            Operation::GetAssertion,
+            |diagnostic| self.get_hmac_secret_for_any_with_diagnostics(credential_ids, diagnostic),
+            |record| log::info!("[WebAuthN-operation] {}", record),
+        )
+    }
+
+    fn get_hmac_secret_for_any_with_diagnostics(
+        &self,
+        credential_ids: &[Vec<u8>],
+        diagnostic: &mut OperationDiagnostics,
+    ) -> Result<(Vec<u8>, [u8; 32]), FidoError> {
+        diagnostic.failure_stage = Some(FailureStage::Preflight);
         validate_credential_ids(credential_ids)?;
         let challenge = random_bytes(32);
         let mut client_json = client_data_json(ClientDataOperation::Get, &challenge);
@@ -739,12 +781,14 @@ impl WindowsWebAuthnBackend {
             owner_hwnd,
             foreground_before_api,
         );
+        diagnostic.failure_stage = Some(FailureStage::Api);
         if hr < 0 {
             if !assertion.is_null() {
                 unsafe { WebAuthNFreeAssertion(assertion) };
             }
             return Err(api_error("getAssertion", hr));
         }
+        diagnostic.failure_stage = Some(FailureStage::Response);
         if assertion.is_null() {
             return Err(FidoError::Internal(
                 "Windows WebAuthn API returned no assertion".into(),
@@ -753,6 +797,7 @@ impl WindowsWebAuthnBackend {
         let assertion = AssertionGuard(assertion);
         let result = unsafe { &*assertion.0 };
         if result.pHmacSecret.is_null() {
+            diagnostic.output_present = Some(false);
             return Err(FidoError::Internal(
                 "security key returned no hmac-secret output".into(),
             ));
@@ -764,8 +809,12 @@ impl WindowsWebAuthnBackend {
                 "selected credential ID",
             )?
         };
-        let selected_id = validate_selected_credential_id(credential_ids, &selected_id)?;
+        let selected_id = validate_selected_credential_id(credential_ids, &selected_id);
+        diagnostic.credential_match = Some(selected_id.is_ok());
+        let selected_id = selected_id?;
         let output = unsafe { &*result.pHmacSecret };
+        diagnostic.output_present = Some(!output.pbFirst.is_null());
+        diagnostic.output_length = Some(output.cbFirst);
         if output.cbFirst != 32 || output.pbFirst.is_null() {
             return Err(FidoError::Internal(format!(
                 "Windows WebAuthn API returned an invalid hmac-secret length ({})",

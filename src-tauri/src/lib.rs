@@ -26,6 +26,8 @@ pub mod diag_log;
 pub mod fido2;
 pub mod vault;
 #[cfg(all(windows, feature = "real-ctap"))]
+mod webauthn_diagnostics;
+#[cfg(all(windows, feature = "real-ctap"))]
 mod windows_webauthn;
 
 pub type Result<T> = std::result::Result<T, String>;
