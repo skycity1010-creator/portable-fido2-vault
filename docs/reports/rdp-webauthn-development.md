@@ -1,6 +1,6 @@
 ﻿# RDP WebAuthn R1 開發報告（自動化候選版已交付）
 
-自動化候選版已交付；Parent review-round1 為 FAIL，collector metadata 尾 LF bug 已修正，仍待 Parent 獨立重審與 Console/RDP physical acceptance。本輪 Node 65/65、real-ctap lib 85/85、fmt、Clippy、PS5.1 parser/actual collector、Parent 原 probe 均實際 exit0。GUI 使用 qualityfix 輪候選，Rust 未變，本輪未重建或執行 GUI。下方保留先前 PermissionDenied／missing component 等歷史；本輪證據詳見 reviewfix 章節。
+CI portability delta 自動化候選已交付，待 Parent 獨立 delta review、發布新 commit 與新 HEAD hosted CI；Console/RDP physical acceptance 尚待。發布版 HEAD `9fc497bad357ca809a29d202bf1071e03a5cb6fb` 的 Windows hosted CI 有 84 PASS／1 FAIL（source oracle 固定 LF）；本輪測試區塊修正後，本機 GNU targeted 5/5、full real-ctap lib 89/89、Node 65/65、Clippy、fmt、PS5.1 parser/actual collector 與新 Release build 均實際 exit0。最新候選與證據以 ci-portability 章節為準；所有先前 review、失敗與歷史 hash 保留，不宣告新 hosted CI 已通過。未執行 GUI。
 
 ## Provenance 與先前失敗
 
@@ -219,3 +219,52 @@ SHA-256 `758C22D5373868D0733C2424C69CADDB701C74A80623C61538C4CA397AED3466`。
 同目錄 `WebView2Loader.dll` SHA-256 `86545B66CDB0603BC26B626FB9AD610CB6E71F28D468F5EA66DF23B03DDA96D5`；兩者 x64，來源與架構證據沿用 `qualityfix-release-artifacts.json`／`qualityfix-pe-architecture.log`，本輪再次讀回 hash。source+diff/hash snapshot 在 `reviewfix-final-provenance.json`／`reviewfix-final-source/`／`reviewfix-tracked-source.diff`，並對照 `qualityfix-final-provenance.json`，不是重新宣稱 Release build 成功。
 
 本輪 checks 後三個 known generated schemas 無 diff，無需還原；最終只有原允許七個 delivery paths 有工作樹變更，其中本輪新改只有 collector、tests、report。沒有丟棄其他 edits、改 index 或覆寫舊 evidence。Console/RDP physical acceptance、R2–R6 仍 NOT_TESTED；正式金庫、支援聲明與部署未變。未 launch GUI、hardware、WinRM/RDP、commit/push/merge 或 PR/Kanban 操作。R1 不自行結案，待 Parent 獨立 re-review。
+
+## ci-portability：發布後 Windows CI CRLF source oracle
+
+開始時確認 HEAD `9fc497bad357ca809a29d202bf1071e03a5cb6fb`，工作樹乾淨；`ci-portability-before.log/json` 封存所有 tracked file hashes、兩個 allowed 檔案原文與 production prefix。Parent review-round2 PASS 只涵蓋舊發布版，非本次 delta。GitHub Windows CI run37404395846 的 frontend PASS、Rust 84 PASS／1 FAIL、mockbuild/E2E skipped；失敗為原 `backend_wiring_preserves_guard_and_foreground_ffi_gap` 對 LF 的固定 substring，CI CRLF checkout 不匹配。Parent 原 `ci-37404395846-failed.log`、`crlf-repro-edition2021-red.log`、scratch repro 全部只讀未改，並保留初次 failure；不是 dependency/toolchain/hardware failure。
+
+唯一 delivery delta：`src-tauri/src/webauthn_diagnostics.rs` 的 `#[cfg(test)]` 區塊與本報告。由原 wiring 檢查抽取相同 pure oracle，先保留所有原斷言不改：capability 在 guard 前、process_session、兩個最後 foreground sample→FFI gap 不含 log/diagnose、兩個 operation wrapper。LF 先通過，再 CRLF 真實失敗於 MakeCredential wrapper；之後僅在 test source 中 `replace("\r\n", "\n")`，其餘 statement/whitespace 完整保留。沒有更改 production metadata normalization、Git autocrlf、.gitattributes 或 workflow。
+
+Production prefix（`#[cfg(test)]` 前 4091 bytes）SHA-256 原/後相同：
+`a4fee41f27b480316ef04ebf84bcc6a39c7c1f977310bf8f13ac17475faf4d96`。
+所有其他 tracked source hashes 均與乾淨 HEAD baseline 相同（包含 windows_webauthn/lib/PS/JS/Cargo.lock/frontend/vendor/vault/crypto/workflow）。
+
+TDD 與 targeted（以下 cargo 命令 cwd=src-tauri；本文既有 process-local CARGO_HOME/build-v2/jobs1/incremental0/debug0/PATH 設定，每個 invocation 的完整環境亦存 `.command.json`）：
+
+| exact command | actual result | log |
+|---|---|---|
+| `cargo +stable-x86_64-pc-windows-gnu test --lib --locked --offline --features real-ctap -j 1 backend_wiring_accepts_lf_and_crlf -- --exact` | exit0；0 tests、86 filtered：初次短 filter 不匹配，不算 RED/GREEN 或驗收 | ci-portability-crlf-red.log |
+| `cargo +stable-x86_64-pc-windows-gnu test --lib --locked --offline --features real-ctap -j 1 webauthn_diagnostics::tests::backend_wiring_accepts_lf_and_crlf -- --exact` | 修改前 exit101；0 pass／1 fail／85 filtered，原斷言拒絕 CRLF；最小修改後 exit0，1 pass／0 fail／85 filtered | ci-portability-crlf-red-exact.log / crlf-green.log |
+| `cargo +stable-x86_64-pc-windows-gnu test --lib --locked --offline --features real-ctap -j 1 webauthn_diagnostics::tests::backend_wiring_rejects_missing_operation_wrappers -- --exact` | 首次 exit0；1 pass，4 個拒絕案例 | ci-portability-negative-wrappers.log |
+| `cargo +stable-x86_64-pc-windows-gnu test --lib --locked --offline --features real-ctap -j 1 webauthn_diagnostics::tests::backend_wiring_rejects_capability_after_guard -- --exact` | 首次 exit0；1 pass，2 個拒絕案例 | ci-portability-negative-capability.log |
+| `cargo +stable-x86_64-pc-windows-gnu test --lib --locked --offline --features real-ctap -j 1 webauthn_diagnostics::tests::backend_wiring_rejects_observers_in_foreground_ffi_gap -- --exact` | 首次 exit0；1 pass，8 個拒絕案例 | ci-portability-negative-gap.log |
+| `cargo +stable-x86_64-pc-windows-gnu test --lib --locked --offline --features real-ctap -j 1 webauthn_diagnostics::tests::backend_wiring` | 最終 exit0；5 pass／0 fail／84 filtered | ci-portability-targeted-final.log |
+
+14 個負向案例 = missing Make/Get wrapper 各 LF/CRLF（4）＋ capability after guard LF/CRLF（2）＋ Make/Get 最後 foreground→FFI gap 插入 synthetic log/diagnose，各 LF/CRLF（8）。pure source mutation + catch_unwind；完全沒有呼叫 FFI。各 negative test 首次即 GREEN，記為既有 contract coverage，沒有假造 RED 或刪除/弱化原斷言。
+
+本輪完整真實驗證：
+
+| cwd | exact command | actual result | log |
+|---|---|---|---|
+| src-tauri | `cargo +stable-x86_64-pc-windows-gnu test --lib --locked --offline --features real-ctap -j 1` | exit0；89 passed／0 failed／0 ignored／0 filtered | ci-portability-rust-lib.log |
+| src-tauri | `cargo +stable-x86_64-pc-windows-gnu clippy --lib --locked --offline --features real-ctap -j 1 -- -D warnings` | exit0；零 warning | ci-portability-clippy.log |
+| src-tauri | `cargo +stable-x86_64-pc-windows-gnu fmt --check` | exit0 | ci-portability-fmt.log |
+| src-tauri | `cargo +stable-x86_64-pc-windows-gnu build --release --locked --offline --features real-ctap --bin portable-fido-vault` | exit0；同一 process 完成，1m43s，未 launch | ci-portability-release.log |
+| root | `node --test --test-reporter=tap tests/*.test.cjs` | exit0；65 passed／0 failed | ci-portability-node-full.log |
+| root | `node --check src/app.js` | exit0 | ci-portability-node-check.log |
+| root | `node --test --test-reporter=tap --test-name-pattern=^actual_collector_metadata_and_parser$ tests/rdp-webauthn-environment.test.cjs` | exit0；1 passed，PS5.1 ParseFile errors0/BOM/actual collector/schema | ci-portability-parser-collector.log |
+| root | `node D:/project/_archives/portable-fido2-vault/20261006-rdp-verification/codex-evidence/ci-portability-collector-audit.cjs` | exit1：evidence log 同名衝突 EBUSY；保留原 output，非 collector failure | ci-portability-collector-audit.log |
+| root | `node D:/project/_archives/portable-fido2-vault/20261006-rdp-verification/codex-evidence/ci-portability-collector-audit-retry.cjs` | exit0；實際 collector exit0、single allowlist JSON、stderr0、無敏感欄位，使用新 evidence 路徑不覆寫失敗 | ci-portability-collector-audit-retry.log |
+| root | `git diff --check` | exit0 | ci-portability-diff-check.log |
+
+新 candidate：本次完整 GNU Release build，源自 HEAD 9fc497b ＋未提交 test-only delta（source diff 與 hashes 已封存），不是 hosted CI artifact：
+`C:/Users/skycity1010/AppData/Local/hermes/cache/scratch/pfv-rdp-20261006-target/build-v2/release/portable-fido-vault.exe`
+SHA-256 **`39B81C3FE8D6DD0958E8E82D2F381266E7000315F82406BEDC17B06683B9C936`**。
+`WebView2Loader.dll` 同目錄，SHA-256 `86545B66CDB0603BC26B626FB9AD610CB6E71F28D468F5EA66DF23B03DDA96D5`；實際 PE machine 確認兩者 x64，DLL hash 與 isolated registry verified crate `webview2-com-sys-0.39.1/x64/WebView2Loader.dll` 相同。沒有執行 candidate。舊 candidate-r1／qualityfix／reviewfix 來源與證據不修改，不將初次 head9fc 候選冒稱最終 CI 候選。
+
+完整 commands/environment/actual exits/counts、原始輸出、source snapshot＋diff＋所有 tracked hashes、candidate preserved copy：
+`D:/project/_archives/portable-fido2-vault/20261006-rdp-verification/codex-evidence/ci-portability-*`。
+關鍵 provenance：`ci-portability-before.json`、`ci-portability-final-provenance.json`、`ci-portability-source.diff`、`ci-portability-final-source/`、`ci-portability-candidate/`、`ci-portability-results.json`。三個已知 generated schemas 在 checks/build 後沒有 diff；保存其 hashes/空 diff，無需還原，也沒有改 index/廣泛 reset/clean。collector measured_in=collector-process，不替代 GUI process/RDP 實機結果。
+
+本輪未 commit/push/merge、publish、PR/Kanban/remote、GUI/hardware、vault/WinRM/RDP/policy 操作或部署；未處理 native completion 403、未讀 credential。production 與正式支援聲明不變。Console/RDP physical acceptance 仍 NOT_TESTED。R1 不自行宣告完成：Parent 尚需獨立 delta review、提交/推送新 commit、讀回新 HEAD 的 hosted CI 結果。

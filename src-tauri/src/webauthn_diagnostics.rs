@@ -318,7 +318,63 @@ mod tests {
     // Wiring regression supplements runtime metadata/observer tests; never calls FFI.
     #[test]
     fn backend_wiring_preserves_guard_and_foreground_ffi_gap() {
+        assert_backend_wiring(include_str!("windows_webauthn.rs"));
+    }
+
+    #[test]
+    fn backend_wiring_accepts_lf_and_crlf() {
+        let lf = include_str!("windows_webauthn.rs").replace("\r\n", "\n");
+        assert_backend_wiring(&lf);
+        assert_backend_wiring(&lf.replace('\n', "\r\n"));
+    }
+
+    fn assert_wiring_rejected_for_both_line_endings(source: &str) {
+        let lf = source.replace("\r\n", "\n");
+        for fixture in [lf.clone(), lf.replace('\n', "\r\n")] {
+            assert!(std::panic::catch_unwind(|| assert_backend_wiring(&fixture)).is_err());
+        }
+    }
+
+    #[test]
+    fn backend_wiring_rejects_missing_operation_wrappers() {
+        let source = include_str!("windows_webauthn.rs").replace("\r\n", "\n");
+        for operation in ["MakeCredential", "GetAssertion"] {
+            let wrapper = format!("diagnose(\n            Operation::{operation}");
+            assert!(source.contains(&wrapper));
+            let mutant = source.replacen(&wrapper, "removed_wrapper(", 1);
+            assert_wiring_rejected_for_both_line_endings(&mutant);
+        }
+    }
+
+    #[test]
+    fn backend_wiring_rejects_capability_after_guard() {
         let source = include_str!("windows_webauthn.rs");
+        let guard = "if !hmac_secret_api_supported(api_version) {";
+        assert!(source.contains(guard));
+        let mutant = source
+            .replacen("capability_record(", "removed_capability(", 1)
+            .replacen(guard, &format!("{guard}\ncapability_record();"), 1);
+        assert_wiring_rejected_for_both_line_endings(&mutant);
+    }
+
+    #[test]
+    fn backend_wiring_rejects_observers_in_foreground_ffi_gap() {
+        let source = include_str!("windows_webauthn.rs");
+        for ffi in [
+            "WebAuthNAuthenticatorMakeCredential(",
+            "WebAuthNAuthenticatorGetAssertion(",
+        ] {
+            assert!(source.contains(ffi));
+            for observer in ["log::info!(\"synthetic\");", "diagnose(synthetic);"] {
+                let mutant = source.replacen(ffi, &format!("{observer}\n{ffi}"), 1);
+                assert_wiring_rejected_for_both_line_endings(&mutant);
+            }
+        }
+    }
+
+    fn assert_backend_wiring(source: &str) {
+        // Normalize checkout line endings only; preserve every statement and space.
+        let source = source.replace("\r\n", "\n");
         let constructor = source
             .split("pub fn new(hwnd:")
             .nth(1)
