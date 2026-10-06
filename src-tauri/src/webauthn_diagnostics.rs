@@ -372,6 +372,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn backend_wiring_rejects_blocking_or_policy_calls_in_final_gap() {
+        let source = include_str!("windows_webauthn.rs");
+        for ffi in [
+            "WebAuthNAuthenticatorMakeCredential(",
+            "WebAuthNAuthenticatorGetAssertion(",
+        ] {
+            for observer in ["std::thread::sleep(delay);", "capture_broker(system);"] {
+                let mutant = source.replacen(ffi, &format!("{observer}\n{ffi}"), 1);
+                assert_wiring_rejected_for_both_line_endings(&mutant);
+            }
+        }
+    }
+
     fn assert_backend_wiring(source: &str) {
         // Normalize checkout line endings only; preserve every statement and space.
         let source = source.replace("\r\n", "\n");
@@ -396,11 +410,12 @@ mod tests {
         ] {
             let before_ffi = source.split(ffi).next().unwrap();
             let gap = before_ffi
-                .rsplit("self.foreground_owner_hwnd()?")
+                .rsplit("self.foreground_owner_hwnd(owner_identity)?")
                 .next()
                 .unwrap();
             assert!(!gap.contains("log::"));
             assert!(!gap.contains("diagnose("));
+            assert_eq!(gap.trim(), ";\n        if let Some(monitor) = focus_monitor.as_ref() {\n            monitor.arm();\n        }\n        let hr = unsafe {");
         }
         assert!(source.contains("diagnose(\n            Operation::MakeCredential"));
         assert!(source.contains("diagnose(\n            Operation::GetAssertion"));
