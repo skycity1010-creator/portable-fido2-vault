@@ -3,7 +3,9 @@
 
 use crate::fido2::{DetectedKey, FidoBackend, FidoError, KeyKind, RegisteredCredential};
 use crate::webauthn_diagnostics::{
-    capability_record, diagnose, FailureStage, Operation, OperationDiagnostics,
+    capability_record, diagnose, monitor_record, ContinuationDiagnostics, ContinuationStatus,
+    FailureStage, MonitorStop, NativeSessionEvidence, Operation, OperationDiagnostics, QueryStatus,
+    SessionProtocol, SessionState, WindowScalars,
 };
 use std::{
     collections::HashSet,
@@ -21,7 +23,10 @@ use windows_sys::Win32::Networking::WindowsWebServices::*;
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
-use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+use windows_sys::Win32::System::RemoteDesktop::{
+    ProcessIdToSessionId, WTSActive, WTSClientProtocolType, WTSConnectState, WTSFreeMemory,
+    WTSQuerySessionInformationW, WTS_INFO_CLASS,
+};
 use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcessId, OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -124,6 +129,7 @@ struct WindowIdentity {
     hwnd: isize,
     process_id: u32,
     thread_id: u32,
+    session: u32,
 }
 
 fn is_new_window_identity(identity: WindowIdentity, baseline: &HashSet<WindowIdentity>) -> bool {
@@ -151,25 +157,41 @@ struct AcceptedBroker {
     baseline: Arc<BrokerBaseline>,
 }
 
+#[derive(Default)]
+struct BrokerObservation {
+    broker: Option<AcceptedBroker>,
+    // Private policy evidence, never populated from the diagnostic channel.
+    passive_safe: bool,
+}
+#[cfg(test)]
+impl From<Option<AcceptedBroker>> for BrokerObservation {
+    fn from(broker: Option<AcceptedBroker>) -> Self {
+        Self {
+            broker,
+            passive_safe: true,
+        }
+    }
+}
 struct RegistrationContinuation {
     owner: WindowIdentity,
     credential_id: Vec<u8>,
     broker: Option<AcceptedBroker>,
+    passive_safe: bool,
 }
 
-type CreationResult =
-    Result<(RegisteredCredential, WindowIdentity, Option<AcceptedBroker>), FidoError>;
+type CreationResult = Result<(RegisteredCredential, WindowIdentity, BrokerObservation), FidoError>;
 
 fn complete_registration(
     pending: &mut Option<RegistrationContinuation>,
     result: CreationResult,
 ) -> Result<RegisteredCredential, FidoError> {
     *pending = None;
-    result.map(|(registration, owner, broker)| {
+    result.map(|(registration, owner, observation)| {
         *pending = Some(RegistrationContinuation {
             owner,
             credential_id: registration.credential_id.clone(),
-            broker,
+            broker: observation.broker,
+            passive_safe: observation.passive_safe,
         });
         registration
     })
@@ -190,6 +212,8 @@ enum HandoffRefusal {
     Foreground,
     Broker,
     Activation,
+    PassiveSession,
+    PassiveDeadline,
 }
 
 impl HandoffRefusal {
@@ -201,15 +225,158 @@ impl HandoffRefusal {
             Self::Foreground => "foreground-not-associated-broker",
             Self::Broker => "broker-revalidation-failed",
             Self::Activation => "activation-failed",
+            Self::PassiveSession => "passive-session-ineligible",
+            Self::PassiveDeadline => "passive-deadline",
         }
     }
 }
 
+#[cfg(test)]
 fn prepare_continuation(
     pending: &mut Option<RegistrationContinuation>,
     owner: isize,
     credential_ids: &[Vec<u8>],
     system: &mut impl ForegroundSystem,
+) -> Result<HandoffOutcome, HandoffRefusal> {
+    prepare_continuation_recorded(
+        pending,
+        owner,
+        credential_ids,
+        system,
+        &mut ContinuationDiagnostics::default(),
+    )
+}
+
+fn prepare_continuation_recorded(
+    pending: &mut Option<RegistrationContinuation>,
+    owner: isize,
+    credential_ids: &[Vec<u8>],
+    system: &mut impl ForegroundSystem,
+    diagnostic: &mut ContinuationDiagnostics,
+) -> Result<HandoffOutcome, HandoffRefusal> {
+    let started = system.monotonic();
+    let result =
+        prepare_continuation_inner(pending, owner, credential_ids, system, started, diagnostic);
+    diagnostic.elapsed_ms = system
+        .monotonic()
+        .saturating_duration_since(started)
+        .as_millis()
+        .min(u64::MAX as u128) as u64;
+    diagnostic.status = Some(match &result {
+        Ok(HandoffOutcome::Ordinary) => ContinuationStatus::Ordinary,
+        Ok(HandoffOutcome::OwnerForeground) if diagnostic.native.is_some() => {
+            ContinuationStatus::PassiveReturn
+        }
+        Ok(HandoffOutcome::OwnerForeground) => ContinuationStatus::OwnerForeground,
+        Ok(HandoffOutcome::Recovered) => ContinuationStatus::Recovered,
+        Err(HandoffRefusal::Credential) => ContinuationStatus::Credential,
+        Err(HandoffRefusal::Owner) => ContinuationStatus::Owner,
+        Err(HandoffRefusal::UnobservedBroker) => ContinuationStatus::UnobservedBroker,
+        Err(HandoffRefusal::Foreground) => ContinuationStatus::Foreground,
+        Err(HandoffRefusal::Broker) => ContinuationStatus::Broker,
+        Err(HandoffRefusal::Activation) => ContinuationStatus::Activation,
+        Err(HandoffRefusal::PassiveSession) => ContinuationStatus::Session,
+        Err(HandoffRefusal::PassiveDeadline) => ContinuationStatus::Deadline,
+    });
+    result
+}
+
+// Carries creation authority separately from the diagnostic record. Only a
+// successful, consumed continuation can supply a creation-bound identity.
+fn prepare_assertion_continuation(
+    pending: &mut Option<RegistrationContinuation>,
+    owner: isize,
+    credential_ids: &[Vec<u8>],
+    system: &mut impl ForegroundSystem,
+    diagnostic: &mut ContinuationDiagnostics,
+) -> Result<(HandoffOutcome, Option<WindowIdentity>), HandoffRefusal> {
+    let creation_owner = pending.as_ref().map(|context| context.owner);
+    prepare_continuation_recorded(pending, owner, credential_ids, system, diagnostic)
+        .map(|outcome| (outcome, creation_owner))
+}
+
+fn assertion_owner_baseline(
+    system: &mut impl ForegroundSystem,
+    hwnd: isize,
+    creation_owner: Option<WindowIdentity>,
+) -> Result<WindowIdentity, FidoError> {
+    if let Some(expected) = creation_owner {
+        if expected.hwnd != hwnd || expected.session == 0 {
+            return Err(FidoError::Internal(
+                "Windows WebAuthn creation owner is unavailable".into(),
+            ));
+        }
+        return checked_owner_snapshot(system, expected);
+    }
+    // Ordinary login establishes its own fresh owner baseline.
+    system
+        .identity(hwnd)
+        .filter(|owner| valid_owner(system, *owner))
+        .ok_or_else(|| FidoError::Internal("Windows WebAuthn owner identity is unavailable".into()))
+}
+
+fn identity_scalars(identity: Option<WindowIdentity>, hwnd: isize) -> WindowScalars {
+    WindowScalars {
+        hwnd: (hwnd != 0).then_some(hwnd),
+        pid: identity.map(|i| i.process_id),
+        tid: identity.map(|i| i.thread_id),
+        session: identity.map(|i| i.session),
+    }
+}
+
+fn diagnostic_foreground(
+    diagnostic: &mut ContinuationDiagnostics,
+    hwnd: isize,
+    observed_owner: Option<WindowScalars>,
+) {
+    // An unrelated sample refuses immediately; do not block on its metadata.
+    diagnostic.foreground = observed_owner
+        .filter(|observed| observed.hwnd == Some(hwnd))
+        .unwrap_or_else(|| identity_scalars(None, hwnd));
+}
+
+fn valid_owner_recorded(
+    system: &mut impl ForegroundSystem,
+    owner: WindowIdentity,
+    diagnostic: &mut ContinuationDiagnostics,
+) -> bool {
+    let pid = system.current_pid();
+    let identity = system.identity(owner.hwnd);
+    diagnostic.owner = identity_scalars(identity, owner.hwnd);
+    let visible = system.visible(owner.hwnd);
+    diagnostic.owner_visible = Some(visible);
+    let session = system.session(pid);
+    // Re-read identity after potentially blocking session metadata.
+    let final_identity = system.identity(owner.hwnd);
+    diagnostic.owner = identity_scalars(final_identity, owner.hwnd);
+    if final_identity.is_some_and(|identity| identity.process_id == pid)
+        && final_identity.map(|identity| identity.session) != session
+    {
+        // Conflicting native metadata is unknown, never a fabricated session.
+        diagnostic.owner.session = None;
+    }
+    let identity_matches = identity == Some(owner)
+        && final_identity == Some(owner)
+        && owner.process_id == pid
+        && session == Some(owner.session)
+        && system.owner_ids(owner.hwnd) == Some((owner.process_id, owner.thread_id));
+    diagnostic.identity_match = Some(identity_matches);
+    let current_visible = visible && system.visible(owner.hwnd);
+    diagnostic.owner_visible = Some(current_visible);
+    owner.hwnd != 0
+        && owner.process_id == pid
+        && identity_matches
+        && current_visible
+        && session == Some(owner.session)
+}
+
+fn prepare_continuation_inner(
+    pending: &mut Option<RegistrationContinuation>,
+    owner: isize,
+    credential_ids: &[Vec<u8>],
+    system: &mut impl ForegroundSystem,
+    started: Instant,
+    diagnostic: &mut ContinuationDiagnostics,
 ) -> Result<HandoffOutcome, HandoffRefusal> {
     let Some(context) = pending.take() else {
         return Ok(HandoffOutcome::Ordinary);
@@ -217,17 +384,39 @@ fn prepare_continuation(
     if owner != context.owner.hwnd || credential_ids != [context.credential_id] {
         return Err(HandoffRefusal::Credential);
     }
-    if !valid_owner(system, context.owner) {
+    // Capture the unobserved branch's initial sample before blocking owner
+    // metadata can turn an initial NULL into a late "ordinary" owner pass.
+    // The accepted-broker branch retains its original observation order.
+    let initial_foreground = context.broker.is_none().then(|| system.foreground());
+    if let Some(foreground) = initial_foreground {
+        diagnostic_foreground(diagnostic, foreground, None);
+    }
+    if !valid_owner_recorded(system, context.owner, diagnostic) {
         return Err(HandoffRefusal::Owner);
     }
-    let foreground = system.foreground();
+    let foreground = match initial_foreground {
+        Some(0) => 0,
+        Some(foreground) if foreground != owner => foreground,
+        _ => system.foreground(),
+    };
+    let observed_owner = diagnostic.owner;
+    diagnostic_foreground(diagnostic, foreground, Some(observed_owner));
+    diagnostic.owner_minimized = Some(system.minimized(owner));
     if foreground == owner {
         if system.minimized(owner) {
             return Err(HandoffRefusal::Owner);
         }
         return Ok(HandoffOutcome::OwnerForeground);
     }
-    let broker = context.broker.ok_or(HandoffRefusal::UnobservedBroker)?;
+    let Some(broker) = context.broker else {
+        if foreground != 0 || !context.passive_safe {
+            return Err(HandoffRefusal::UnobservedBroker);
+        }
+        if initial_foreground != Some(0) {
+            return Err(HandoffRefusal::UnobservedBroker);
+        }
+        return passive_owner_return(system, context.owner, started, diagnostic);
+    };
     if foreground != broker.identity.hwnd {
         return Err(HandoffRefusal::Foreground);
     }
@@ -274,13 +463,170 @@ fn prepare_continuation(
     Ok(HandoffOutcome::Recovered)
 }
 
+// Budget starts before eligibility metadata; a blocking native query can return
+// late, but can never grant a late success. Only NULL samples permit another poll.
+fn passive_owner_return(
+    system: &mut impl ForegroundSystem,
+    owner: WindowIdentity,
+    started: Instant,
+    diagnostic: &mut ContinuationDiagnostics,
+) -> Result<HandoffOutcome, HandoffRefusal> {
+    let deadline = started + Duration::from_millis(1000);
+    let poll = Duration::from_millis(20);
+    // No waiting is authorized until native active RDP and owner evidence agree.
+    passive_eligibility(system, owner, deadline, diagnostic)?;
+    loop {
+        if deadline.saturating_duration_since(system.monotonic()) < poll {
+            return Err(HandoffRefusal::PassiveDeadline);
+        }
+        system.wait(poll);
+        // Refresh all eligibility evidence after each wait, before the new sample.
+        passive_eligibility(system, owner, deadline, diagnostic)?;
+        let foreground = system.foreground();
+        let observed_owner = diagnostic.owner;
+        diagnostic_foreground(diagnostic, foreground, Some(observed_owner));
+        if system.monotonic() >= deadline {
+            return Err(HandoffRefusal::PassiveDeadline);
+        }
+        if foreground == owner.hwnd {
+            return Ok(HandoffOutcome::OwnerForeground);
+        }
+        if foreground != 0 {
+            return Err(HandoffRefusal::Foreground);
+        }
+    }
+}
+
+fn passive_eligibility(
+    system: &mut impl ForegroundSystem,
+    owner: WindowIdentity,
+    deadline: Instant,
+    diagnostic: &mut ContinuationDiagnostics,
+) -> Result<(), HandoffRefusal> {
+    if system.monotonic() >= deadline {
+        return Err(HandoffRefusal::PassiveDeadline);
+    }
+    if owner.session == 0 {
+        return Err(HandoffRefusal::Owner);
+    }
+    let owner_valid = valid_owner_recorded(system, owner, diagnostic);
+    let minimized = system.minimized(owner.hwnd);
+    diagnostic.owner_minimized = Some(minimized);
+    if !owner_valid || minimized {
+        return Err(HandoffRefusal::Owner);
+    }
+    if system.monotonic() >= deadline {
+        return Err(HandoffRefusal::PassiveDeadline);
+    }
+    let evidence = system.native_session(owner.session, deadline);
+    diagnostic.native = Some(evidence);
+    if system.monotonic() >= deadline {
+        return Err(HandoffRefusal::PassiveDeadline);
+    }
+    if !evidence.active_rdp() {
+        return Err(HandoffRefusal::PassiveSession);
+    }
+    // Identity/session and visibility are validated again after native metadata.
+    let owner_valid = valid_owner_recorded(system, owner, diagnostic);
+    let minimized = system.minimized(owner.hwnd);
+    diagnostic.owner_minimized = Some(minimized);
+    if !owner_valid || minimized {
+        return Err(HandoffRefusal::Owner);
+    }
+    if system.monotonic() >= deadline {
+        return Err(HandoffRefusal::PassiveDeadline);
+    }
+    Ok(())
+}
+
+fn query_native_session(
+    session: u32,
+    deadline: Instant,
+    query_protocol: impl FnOnce(u32) -> Result<u16, QueryStatus>,
+    query_state: impl FnOnce(u32) -> Result<i32, QueryStatus>,
+    now: impl FnOnce() -> Instant,
+) -> NativeSessionEvidence {
+    let protocol = query_protocol(session);
+    // Failed/unknown/non-RDP protocol cannot authorize another blocking query.
+    let state = if protocol == Ok(2) && now() < deadline {
+        query_state(session)
+    } else {
+        Err(QueryStatus::NotQueried)
+    };
+    session_evidence(protocol, state)
+}
+
+fn session_evidence(
+    protocol: Result<u16, QueryStatus>,
+    state: Result<i32, QueryStatus>,
+) -> NativeSessionEvidence {
+    NativeSessionEvidence {
+        protocol: match protocol {
+            Ok(0) => SessionProtocol::Console,
+            Ok(1) => SessionProtocol::Legacy,
+            Ok(2) => SessionProtocol::Rdp,
+            _ => SessionProtocol::Unknown,
+        },
+        state: match state {
+            Ok(value) if value == WTSActive => SessionState::Active,
+            Ok(1..=9) => SessionState::Inactive,
+            _ => SessionState::Unknown,
+        },
+        protocol_query: protocol
+            .map(|_| QueryStatus::Valid)
+            .unwrap_or_else(|status| status),
+        state_query: state
+            .map(|_| QueryStatus::Valid)
+            .unwrap_or_else(|status| status),
+    }
+}
+
+// The BOOL and byte count are native API output, not environment heuristics.
+unsafe fn parse_wts<T: Copy>(
+    success: i32,
+    buffer: *const u16,
+    bytes: u32,
+) -> Result<T, QueryStatus> {
+    if success == 0 {
+        return Err(QueryStatus::NativeFailure);
+    }
+    if buffer.is_null() {
+        return Err(QueryStatus::NullBuffer);
+    }
+    if bytes as usize != std::mem::size_of::<T>() {
+        return Err(QueryStatus::InvalidLength);
+    }
+    Ok(unsafe { ptr::read_unaligned(buffer.cast::<T>()) })
+}
+
+struct WtsAllocation(*mut u16);
+impl Drop for WtsAllocation {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                WTSFreeMemory(self.0.cast());
+            }
+        }
+    }
+}
+fn query_wts<T: Copy>(session: u32, class: WTS_INFO_CLASS) -> Result<T, QueryStatus> {
+    let mut buffer = ptr::null_mut();
+    let mut bytes = 0;
+    let success = unsafe {
+        WTSQuerySessionInformationW(ptr::null_mut(), session, class, &mut buffer, &mut bytes)
+    };
+    let allocation = WtsAllocation(buffer);
+    // Free every non-NULL allocation even when BOOL/length validation fails.
+    unsafe { parse_wts(success, allocation.0, bytes) }
+}
+
 fn valid_owner(system: &mut impl ForegroundSystem, owner: WindowIdentity) -> bool {
     let pid = system.current_pid();
     owner.hwnd != 0
         && owner.process_id == pid
         && system.identity(owner.hwnd) == Some(owner)
         && system.visible(owner.hwnd)
-        && system.session(pid).is_some()
+        && system.session(pid) == Some(owner.session)
 }
 
 fn checked_owner(
@@ -308,6 +654,16 @@ fn checked_owner_snapshot(
             "Windows WebAuthn owner identity changed before the API call".into(),
         ));
     }
+    // All session metadata is complete. Revalidate the creation-bound IDs
+    // without another session query before the final foreground sample.
+    if !system.visible(expected.hwnd)
+        || system.minimized(expected.hwnd)
+        || system.owner_ids(expected.hwnd) != Some((expected.process_id, expected.thread_id))
+    {
+        return Err(FidoError::Internal(
+            "Windows WebAuthn owner changed after metadata validation".into(),
+        ));
+    }
     Ok(current)
 }
 
@@ -324,7 +680,11 @@ fn current_broker(system: &mut impl ForegroundSystem, broker: &AcceptedBroker) -
 // Native observations and mutations are injected together, so tests execute the
 // same identity policy and ordering as production without calling Windows UI.
 trait ForegroundSystem {
+    fn monotonic(&mut self) -> Instant;
+    fn wait(&mut self, duration: Duration);
+    fn native_session(&mut self, session: u32, deadline: Instant) -> NativeSessionEvidence;
     fn identity(&mut self, hwnd: isize) -> Option<WindowIdentity>;
+    fn owner_ids(&mut self, hwnd: isize) -> Option<(u32, u32)>;
     fn foreground(&mut self) -> isize;
     fn windows(&mut self) -> Result<Vec<isize>, ()>;
     fn visible(&mut self, hwnd: isize) -> bool;
@@ -341,6 +701,21 @@ trait ForegroundSystem {
 struct NativeForegroundSystem;
 
 impl ForegroundSystem for NativeForegroundSystem {
+    fn monotonic(&mut self) -> Instant {
+        Instant::now()
+    }
+    fn wait(&mut self, duration: Duration) {
+        thread::sleep(duration);
+    }
+    fn native_session(&mut self, session: u32, deadline: Instant) -> NativeSessionEvidence {
+        query_native_session(
+            session,
+            deadline,
+            |session| query_wts::<u16>(session, WTSClientProtocolType),
+            |session| query_wts::<i32>(session, WTSConnectState),
+            Instant::now,
+        )
+    }
     fn identity(&mut self, hwnd: isize) -> Option<WindowIdentity> {
         if hwnd == 0 || unsafe { IsWindow(hwnd as HWND) } == 0 {
             None
@@ -350,6 +725,14 @@ impl ForegroundSystem for NativeForegroundSystem {
     }
     fn foreground(&mut self) -> isize {
         (unsafe { GetForegroundWindow() }) as isize
+    }
+    fn owner_ids(&mut self, hwnd: isize) -> Option<(u32, u32)> {
+        if hwnd == 0 || unsafe { IsWindow(hwnd as HWND) } == 0 {
+            return None;
+        }
+        let mut process_id = 0;
+        let thread_id = unsafe { GetWindowThreadProcessId(hwnd as HWND, &mut process_id) };
+        (process_id != 0 && thread_id != 0).then_some((process_id, thread_id))
     }
     fn windows(&mut self) -> Result<Vec<isize>, ()> {
         top_level_windows().map(|windows| windows.into_iter().map(|hwnd| hwnd as isize).collect())
@@ -481,22 +864,28 @@ fn record_broker(
     candidate: WindowIdentity,
     cancelled: &AtomicBool,
     accepted: &Mutex<Option<AcceptedBroker>>,
-) {
+) -> MonitorStop {
     if cancelled.load(Ordering::Acquire) {
-        return;
+        return MonitorStop::Cancelled;
     }
-    if let Some(broker) = capture_broker(system, baseline, candidate) {
-        if let Ok(mut result) = accepted.lock() {
-            if !cancelled.load(Ordering::Acquire) {
-                *result = Some(broker);
-            }
-        }
+    let Some(broker) = capture_broker(system, baseline, candidate) else {
+        return MonitorStop::CandidateChanged;
+    };
+    let Ok(mut result) = accepted.lock() else {
+        return MonitorStop::ChannelFailed;
+    };
+    if cancelled.load(Ordering::Acquire) {
+        return MonitorStop::Cancelled;
     }
+    *result = Some(broker);
+    MonitorStop::Accepted
 }
 
 #[derive(Default)]
 struct MonitorPolicy {
     stopped: bool,
+    reason: Option<MonitorStop>,
+    passive_safe: bool,
 }
 impl MonitorPolicy {
     fn observe(
@@ -508,13 +897,21 @@ impl MonitorPolicy {
         accepted: &Mutex<Option<AcceptedBroker>>,
     ) -> bool {
         if !self.stopped {
-            self.stopped = monitor_observe(system, owner, baseline, cancelled, accepted);
+            self.reason = monitor_observe_reason(
+                system,
+                owner,
+                baseline,
+                cancelled,
+                accepted,
+                &mut self.passive_safe,
+            );
+            self.stopped = self.reason.is_some();
         }
         self.stopped
     }
 }
 
-// true is terminal, including ambiguity or any incomplete observation.
+#[cfg(test)]
 fn monitor_observe(
     system: &mut impl ForegroundSystem,
     owner: isize,
@@ -522,22 +919,46 @@ fn monitor_observe(
     cancelled: &AtomicBool,
     accepted: &Mutex<Option<AcceptedBroker>>,
 ) -> bool {
+    monitor_observe_reason(system, owner, baseline, cancelled, accepted, &mut false).is_some()
+}
+
+fn monitor_observe_reason(
+    system: &mut impl ForegroundSystem,
+    owner: isize,
+    baseline: Arc<BrokerBaseline>,
+    cancelled: &AtomicBool,
+    accepted: &Mutex<Option<AcceptedBroker>>,
+    passive_safe: &mut bool,
+) -> Option<MonitorStop> {
     if cancelled.load(Ordering::Acquire) {
-        return true;
+        *passive_safe = false;
+        return Some(MonitorStop::Cancelled);
     }
     let Ok(candidates) = broker_candidates(system, &baseline) else {
-        return true;
+        *passive_safe = false;
+        return Some(MonitorStop::Incomplete);
     };
+    if cancelled.load(Ordering::Acquire) {
+        *passive_safe = false;
+        return Some(MonitorStop::Cancelled);
+    }
     if candidates.len() > 1 {
-        return true;
+        *passive_safe = false;
+        return Some(MonitorStop::Ambiguous);
     }
     let Some(candidate) = select_unique_candidate(&candidates) else {
-        return system.foreground() != owner;
+        // Complete absence is policy evidence; terminal disqualification cannot
+        // be undone by a later disappearing competitor or diagnostic label.
+        let foreground = system.foreground();
+        *passive_safe = foreground == owner || foreground == 0;
+        return (foreground != owner).then_some(MonitorStop::ForegroundLost);
     };
+    *passive_safe = false;
     let foreground = system.foreground();
     if foreground == candidate.hwnd {
-        record_broker(system, baseline, candidate, cancelled, accepted);
-        return true;
+        return Some(record_broker(
+            system, baseline, candidate, cancelled, accepted,
+        ));
     }
     if !should_attempt_dialog_activation(
         owner,
@@ -545,32 +966,45 @@ fn monitor_observe(
         foreground,
         cancelled.load(Ordering::Acquire),
     ) {
-        return true;
+        return Some(if cancelled.load(Ordering::Acquire) {
+            MonitorStop::Cancelled
+        } else {
+            MonitorStop::ForegroundLost
+        });
     }
     if broker_candidates(system, &baseline)
         .ok()
         .and_then(|c| select_unique_candidate(&c))
         != Some(candidate)
     {
-        return true;
+        return Some(MonitorStop::CandidateChanged);
     }
-    if cancelled.load(Ordering::Acquire) || system.identity(candidate.hwnd) != Some(candidate) {
-        return true;
+    if cancelled.load(Ordering::Acquire) {
+        return Some(MonitorStop::Cancelled);
     }
-    // Best effort: Windows may change identity/focus after the final sample.
+    if system.identity(candidate.hwnd) != Some(candidate) {
+        return Some(MonitorStop::CandidateChanged);
+    }
     if !should_attempt_dialog_activation(
         owner,
         candidate.hwnd,
         system.foreground(),
         cancelled.load(Ordering::Acquire),
     ) {
-        return true;
+        return Some(if cancelled.load(Ordering::Acquire) {
+            MonitorStop::Cancelled
+        } else {
+            MonitorStop::ForegroundLost
+        });
     }
     system.activate(candidate.hwnd);
     if system.foreground() == candidate.hwnd {
-        record_broker(system, baseline, candidate, cancelled, accepted);
+        Some(record_broker(
+            system, baseline, candidate, cancelled, accepted,
+        ))
+    } else {
+        Some(MonitorStop::ActivationFailed)
     }
-    true
 }
 
 fn should_attempt_dialog_activation(
@@ -620,6 +1054,7 @@ fn window_identity(hwnd: HWND) -> Option<WindowIdentity> {
         hwnd: hwnd as isize,
         process_id,
         thread_id,
+        session: process_session(process_id)?,
     })
 }
 
@@ -725,11 +1160,89 @@ fn window_class(hwnd: HWND) -> Option<String> {
     }
 }
 
+struct MonitorWorkerChannels<'a> {
+    cancelled: &'a AtomicBool,
+    api_returned: &'a AtomicBool,
+    armed: &'a AtomicBool,
+    accepted: &'a Mutex<Option<AcceptedBroker>>,
+    passive_safe: &'a AtomicBool,
+    reason: &'a Mutex<Option<MonitorStop>>,
+}
+
+fn run_monitor_worker(
+    system: &mut impl ForegroundSystem,
+    owner: isize,
+    baseline: Arc<BrokerBaseline>,
+    channels: MonitorWorkerChannels<'_>,
+) {
+    while !channels.armed.load(Ordering::Acquire) {
+        if channels.cancelled.load(Ordering::Acquire) {
+            channels.passive_safe.store(false, Ordering::Release);
+            if let Ok(mut reason) = channels.reason.lock() {
+                *reason = Some(if channels.api_returned.load(Ordering::Acquire) {
+                    MonitorStop::ApiReturnedBeforeArm
+                } else {
+                    MonitorStop::CancelledBeforeArm
+                });
+            }
+            return;
+        }
+        system.wait(Duration::from_millis(5));
+    }
+    let deadline = system.monotonic() + focus_monitor_timeout();
+    let mut policy = MonitorPolicy::default();
+    while !channels.cancelled.load(Ordering::Acquire) && system.monotonic() < deadline {
+        let terminal = policy.observe(
+            system,
+            owner,
+            Arc::clone(&baseline),
+            channels.cancelled,
+            channels.accepted,
+        );
+        channels
+            .passive_safe
+            .store(policy.passive_safe, Ordering::Release);
+        if terminal {
+            let terminal_reason = if policy.reason == Some(MonitorStop::Cancelled)
+                && channels.api_returned.load(Ordering::Acquire)
+            {
+                Some(MonitorStop::ApiReturned)
+            } else {
+                policy.reason
+            };
+            if let Ok(mut reason) = channels.reason.lock() {
+                *reason = terminal_reason;
+            }
+            return;
+        }
+        system.wait(Duration::from_millis(100));
+    }
+    let reason = if channels.cancelled.load(Ordering::Acquire) {
+        if channels.api_returned.load(Ordering::Acquire) {
+            MonitorStop::ApiReturned
+        } else {
+            channels.passive_safe.store(false, Ordering::Release);
+            MonitorStop::Cancelled
+        }
+    } else {
+        channels.passive_safe.store(false, Ordering::Release);
+        MonitorStop::Deadline
+    };
+    if let Ok(mut output) = channels.reason.lock() {
+        *output = Some(reason);
+    }
+}
+
 struct WebAuthnForegroundMonitor {
     cancelled: Arc<AtomicBool>,
+    api_returned: Arc<AtomicBool>,
     armed: Arc<AtomicBool>,
     accepted: Arc<Mutex<Option<AcceptedBroker>>>,
     worker: Option<JoinHandle<()>>,
+    passive_safe: Arc<AtomicBool>,
+    reason: Arc<Mutex<Option<MonitorStop>>>,
+    operation: Operation,
+    pid: u32,
 }
 
 impl WebAuthnForegroundMonitor {
@@ -737,20 +1250,62 @@ impl WebAuthnForegroundMonitor {
         self.cancelled.store(true, Ordering::Release);
         if let Some(worker) = self.worker.take() {
             if worker.join().is_err() {
+                self.passive_safe.store(false, Ordering::Release);
+                if let Ok(mut reason) = self.reason.lock() {
+                    *reason = Some(MonitorStop::WorkerFailed);
+                }
                 if let Ok(mut accepted) = self.accepted.lock() {
                     *accepted = None;
                 }
                 log::warn!("[WebAuthN-handoff] reason=monitor-worker-failed");
             }
+            if self.accepted.is_poisoned() {
+                self.passive_safe.store(false, Ordering::Release);
+                if let Ok(mut reason) = self.reason.lock() {
+                    *reason = Some(MonitorStop::ChannelFailed);
+                }
+            }
+            let reason = self
+                .reason
+                .lock()
+                .map(|reason| *reason)
+                .unwrap_or(Some(MonitorStop::ChannelFailed));
+            log::info!(
+                "[WebAuthN-monitor] {}",
+                monitor_record(self.operation, self.pid, reason)
+            );
         }
     }
 
-    fn finish(mut self) -> Option<AcceptedBroker> {
-        self.stop();
-        self.accepted.lock().ok()?.take()
+    #[cfg(test)]
+    fn finish(self) -> Option<AcceptedBroker> {
+        self.finish_observation().broker
     }
 
-    fn prepare(owner_hwnd: HWND, operation: &'static str) -> Option<Self> {
+    fn finish_observation(mut self) -> BrokerObservation {
+        // Only this native-call-return path distinguishes normal worker shutdown.
+        // Cancellation already observed before it remains permanently disqualified.
+        let was_cancelled = self.cancelled.load(Ordering::Acquire);
+        if !was_cancelled {
+            self.api_returned.store(true, Ordering::Release);
+        }
+        self.stop();
+        if was_cancelled {
+            if let Ok(mut accepted) = self.accepted.lock() {
+                *accepted = None;
+            }
+            return BrokerObservation::default();
+        }
+        let Ok(mut accepted) = self.accepted.lock() else {
+            return BrokerObservation::default();
+        };
+        BrokerObservation {
+            broker: accepted.take(),
+            passive_safe: self.passive_safe.load(Ordering::Acquire),
+        }
+    }
+
+    fn prepare(owner_hwnd: HWND, operation: Operation) -> Option<Self> {
         let system_directory = system_directory().or_else(|| {
             log::warn!("[WebAuthN-focus] could not determine the Windows system directory");
             None
@@ -766,7 +1321,7 @@ impl WebAuthnForegroundMonitor {
         })?;
         log::info!(
             "[WebAuthN-focus] prepared operation={} session={} baseline_windows={} baseline_broker_processes={}",
-            operation,
+            match operation { Operation::MakeCredential => "MakeCredential", Operation::GetAssertion => "GetAssertion" },
             current_session,
             baseline_windows.len(),
             baseline_broker_processes.len(),
@@ -775,9 +1330,15 @@ impl WebAuthnForegroundMonitor {
         let cancelled = Arc::new(AtomicBool::new(false));
         let armed = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
+        let api_returned = Arc::new(AtomicBool::new(false));
+        let worker_api_returned = Arc::clone(&api_returned);
         let worker_armed = Arc::clone(&armed);
         let accepted = Arc::new(Mutex::new(None));
         let worker_accepted = Arc::clone(&accepted);
+        let passive_safe = Arc::new(AtomicBool::new(false));
+        let worker_passive_safe = Arc::clone(&passive_safe);
+        let reason = Arc::new(Mutex::new(None));
+        let worker_reason = Arc::clone(&reason);
         let baseline = Arc::new(BrokerBaseline {
             system_directory: system_directory.clone(),
             session: current_session,
@@ -788,37 +1349,37 @@ impl WebAuthnForegroundMonitor {
         let worker = match thread::Builder::new()
             .name("webauthn-security-dialog-focus".into())
             .spawn(move || {
-                while !worker_armed.load(Ordering::Acquire) {
-                    if worker_cancelled.load(Ordering::Acquire) {
-                        return;
-                    }
-                    thread::sleep(Duration::from_millis(5));
-                }
-
-                let deadline = Instant::now() + focus_monitor_timeout();
-                let mut policy = MonitorPolicy::default();
-                while !worker_cancelled.load(Ordering::Acquire) && Instant::now() < deadline {
-                    if policy.observe(&mut NativeForegroundSystem, owner_hwnd_value, Arc::clone(&baseline), &worker_cancelled, &worker_accepted) { return; }
-                    thread::sleep(Duration::from_millis(100));
-                }
-                log::debug!(
-                    "[WebAuthN-focus] operation={} monitor ended without finding a new trusted dialog",
-                    operation,
+                run_monitor_worker(
+                    &mut NativeForegroundSystem,
+                    owner_hwnd_value,
+                    baseline,
+                    MonitorWorkerChannels {
+                        cancelled: &worker_cancelled,
+                        api_returned: &worker_api_returned,
+                        armed: &worker_armed,
+                        accepted: &worker_accepted,
+                        passive_safe: &worker_passive_safe,
+                        reason: &worker_reason,
+                    },
                 );
-            })
-        {
+            }) {
             Ok(worker) => worker,
-            Err(error) => {
-                log::warn!("[WebAuthN-focus] failed to start dialog monitor: {error}");
+            Err(_) => {
+                log::warn!("[WebAuthN-focus] reason=worker-start-failed");
                 return None;
             }
         };
 
         Some(Self {
             cancelled,
+            api_returned,
             armed,
             accepted,
             worker: Some(worker),
+            passive_safe,
+            reason,
+            operation,
+            pid: unsafe { GetCurrentProcessId() },
         })
     }
 
@@ -987,7 +1548,8 @@ impl WindowsWebAuthnBackend {
         let owner_for_prepare = self.hwnd()?;
         let owner_identity =
             checked_owner(&mut NativeForegroundSystem, owner_for_prepare as isize)?;
-        let focus_monitor = WebAuthnForegroundMonitor::prepare(owner_for_prepare, "MakeCredential");
+        let focus_monitor =
+            WebAuthnForegroundMonitor::prepare(owner_for_prepare, Operation::MakeCredential);
         let (owner_hwnd, foreground_before_api) = self.foreground_owner_hwnd(owner_identity)?;
         if let Some(monitor) = focus_monitor.as_ref() {
             monitor.arm();
@@ -1003,7 +1565,9 @@ impl WindowsWebAuthnBackend {
                 &mut attestation,
             )
         };
-        let accepted_broker = focus_monitor.and_then(WebAuthnForegroundMonitor::finish);
+        let accepted_broker = focus_monitor
+            .map(WebAuthnForegroundMonitor::finish_observation)
+            .unwrap_or_default();
         log::info!(
             "Windows WebAuthn MakeCredential owner snapshot captured immediately before API: owner={:p} foreground={:p}",
             owner_hwnd,
@@ -1081,16 +1645,30 @@ impl WindowsWebAuthnBackend {
         diagnostic.failure_stage = Some(FailureStage::Preflight);
         let mut continuation = self.continuation.take();
         let mut system = NativeForegroundSystem;
-        let owner_identity = system
-            .identity(self.hwnd)
-            .filter(|owner| valid_owner(&mut system, *owner))
-            .ok_or_else(|| {
-                FidoError::Internal("Windows WebAuthn owner identity is unavailable".into())
-            })?;
-        let preparation =
-            prepare_continuation(&mut continuation, self.hwnd, credential_ids, &mut system);
-        match preparation {
-            Ok(outcome) => log::info!("[WebAuthN-handoff] outcome={:?}", outcome),
+        let mut continuation_diagnostic = ContinuationDiagnostics::default();
+        let preparation = prepare_assertion_continuation(
+            &mut continuation,
+            self.hwnd,
+            credential_ids,
+            &mut system,
+            &mut continuation_diagnostic,
+        );
+        log::info!(
+            "[WebAuthN-continuation] {}",
+            continuation_diagnostic.record(system.current_pid())
+        );
+        let creation_owner = match preparation {
+            Ok((outcome, creation_owner)) => {
+                log::info!(
+                    "[WebAuthN-handoff] outcome={}",
+                    match outcome {
+                        HandoffOutcome::Ordinary => "ordinary",
+                        HandoffOutcome::OwnerForeground => "owner-foreground",
+                        HandoffOutcome::Recovered => "recovered",
+                    }
+                );
+                creation_owner
+            }
             Err(refusal) => {
                 log::warn!("[WebAuthN-handoff] reason={}", refusal.reason());
                 return Err(FidoError::Internal(format!(
@@ -1098,7 +1676,8 @@ impl WindowsWebAuthnBackend {
                     refusal.reason()
                 )));
             }
-        }
+        };
+        let owner_identity = assertion_owner_baseline(&mut system, self.hwnd, creation_owner)?;
         validate_credential_ids(credential_ids)?;
         let challenge = random_bytes(32);
         let mut client_json = client_data_json(ClientDataOperation::Get, &challenge);
@@ -1143,7 +1722,8 @@ impl WindowsWebAuthnBackend {
         let rp_id = wide(RP_ID);
         let mut assertion = ptr::null_mut();
         let owner_for_prepare = self.hwnd()?;
-        let focus_monitor = WebAuthnForegroundMonitor::prepare(owner_for_prepare, "GetAssertion");
+        let focus_monitor =
+            WebAuthnForegroundMonitor::prepare(owner_for_prepare, Operation::GetAssertion);
         let (owner_hwnd, foreground_before_api) = self.foreground_owner_hwnd(owner_identity)?;
         if let Some(monitor) = focus_monitor.as_ref() {
             monitor.arm();
@@ -1157,7 +1737,7 @@ impl WindowsWebAuthnBackend {
                 &mut assertion,
             )
         };
-        drop(focus_monitor);
+        let _ = focus_monitor.map(WebAuthnForegroundMonitor::finish_observation);
         log::info!(
             "Windows WebAuthn GetAssertion owner snapshot captured immediately before API: owner={:p} foreground={:p}",
             owner_hwnd,
@@ -1443,7 +2023,28 @@ mod tests {
         inaccessible_session: Option<u32>,
         inaccessible_pid: Option<u32>,
         owner_sessions: std::collections::VecDeque<Option<u32>>,
+        owner_identity_uses_session: bool,
+        owner_session_reads: usize,
+        owner_drift_on_session: Option<(usize, u8)>,
+        identity_hwnds: Vec<isize>,
+        session_pids: Vec<u32>,
         broker_drift_on_path: bool,
+        clock_base: Instant,
+        time_ms: u64,
+        native_delay_ms: u64,
+        native_delays: std::collections::VecDeque<u64>,
+        owner_query_delay_ms: u64,
+        owner_foreground_on_metadata: bool,
+        native_count: usize,
+        mutation_on_native: Option<(usize, u8)>,
+        native_sequence: std::collections::VecDeque<NativeSessionEvidence>,
+        queried_sessions: Vec<u32>,
+        test_pid: u32,
+        cancel_on_wait: Option<Arc<AtomicBool>>,
+        returned_on_wait: Option<Arc<AtomicBool>>,
+        worker_wait_entered: Option<std::sync::mpsc::Sender<()>>,
+        wait_until_stopped: Option<Arc<AtomicBool>>,
+        native_evidence: NativeSessionEvidence,
         trace: Vec<&'static str>,
     }
 
@@ -1456,12 +2057,74 @@ mod tests {
     }
 
     impl ForegroundSystem for TestSystem {
+        fn monotonic(&mut self) -> Instant {
+            self.clock_base + Duration::from_millis(self.time_ms)
+        }
+        fn wait(&mut self, duration: Duration) {
+            self.trace.push("wait");
+            self.time_ms += duration.as_millis() as u64;
+            if let Some(entered) = self.worker_wait_entered.take() {
+                entered.send(()).unwrap();
+            }
+            if let Some(cancelled) = &self.wait_until_stopped {
+                // Only the injected test clock waits for lifecycle shutdown.
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !cancelled.load(Ordering::Acquire) {
+                    assert!(Instant::now() < deadline, "synthetic shutdown timed out");
+                    thread::yield_now();
+                }
+            }
+            if let Some(returned) = &self.returned_on_wait {
+                returned.store(true, Ordering::Release);
+            }
+            if let Some(cancelled) = &self.cancel_on_wait {
+                cancelled.store(true, Ordering::Release);
+            }
+        }
+        fn native_session(&mut self, session: u32, _: Instant) -> NativeSessionEvidence {
+            self.trace.push("native-session");
+            self.time_ms += self
+                .native_delays
+                .pop_front()
+                .unwrap_or(self.native_delay_ms);
+            self.native_count += 1;
+            self.queried_sessions.push(session);
+            if let Some((count, fault)) = self.mutation_on_native {
+                if count == self.native_count {
+                    match fault {
+                        0 => self.windows[0].identity.process_id = 99,
+                        1 => self.windows[0].identity.thread_id = 99,
+                        2 => self.windows[0].session = 3,
+                        3 => self.windows[0].visible = false,
+                        4 => self.windows[0].minimized = true,
+                        5 => self.inaccessible_hwnd = Some(1),
+                        6 => self.test_pid = 99,
+                        7 => self.windows[0].identity.hwnd = 9,
+                        _ => panic!("unknown fixture mutation"),
+                    }
+                }
+            }
+            self.native_sequence
+                .pop_front()
+                .unwrap_or(self.native_evidence)
+        }
         fn identity(&mut self, hwnd: isize) -> Option<WindowIdentity> {
             self.trace.push("identity");
+            self.identity_hwnds.push(hwnd);
             if self.inaccessible_hwnd == Some(hwnd) {
                 return None;
             }
-            self.window(hwnd).map(|w| w.identity)
+            let identity = self.window(hwnd).map(|w| w.identity)?;
+            if self.owner_identity_uses_session && hwnd == 1 {
+                // Mirror Native identity: capture PID/TID before session metadata.
+                let session = self.session(identity.process_id)?;
+                Some(WindowIdentity {
+                    session,
+                    ..identity
+                })
+            } else {
+                Some(identity)
+            }
         }
         fn foreground(&mut self) -> isize {
             self.trace.push("foreground");
@@ -1470,6 +2133,14 @@ mod tests {
             }
             self.foreground
         }
+        fn owner_ids(&mut self, hwnd: isize) -> Option<(u32, u32)> {
+            self.trace.push("owner-ids");
+            if self.inaccessible_hwnd == Some(hwnd) {
+                return None;
+            }
+            self.window(hwnd)
+                .map(|w| (w.identity.process_id, w.identity.thread_id))
+        }
         fn windows(&mut self) -> Result<Vec<isize>, ()> {
             if self.enumeration_failed {
                 return Err(());
@@ -1477,12 +2148,41 @@ mod tests {
             Ok(self.windows.iter().map(|w| w.identity.hwnd).collect())
         }
         fn visible(&mut self, hwnd: isize) -> bool {
+            self.trace.push("visible");
             self.window(hwnd).is_some_and(|w| w.visible)
         }
         fn minimized(&mut self, hwnd: isize) -> bool {
+            self.trace.push("minimized");
             self.window(hwnd).is_some_and(|w| w.minimized)
         }
         fn session(&mut self, pid: u32) -> Option<u32> {
+            self.trace.push("session");
+            self.session_pids.push(pid);
+            self.owner_session_reads += usize::from(pid == 10);
+            let captured_session = self
+                .windows
+                .iter()
+                .find(|w| w.identity.process_id == pid)
+                .map(|w| w.session);
+            if let Some((read, drift)) = self.owner_drift_on_session {
+                if pid == 10 && read == self.owner_session_reads {
+                    self.owner_drift_on_session = None;
+                    self.trace.push("metadata-drift");
+                    match drift {
+                        0..=4 => inject_owner_drift(self, drift),
+                        5 => self.inaccessible_hwnd = Some(1),
+                        6 => self.windows[0].identity.hwnd = 9,
+                        _ => unreachable!("closed metadata drift fixture"),
+                    }
+                    return captured_session;
+                }
+            }
+            if pid == 10 {
+                self.time_ms += self.owner_query_delay_ms;
+                if self.owner_foreground_on_metadata {
+                    self.foreground = 1;
+                }
+            }
             if self.inaccessible_session == Some(pid) {
                 return None;
             }
@@ -1534,7 +2234,7 @@ mod tests {
             self.window(hwnd).map(|w| w.class.clone())
         }
         fn current_pid(&mut self) -> u32 {
-            10
+            self.test_pid
         }
         fn restore(&mut self, hwnd: isize) {
             self.trace.push("restore");
@@ -1567,11 +2267,13 @@ mod tests {
             hwnd: 1,
             process_id: 10,
             thread_id: 11,
+            session: 2,
         };
         let broker = WindowIdentity {
             hwnd: 2,
             process_id: 20,
             thread_id: 21,
+            session: 2,
         };
         let system = TestSystem {
             windows: vec![
@@ -1609,7 +2311,28 @@ mod tests {
             inaccessible_session: None,
             inaccessible_pid: None,
             owner_sessions: Default::default(),
+            owner_identity_uses_session: false,
+            owner_session_reads: 0,
+            owner_drift_on_session: None,
+            identity_hwnds: Vec::new(),
+            session_pids: Vec::new(),
             broker_drift_on_path: false,
+            clock_base: Instant::now(),
+            time_ms: 0,
+            native_delay_ms: 0,
+            native_delays: Default::default(),
+            owner_query_delay_ms: 0,
+            owner_foreground_on_metadata: false,
+            native_count: 0,
+            mutation_on_native: None,
+            native_sequence: Default::default(),
+            queried_sessions: Vec::new(),
+            test_pid: 10,
+            cancel_on_wait: None,
+            returned_on_wait: None,
+            worker_wait_entered: None,
+            wait_until_stopped: None,
+            native_evidence: session_evidence(Ok(2), Ok(WTSActive)),
             trace: Vec::new(),
         };
         let baseline = Arc::new(BrokerBaseline {
@@ -1630,6 +2353,7 @@ mod tests {
                 hwnd: 3,
                 process_id: 30,
                 thread_id: 31,
+                session: 2,
             };
             system.windows.push(other);
             match fault {
@@ -1749,6 +2473,7 @@ mod tests {
             hwnd: 3,
             process_id: 30,
             thread_id: 31,
+            session: 2,
         };
         system.windows.push(other);
         system.inaccessible_pid = Some(30);
@@ -1758,7 +2483,11 @@ mod tests {
             "incomplete competitor is not proof of uniqueness"
         );
         let mut pending = None;
-        complete_registration(&mut pending, Ok((test_registration(), owner, observation))).unwrap();
+        complete_registration(
+            &mut pending,
+            Ok((test_registration(), owner, (observation).into())),
+        )
+        .unwrap();
         assert_eq!(
             prepare_continuation(&mut pending, owner.hwnd, &[vec![7, 8]], &mut system),
             Err(HandoffRefusal::UnobservedBroker)
@@ -1811,6 +2540,339 @@ mod tests {
         assert!(!system.trace.contains(&"activate"));
     }
 
+    #[test]
+    fn passive_null_returns_to_owner_without_activation() {
+        let (mut system, _, owner, _) = handoff_fixture();
+        let mut pending = None;
+        complete_registration(
+            &mut pending,
+            Ok((test_registration(), owner, (None).into())),
+        )
+        .unwrap();
+        system.foreground_sequence = [0, owner.hwnd].into();
+        assert_eq!(
+            prepare_continuation(&mut pending, owner.hwnd, &[vec![7, 8]], &mut system),
+            Ok(HandoffOutcome::OwnerForeground)
+        );
+        assert!(pending.is_none());
+        assert!(!system.trace.contains(&"activate"));
+        assert!(!system.trace.contains(&"restore"));
+        assert!(system.windows[0].maximized);
+        assert!(
+            system.time_ms >= 20,
+            "success must respect the minimum polling interval"
+        );
+    }
+
+    #[test]
+    fn passive_incomplete_monitor_cannot_become_authority() {
+        let (mut system, baseline, owner, _) = handoff_fixture();
+        system.enumeration_failed = true;
+        let accepted = Mutex::new(None);
+        let mut policy = MonitorPolicy::default();
+        assert!(policy.observe(
+            &mut system,
+            owner.hwnd,
+            baseline,
+            &AtomicBool::new(false),
+            &accepted
+        ));
+        let observation = BrokerObservation {
+            broker: accepted.lock().unwrap().take(),
+            passive_safe: policy.passive_safe,
+        };
+        let mut pending = None;
+        complete_registration(
+            &mut pending,
+            Ok((test_registration(), owner, (observation).into())),
+        )
+        .unwrap();
+        system.enumeration_failed = false;
+        system.foreground_sequence = [0, owner.hwnd].into();
+        assert_eq!(
+            prepare_continuation(&mut pending, owner.hwnd, &[vec![7, 8]], &mut system),
+            Err(HandoffRefusal::UnobservedBroker)
+        );
+        assert!(pending.is_none());
+    }
+
+    fn passive_pending(owner: WindowIdentity) -> Option<RegistrationContinuation> {
+        let mut pending = None;
+        complete_registration(&mut pending, Ok((test_registration(), owner, None.into()))).unwrap();
+        pending
+    }
+
+    #[test]
+    fn passive_timeout_and_slow_metadata_never_accept_late_owner() {
+        for (native_delay, owner_delay, sequence, expected_time) in [
+            (0, 0, vec![0], 1000),
+            (1000, 0, vec![0, 1], 1000),
+            (1001, 0, vec![0, 1], 1001),
+            (0, 1000, vec![0, 1], 1000),
+            (995, 0, vec![0, 0, 1], 995),
+        ] {
+            let (mut system, _, owner, _) = handoff_fixture();
+            let mut pending = passive_pending(owner);
+            system.native_delay_ms = native_delay;
+            system.owner_query_delay_ms = owner_delay;
+            system.foreground_sequence = sequence.into();
+            assert_eq!(
+                prepare_continuation(&mut pending, 1, &[vec![7, 8]], &mut system),
+                Err(HandoffRefusal::PassiveDeadline)
+            );
+            assert_eq!(system.time_ms, expected_time);
+            assert!(pending.is_none());
+            assert!(!system.trace.contains(&"activate"));
+            assert!(!system.trace.contains(&"restore"));
+            assert!(system.windows[0].maximized);
+        }
+        let (mut system, _, owner, _) = handoff_fixture();
+        system.native_delays = [0, 979].into();
+        system.foreground_sequence = [0, 1].into();
+        assert_eq!(
+            prepare_continuation(&mut passive_pending(owner), 1, &[vec![7, 8]], &mut system),
+            Ok(HandoffOutcome::OwnerForeground)
+        );
+        assert_eq!(system.time_ms, 999);
+    }
+
+    #[test]
+    fn passive_only_null_samples_wait_and_initial_unrelated_is_immediate() {
+        for (sequence, native_count, waits, refusal) in [
+            (vec![3, 1], 0, 0, HandoffRefusal::UnobservedBroker),
+            (vec![0, 3, 1], 2, 1, HandoffRefusal::Foreground),
+            (vec![0, 0, 3, 1], 3, 2, HandoffRefusal::Foreground),
+        ] {
+            let (mut system, _, owner, _) = handoff_fixture();
+            system.foreground_sequence = sequence.into();
+            let mut pending = passive_pending(owner);
+            assert_eq!(
+                prepare_continuation(&mut pending, 1, &[vec![7, 8]], &mut system),
+                Err(refusal)
+            );
+            assert_eq!(system.native_count, native_count);
+            assert_eq!(system.trace.iter().filter(|v| **v == "wait").count(), waits);
+            assert_eq!(system.time_ms, waits as u64 * 20);
+            assert!(pending.is_none());
+            assert!(!system.trace.contains(&"activate"));
+            assert!(!system.trace.contains(&"restore"));
+        }
+    }
+
+    #[test]
+    fn passive_native_session_unknown_console_legacy_disconnected_and_failures_refuse() {
+        let invalid = [
+            session_evidence(Ok(0), Ok(0)),
+            session_evidence(Ok(1), Ok(0)),
+            session_evidence(Ok(3), Ok(0)),
+            session_evidence(Ok(2), Ok(4)),
+            session_evidence(Ok(2), Ok(10)),
+            session_evidence(Err(QueryStatus::NativeFailure), Ok(0)),
+            session_evidence(Err(QueryStatus::NullBuffer), Ok(0)),
+            session_evidence(Err(QueryStatus::InvalidLength), Ok(0)),
+            session_evidence(Ok(2), Err(QueryStatus::NativeFailure)),
+            session_evidence(Ok(2), Err(QueryStatus::NullBuffer)),
+            session_evidence(Ok(2), Err(QueryStatus::InvalidLength)),
+            session_evidence(Ok(2), Err(QueryStatus::NotQueried)),
+        ];
+        for evidence in invalid {
+            for change_during_wait in [false, true] {
+                let (mut system, _, owner, _) = handoff_fixture();
+                system.foreground_sequence = [0, 0, 1].into();
+                system.native_sequence = if change_during_wait {
+                    vec![session_evidence(Ok(2), Ok(0)), evidence]
+                } else {
+                    vec![evidence]
+                }
+                .into();
+                let mut pending = passive_pending(owner);
+                assert_eq!(
+                    prepare_continuation(&mut pending, 1, &[vec![7, 8]], &mut system),
+                    Err(HandoffRefusal::PassiveSession)
+                );
+                assert!(pending.is_none());
+                assert!(!system.trace.contains(&"activate"));
+                if !change_during_wait {
+                    assert!(
+                        !system.trace.contains(&"wait"),
+                        "invalid native evidence cannot authorize waiting"
+                    );
+                }
+                assert!(!system.trace.contains(&"restore"));
+            }
+        }
+    }
+
+    #[test]
+    fn passive_owner_and_session_mutations_before_and_after_metadata_refuse() {
+        for fault in 0..8 {
+            for query in [1, 2] {
+                let (mut system, _, owner, _) = handoff_fixture();
+                system.foreground_sequence = [0, 0, 1].into();
+                system.mutation_on_native = Some((query, fault));
+                let mut pending = passive_pending(owner);
+                assert_eq!(
+                    prepare_continuation(&mut pending, 1, &[vec![7, 8]], &mut system),
+                    Err(HandoffRefusal::Owner)
+                );
+                assert!(pending.is_none());
+                assert!(!system.trace.contains(&"activate"));
+                assert!(!system.trace.contains(&"restore"));
+                assert!(system.queried_sessions.iter().all(|s| *s == 2));
+            }
+        }
+        for fault in 0..4 {
+            let (mut system, _, mut owner, _) = handoff_fixture();
+            match fault {
+                0 => {
+                    owner.session = 0;
+                    system.windows[0].identity.session = 0;
+                    system.windows[0].session = 0;
+                }
+                1 => system.windows[0].visible = false,
+                2 => system.windows[0].minimized = true,
+                _ => system.inaccessible_session = Some(10),
+            }
+            let mut pending = passive_pending(owner);
+            system.foreground_sequence = [0, 1].into();
+            assert_eq!(
+                prepare_continuation(&mut pending, 1, &[vec![7, 8]], &mut system),
+                Err(HandoffRefusal::Owner)
+            );
+            assert_eq!(system.native_count, 0);
+            assert!(pending.is_none());
+        }
+    }
+
+    #[test]
+    fn passive_single_created_credential_one_use_and_ordinary_login() {
+        for ids in [
+            vec![],
+            vec![vec![9]],
+            vec![vec![7, 8], vec![7, 8]],
+            vec![vec![7, 8], vec![9]],
+        ] {
+            let (mut system, _, owner, _) = handoff_fixture();
+            system.foreground_sequence = [0, 1].into();
+            let mut pending = passive_pending(owner);
+            assert_eq!(
+                prepare_continuation(&mut pending, 1, &ids, &mut system),
+                Err(HandoffRefusal::Credential)
+            );
+            assert!(pending.is_none());
+            assert_eq!(system.native_count, 0);
+        }
+        let (mut system, _, owner, _) = handoff_fixture();
+        let mut pending = passive_pending(owner);
+        system.foreground_sequence = [0, 1].into();
+        assert_eq!(
+            prepare_continuation(&mut pending, 1, &[vec![7, 8]], &mut system),
+            Ok(HandoffOutcome::OwnerForeground)
+        );
+        let calls = system.native_count;
+        system.foreground = 3;
+        assert_eq!(
+            prepare_continuation(&mut pending, 1, &[vec![7, 8]], &mut system),
+            Ok(HandoffOutcome::Ordinary)
+        );
+        assert_eq!(system.native_count, calls);
+        assert!(validate_owner_foreground(1 as HWND, system.foreground as HWND).is_err());
+        let mut pending = passive_pending(owner);
+        system.foreground = 1;
+        system.native_evidence = session_evidence(Ok(0), Ok(0));
+        assert_eq!(
+            prepare_continuation(&mut pending, 1, &[vec![7, 8]], &mut system),
+            Ok(HandoffOutcome::OwnerForeground)
+        );
+        assert_eq!(system.native_count, calls);
+        assert!(!system.trace.contains(&"activate"));
+    }
+
+    #[test]
+    fn native_wts_parser_checks_bool_null_exact_typed_sizes_and_known_values() {
+        let value = 2u16;
+        let pointer = &value as *const u16;
+        for success in [1, -1, 2] {
+            assert_eq!(unsafe { parse_wts::<u16>(success, pointer, 2) }, Ok(2));
+        }
+        assert_eq!(
+            unsafe { parse_wts::<u16>(0, pointer, 2) },
+            Err(QueryStatus::NativeFailure)
+        );
+        assert_eq!(
+            unsafe { parse_wts::<u16>(1, ptr::null(), 2) },
+            Err(QueryStatus::NullBuffer)
+        );
+        for bytes in [0, 1, 3, 4, u32::MAX] {
+            assert_eq!(
+                unsafe { parse_wts::<u16>(1, pointer, bytes) },
+                Err(QueryStatus::InvalidLength)
+            );
+        }
+        let active = WTSActive;
+        assert_eq!(
+            unsafe { parse_wts::<i32>(1, (&active as *const i32).cast(), 4) },
+            Ok(WTSActive)
+        );
+        for protocol in [0, 1, 2, 3, u16::MAX] {
+            assert_eq!(
+                session_evidence(Ok(protocol), Ok(0)).active_rdp(),
+                protocol == 2
+            );
+        }
+        for state in [-1, 0, 1, 4, 9, 10, i32::MAX] {
+            assert_eq!(session_evidence(Ok(2), Ok(state)).active_rdp(), state == 0);
+        }
+    }
+
+    #[test]
+    fn monitor_precise_terminal_reasons_are_per_instance_and_permanent() {
+        for (fault, expected) in [
+            (0, MonitorStop::Incomplete),
+            (1, MonitorStop::Ambiguous),
+            (2, MonitorStop::ForegroundLost),
+            (3, MonitorStop::Cancelled),
+            (4, MonitorStop::Accepted),
+            (5, MonitorStop::ActivationFailed),
+        ] {
+            let (mut system, baseline, owner, _) = handoff_fixture();
+            let cancelled = AtomicBool::new(fault == 3);
+            let accepted = Mutex::new(None);
+            let mut policy = MonitorPolicy::default();
+            match fault {
+                0 => system.enumeration_failed = true,
+                1 => {
+                    let mut other = system.windows[1].clone();
+                    other.identity.hwnd = 3;
+                    other.identity.process_id = 30;
+                    system.windows.push(other);
+                }
+                2 => {
+                    system.windows.pop();
+                    system.foreground = 0;
+                }
+                5 => {
+                    system.foreground = 1;
+                    system.activation_succeeds = false;
+                }
+                _ => (),
+            }
+            assert!(policy.observe(&mut system, 1, Arc::clone(&baseline), &cancelled, &accepted));
+            assert_eq!(policy.reason, Some(expected));
+            let safe = policy.passive_safe;
+            system.enumeration_failed = false;
+            system.windows.truncate(1);
+            system.foreground = owner.hwnd;
+            assert!(policy.observe(&mut system, 1, baseline, &cancelled, &accepted));
+            assert_eq!(policy.reason, Some(expected));
+            assert_eq!(policy.passive_safe, safe);
+            assert_eq!(safe, fault == 2);
+            let other = MonitorPolicy::default();
+            assert!(other.reason.is_none());
+            assert!(!other.passive_safe);
+        }
+    }
+
     fn test_registration() -> RegisteredCredential {
         RegisteredCredential {
             credential_id: vec![7, 8],
@@ -1827,7 +2889,7 @@ mod tests {
         let mut pending = None;
         let registration = complete_registration(
             &mut pending,
-            Ok((test_registration(), owner, Some(accepted))),
+            Ok((test_registration(), owner, (Some(accepted)).into())),
         )
         .unwrap();
         let context = pending.expect("validated creation must publish one continuation");
@@ -1846,7 +2908,7 @@ mod tests {
         let mut pending = None;
         complete_registration(
             &mut pending,
-            Ok((test_registration(), owner, Some(accepted))),
+            Ok((test_registration(), owner, (Some(accepted)).into())),
         )
         .unwrap();
         pending
@@ -1978,6 +3040,7 @@ mod tests {
                     hwnd: 3,
                     process_id: 30,
                     thread_id: 31,
+                    session: 2,
                 };
                 system.windows.push(other);
             } else {
@@ -1986,8 +3049,11 @@ mod tests {
             let observation = capture_broker(&mut system, baseline, broker);
             assert!(observation.is_none());
             let mut pending = None;
-            complete_registration(&mut pending, Ok((test_registration(), owner, observation)))
-                .unwrap();
+            complete_registration(
+                &mut pending,
+                Ok((test_registration(), owner, (observation).into())),
+            )
+            .unwrap();
             system.trace.clear();
             assert_eq!(
                 prepare_continuation(&mut pending, owner.hwnd, &[vec![7, 8]], &mut system),
@@ -2019,6 +3085,7 @@ mod tests {
                         hwnd: 3,
                         process_id: 30,
                         thread_id: 31,
+                        session: 2,
                     };
                     system.windows.push(other);
                 }
@@ -2166,11 +3233,16 @@ mod tests {
         let worker_result = Arc::clone(&accepted);
         let monitor = WebAuthnForegroundMonitor {
             cancelled: Arc::new(AtomicBool::new(false)),
+            api_returned: Arc::new(AtomicBool::new(false)),
             armed: Arc::new(AtomicBool::new(true)),
             accepted: Arc::clone(&accepted),
             worker: Some(thread::spawn(move || {
                 *worker_result.lock().unwrap() = Some(proof);
             })),
+            passive_safe: Arc::new(AtomicBool::new(false)),
+            reason: Arc::new(Mutex::new(None)),
+            operation: Operation::MakeCredential,
+            pid: 10,
         };
         assert_eq!(monitor.finish().unwrap().identity, broker);
         assert!(accepted.lock().unwrap().is_none());
@@ -2182,11 +3254,18 @@ mod tests {
         let proof = capture_broker(&mut system, baseline, broker).unwrap();
         let monitor = WebAuthnForegroundMonitor {
             cancelled: Arc::new(AtomicBool::new(false)),
+            api_returned: Arc::new(AtomicBool::new(false)),
             armed: Arc::new(AtomicBool::new(true)),
             accepted: Arc::new(Mutex::new(Some(proof))),
             worker: Some(thread::spawn(|| panic!("synthetic monitor failure"))),
+            passive_safe: Arc::new(AtomicBool::new(false)),
+            reason: Arc::new(Mutex::new(None)),
+            operation: Operation::MakeCredential,
+            pid: 10,
         };
+        let reason = Arc::clone(&monitor.reason);
         assert!(monitor.finish().is_none());
+        assert_eq!(*reason.lock().unwrap(), Some(MonitorStop::WorkerFailed));
     }
 
     #[test]
@@ -2279,6 +3358,213 @@ mod tests {
         }
     }
 
+    #[test]
+    fn fix_s1_session_metadata_drift_rejects_creation_owner() {
+        for native_identity_metadata in [false, true] {
+            for drift in [0, 1, 3, 4, 5, 6] {
+                let (mut system, _, owner, _) = handoff_fixture();
+                system.foreground = owner.hwnd;
+                system.owner_identity_uses_session = native_identity_metadata;
+                system.owner_drift_on_session =
+                    Some((if native_identity_metadata { 2 } else { 1 }, drift));
+                let result = checked_owner_snapshot(&mut system, owner);
+                assert!(result.is_err(), "CONTRACT:S1_METADATA_DRIFT_REFUSED native_identity={native_identity_metadata} drift={drift}");
+                assert!(system.trace.contains(&"metadata-drift"));
+                assert!(!system.trace.contains(&"activate"));
+                assert!(!system.trace.contains(&"restore"));
+            }
+        }
+    }
+
+    #[test]
+    fn fix_s1_unchanged_owner_and_unknown_session() {
+        for native_identity_metadata in [false, true] {
+            let (mut system, _, owner, _) = handoff_fixture();
+            system.owner_identity_uses_session = native_identity_metadata;
+            assert_eq!(checked_owner_snapshot(&mut system, owner).unwrap(), owner);
+            system.inaccessible_session = Some(owner.process_id);
+            assert!(checked_owner_snapshot(&mut system, owner).is_err());
+        }
+    }
+
+    #[test]
+    fn fix_s1_final_lightweight_guard_follows_metadata() {
+        for native_identity_metadata in [false, true] {
+            let (mut system, _, owner, _) = handoff_fixture();
+            system.owner_identity_uses_session = native_identity_metadata;
+            system.foreground = owner.hwnd;
+            assert_eq!(checked_owner_snapshot(&mut system, owner).unwrap(), owner);
+            let metadata = system
+                .trace
+                .iter()
+                .rposition(|event| *event == "session")
+                .unwrap();
+            assert_eq!(
+                &system.trace[metadata + 1..],
+                ["minimized", "visible", "minimized", "owner-ids"]
+            );
+            assert_eq!(system.foreground(), owner.hwnd);
+            assert_eq!(
+                &system.trace[system.trace.len() - 2..],
+                ["owner-ids", "foreground"]
+            );
+        }
+        for field in ["pid", "tid"] {
+            let (mut system, _, owner, _) = handoff_fixture();
+            if field == "pid" {
+                system.windows[0].identity.process_id = 0;
+            } else {
+                system.windows[0].identity.thread_id = 0;
+            }
+            assert!(checked_owner_snapshot(&mut system, owner).is_err());
+        }
+    }
+
+    fn inject_owner_drift(system: &mut TestSystem, drift: u8) {
+        match drift {
+            0 => system.windows[0].identity.thread_id += 1,
+            1 => system.windows[0].identity.process_id += 1,
+            2 => {
+                system.windows[0].identity.session += 1;
+                system.windows[0].session += 1;
+            }
+            3 => system.windows[0].visible = false,
+            4 => system.windows[0].minimized = true,
+            _ => unreachable!("closed synthetic drift cases"),
+        }
+    }
+
+    #[test]
+    fn fix_r1_owner_drift_after_successful_preparation_refuses() {
+        for drift in 0..5 {
+            for before_selection in [true, false] {
+                let (mut system, _, owner, _) = handoff_fixture();
+                system.foreground = owner.hwnd;
+                let mut pending = passive_pending(owner);
+                let (outcome, creation_owner) = prepare_assertion_continuation(
+                    &mut pending,
+                    owner.hwnd,
+                    &[vec![7, 8]],
+                    &mut system,
+                    &mut ContinuationDiagnostics::default(),
+                )
+                .unwrap();
+                assert_eq!(outcome, HandoffOutcome::OwnerForeground);
+                assert_eq!(creation_owner, Some(owner));
+                assert!(pending.is_none());
+                if before_selection {
+                    inject_owner_drift(&mut system, drift);
+                }
+                let selection = assertion_owner_baseline(&mut system, owner.hwnd, creation_owner);
+                if !before_selection {
+                    inject_owner_drift(&mut system, drift);
+                }
+                let result =
+                    selection.and_then(|selected| checked_owner_snapshot(&mut system, selected));
+                assert!(result.is_err(), "R1 creation owner must survive post-preparation drift={drift}, before_selection={before_selection}");
+                let (outcome, replay_owner) = prepare_assertion_continuation(
+                    &mut pending,
+                    owner.hwnd,
+                    &[vec![7, 8]],
+                    &mut system,
+                    &mut ContinuationDiagnostics::default(),
+                )
+                .unwrap();
+                assert_eq!(outcome, HandoffOutcome::Ordinary);
+                assert!(
+                    replay_owner.is_none(),
+                    "consumed creation authority cannot replay"
+                );
+                assert!(!system.trace.contains(&"activate"));
+                assert!(!system.trace.contains(&"restore"));
+            }
+        }
+    }
+
+    #[test]
+    fn fix_r1_zero_creation_session_is_not_authority() {
+        let (mut system, _, mut owner, _) = handoff_fixture();
+        owner.session = 0;
+        system.windows[0].identity = owner;
+        system.windows[0].session = 0;
+        assert!(assertion_owner_baseline(&mut system, owner.hwnd, Some(owner)).is_err());
+    }
+
+    #[test]
+    fn fix_r1_ordinary_login_can_establish_fresh_thread_baseline() {
+        let (mut system, _, owner, _) = handoff_fixture();
+        system.foreground = owner.hwnd;
+        inject_owner_drift(&mut system, 0);
+        let selected = assertion_owner_baseline(&mut system, owner.hwnd, None).unwrap();
+        assert_ne!(selected, owner);
+        assert_eq!(
+            checked_owner_snapshot(&mut system, selected).unwrap(),
+            selected
+        );
+        assert!(!system.trace.contains(&"activate"));
+    }
+
+    #[test]
+    fn fix_r1_ordinary_and_unchanged_owner_remain_safe() {
+        for continuation in [false, true] {
+            let (mut system, _, owner, _) = handoff_fixture();
+            system.foreground = owner.hwnd;
+            let mut pending = if continuation {
+                passive_pending(owner)
+            } else {
+                None
+            };
+            let (_, creation_owner) = prepare_assertion_continuation(
+                &mut pending,
+                owner.hwnd,
+                &[vec![7, 8]],
+                &mut system,
+                &mut ContinuationDiagnostics::default(),
+            )
+            .unwrap();
+            assert_eq!(creation_owner, continuation.then_some(owner));
+            let selected =
+                assertion_owner_baseline(&mut system, owner.hwnd, creation_owner).unwrap();
+            assert_eq!(
+                checked_owner_snapshot(&mut system, selected).unwrap(),
+                owner
+            );
+            assert!(
+                validate_owner_foreground(owner.hwnd as HWND, system.foreground as HWND).is_ok()
+            );
+            assert!(!system.trace.contains(&"activate"));
+        }
+    }
+
+    #[test]
+    fn fix_r1_drift_prevents_second_ffi_and_mock_vault_persistence() {
+        let (mut vault, dir) = fixture_vault();
+        let before = std::fs::read(&vault.path).unwrap();
+        let slots = vault.keys_meta();
+        let audit = vault.audit().len();
+        for drift in 0..5 {
+            let mut backend = ceremony_backend(None, false);
+            backend.passive_registration = true;
+            backend.owner_drift_after_preparation = Some(drift);
+            assert!(
+                vault
+                    .register_key_with_label(&mut backend, None, "Synthetic")
+                    .is_err(),
+                "R1 drift={drift} must refuse before fake second FFI"
+            );
+            assert_eq!(backend.get_calls, 1);
+            assert_eq!(backend.ffi_calls, 0);
+            assert!(backend.pending.is_none());
+            assert_eq!(vault.keys_meta(), slots);
+            assert_eq!(vault.audit().len(), audit);
+            assert_eq!(std::fs::read(&vault.path).unwrap(), before);
+            assert!(!backend.system.trace.contains(&"activate"));
+            assert!(!backend.system.trace.contains(&"restore"));
+        }
+        std::fs::remove_file(&vault.path).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
     struct CeremonyBackend {
         system: TestSystem,
         baseline: Arc<BrokerBaseline>,
@@ -2287,6 +3573,9 @@ mod tests {
         pending: Option<RegistrationContinuation>,
         first_error: Option<FidoError>,
         second_error: bool,
+        passive_registration: bool,
+        owner_drift_after_preparation: Option<u8>,
+        ffi_calls: usize,
         get_calls: usize,
     }
 
@@ -2309,26 +3598,56 @@ mod tests {
             validate_owner_foreground(self.owner.hwnd as HWND, self.system.foreground as HWND)?;
             let result = if let Some(error) = self.first_error.take() {
                 Err(error)
+            } else if self.passive_registration {
+                self.system.windows.truncate(1);
+                self.system.foreground = 0;
+                let accepted = Mutex::new(None);
+                let mut policy = MonitorPolicy::default();
+                assert!(policy.observe(
+                    &mut self.system,
+                    self.owner.hwnd,
+                    Arc::clone(&self.baseline),
+                    &AtomicBool::new(false),
+                    &accepted
+                ));
+                self.system.foreground_sequence = [0, self.owner.hwnd].into();
+                let broker = accepted.lock().unwrap().take();
+                Ok((
+                    test_registration(),
+                    self.owner,
+                    BrokerObservation {
+                        broker,
+                        passive_safe: policy.passive_safe,
+                    },
+                ))
             } else {
                 // Synthetic native success/focus loss, followed by real capture policy.
                 self.system.foreground = self.broker.hwnd;
                 let observation =
                     capture_broker(&mut self.system, Arc::clone(&self.baseline), self.broker);
-                Ok((test_registration(), self.owner, observation))
+                Ok((test_registration(), self.owner, (observation).into()))
             };
             complete_registration(&mut self.pending, result)
         }
         fn get_prf_secret(&mut self, id: &[u8], _: Option<&str>) -> Result<[u8; 32], FidoError> {
             self.get_calls += 1;
-            prepare_continuation(
+            let (_, creation_owner) = prepare_assertion_continuation(
                 &mut self.pending,
                 self.owner.hwnd,
                 &[id.to_vec()],
                 &mut self.system,
+                &mut ContinuationDiagnostics::default(),
             )
             .map_err(|refusal| FidoError::Internal(refusal.reason().into()))?;
-            checked_owner_snapshot(&mut self.system, self.owner)?;
+            if let Some(drift) = self.owner_drift_after_preparation.take() {
+                inject_owner_drift(&mut self.system, drift);
+            }
+            // Same owner selection and final identity policy as the native wrapper.
+            let selected =
+                assertion_owner_baseline(&mut self.system, self.owner.hwnd, creation_owner)?;
+            checked_owner_snapshot(&mut self.system, selected)?;
             validate_owner_foreground(self.owner.hwnd as HWND, self.system.foreground as HWND)?;
+            self.ffi_calls += 1;
             if self.second_error {
                 Err(FidoError::Internal("synthetic second API failure".into()))
             } else {
@@ -2350,8 +3669,680 @@ mod tests {
             pending: None,
             first_error,
             second_error,
+            passive_registration: false,
+            owner_drift_after_preparation: None,
+            ffi_calls: 0,
             get_calls: 0,
         }
+    }
+
+    #[test]
+    fn monitor_worker_lifecycle_reasons_and_private_channels() {
+        for (armed, cancelled, expected) in [
+            (false, true, MonitorStop::CancelledBeforeArm),
+            (true, true, MonitorStop::Cancelled),
+            (true, false, MonitorStop::Deadline),
+        ] {
+            let (mut system, baseline, owner, _) = handoff_fixture();
+            system.windows.truncate(1);
+            system.foreground = 1;
+            let cancelled = AtomicBool::new(cancelled);
+            let armed = AtomicBool::new(armed);
+            let accepted = Mutex::new(None);
+            let safe = AtomicBool::new(false);
+            let reason = Mutex::new(None);
+            run_monitor_worker(
+                &mut system,
+                owner.hwnd,
+                baseline,
+                MonitorWorkerChannels {
+                    cancelled: &cancelled,
+                    api_returned: &AtomicBool::new(false),
+                    armed: &armed,
+                    accepted: &accepted,
+                    passive_safe: &safe,
+                    reason: &reason,
+                },
+            );
+            assert_eq!(*reason.lock().unwrap(), Some(expected));
+            assert!(accepted.lock().unwrap().is_none());
+            assert!(!safe.load(Ordering::Acquire));
+            assert!(!system.trace.contains(&"activate"));
+        }
+        let (mut system, baseline, owner, broker) = handoff_fixture();
+        let proof = capture_broker(&mut system, Arc::clone(&baseline), broker).unwrap();
+        let accepted_a = Arc::new(Mutex::new(None));
+        let accepted_b = Arc::new(Mutex::new(None));
+        let reason_a = Arc::new(Mutex::new(None));
+        let reason_b = Arc::new(Mutex::new(None));
+        assert!(!Arc::ptr_eq(&accepted_a, &accepted_b));
+        assert!(!Arc::ptr_eq(&reason_a, &reason_b));
+        let output = Arc::clone(&accepted_a);
+        let reason = Arc::clone(&reason_a);
+        let a = WebAuthnForegroundMonitor {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            api_returned: Arc::new(AtomicBool::new(false)),
+            armed: Arc::new(AtomicBool::new(true)),
+            accepted: Arc::clone(&accepted_a),
+            passive_safe: Arc::new(AtomicBool::new(false)),
+            reason: Arc::clone(&reason_a),
+            operation: Operation::MakeCredential,
+            pid: owner.process_id,
+            worker: Some(thread::spawn(move || {
+                *output.lock().unwrap() = Some(proof);
+                *reason.lock().unwrap() = Some(MonitorStop::Accepted);
+            })),
+        };
+        let reason = Arc::clone(&reason_b);
+        let b = WebAuthnForegroundMonitor {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            api_returned: Arc::new(AtomicBool::new(false)),
+            armed: Arc::new(AtomicBool::new(true)),
+            accepted: Arc::clone(&accepted_b),
+            passive_safe: Arc::new(AtomicBool::new(false)),
+            reason: Arc::clone(&reason_b),
+            operation: Operation::GetAssertion,
+            pid: 10,
+            worker: Some(thread::spawn(move || {
+                *reason.lock().unwrap() = Some(MonitorStop::Incomplete);
+            })),
+        };
+        assert_eq!(a.finish_observation().broker.unwrap().identity, broker);
+        let outcome = b.finish_observation();
+        assert!(outcome.broker.is_none());
+        assert!(!outcome.passive_safe);
+        assert!(accepted_a.lock().unwrap().is_none());
+        assert!(accepted_b.lock().unwrap().is_none());
+        assert_eq!(*reason_a.lock().unwrap(), Some(MonitorStop::Accepted));
+        assert_eq!(*reason_b.lock().unwrap(), Some(MonitorStop::Incomplete));
+    }
+
+    #[test]
+    fn passive_vault_second_failure_preserves_bytes_audit_and_slots() {
+        let (mut vault, dir) = fixture_vault();
+        vault
+            .register_key_with_label(&mut crate::fido2::MockBackend::new(), None, "Existing")
+            .unwrap();
+        let slots = vault.keys_meta();
+        let audit = vault.audit().len();
+        let before = std::fs::read(&vault.path).unwrap();
+        for refusal in [false, true] {
+            let mut backend = ceremony_backend(None, true);
+            backend.passive_registration = true;
+            if refusal {
+                backend.system.native_evidence = session_evidence(Ok(0), Ok(0));
+            }
+            assert!(vault
+                .register_key_with_label(&mut backend, None, "New")
+                .is_err());
+            assert_eq!(backend.get_calls, 1);
+            assert!(backend.pending.is_none());
+            assert_eq!(vault.keys_meta(), slots);
+            assert_eq!(vault.audit().len(), audit);
+            assert_eq!(std::fs::read(&vault.path).unwrap(), before);
+            assert!(!backend.system.trace.contains(&"activate"));
+            assert!(!backend.system.trace.contains(&"restore"));
+            assert!(backend.system.windows[0].maximized);
+            if refusal {
+                assert!(!backend.system.trace.contains(&"wait"));
+            } else {
+                assert!(backend.system.time_ms >= 20);
+            }
+        }
+        std::fs::remove_file(&vault.path).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn fix_r2_production_wrappers_finish_native_return() {
+        let source = include_str!("windows_webauthn.rs").replace("\r\n", "\n");
+        for ffi in [
+            "WebAuthNAuthenticatorMakeCredential(",
+            "WebAuthNAuthenticatorGetAssertion(",
+        ] {
+            let after = source.split(ffi).nth(1).expect("native wrapper locator");
+            let shutdown = after.split("log::info!(").next().unwrap();
+            assert!(
+                shutdown.contains(".map(WebAuthnForegroundMonitor::finish_observation)"),
+                "R2_NATIVE_RETURN_WRAPPER: {ffi}"
+            );
+            assert!(
+                !shutdown.contains("drop(focus_monitor)"),
+                "R2_DROP_IS_CANCELLATION"
+            );
+        }
+    }
+
+    #[test]
+    fn fix_r2_injected_native_return_stops_and_joins_actual_monitor() {
+        for operation in [Operation::MakeCredential, Operation::GetAssertion] {
+            for pre_cancelled in [false, true] {
+                let (mut system, baseline, owner, _) = handoff_fixture();
+                system.windows.truncate(1);
+                system.foreground = owner.hwnd;
+                let cancelled = Arc::new(AtomicBool::new(false));
+                let returned = Arc::new(AtomicBool::new(false));
+                let armed = Arc::new(AtomicBool::new(true));
+                let accepted = Arc::new(Mutex::new(None));
+                let safe = Arc::new(AtomicBool::new(false));
+                let reason = Arc::new(Mutex::new(None));
+                let (entered, waiting) = std::sync::mpsc::channel();
+                system.worker_wait_entered = Some(entered);
+                system.wait_until_stopped = Some(Arc::clone(&cancelled));
+                let worker_cancelled = Arc::clone(&cancelled);
+                let worker_returned = Arc::clone(&returned);
+                let worker_armed = Arc::clone(&armed);
+                let worker_accepted = Arc::clone(&accepted);
+                let worker_safe = Arc::clone(&safe);
+                let worker_reason = Arc::clone(&reason);
+                let worker = thread::spawn(move || {
+                    run_monitor_worker(
+                        &mut system,
+                        owner.hwnd,
+                        baseline,
+                        MonitorWorkerChannels {
+                            cancelled: &worker_cancelled,
+                            api_returned: &worker_returned,
+                            armed: &worker_armed,
+                            accepted: &worker_accepted,
+                            passive_safe: &worker_safe,
+                            reason: &worker_reason,
+                        },
+                    );
+                });
+                let mut monitor = WebAuthnForegroundMonitor {
+                    cancelled,
+                    api_returned: Arc::clone(&returned),
+                    armed,
+                    accepted,
+                    passive_safe: safe,
+                    reason: Arc::clone(&reason),
+                    operation,
+                    pid: owner.process_id,
+                    worker: Some(worker),
+                };
+                waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+                if pre_cancelled {
+                    monitor.stop();
+                }
+                // Exactly the production normal-return method; no test sets api_returned.
+                let observation = monitor.finish_observation();
+                assert_eq!(returned.load(Ordering::Acquire), !pre_cancelled);
+                assert_eq!(
+                    *reason.lock().unwrap(),
+                    Some(if pre_cancelled {
+                        MonitorStop::Cancelled
+                    } else {
+                        MonitorStop::ApiReturned
+                    })
+                );
+                assert_eq!(observation.passive_safe, !pre_cancelled);
+                assert!(observation.broker.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn fix_r2_native_return_cannot_revive_terminal_worker_faults() {
+        for (fault, expected) in [
+            (0, MonitorStop::Incomplete),
+            (1, MonitorStop::Ambiguous),
+            (2, MonitorStop::ForegroundLost),
+            (3, MonitorStop::Cancelled),
+            (4, MonitorStop::WorkerFailed),
+        ] {
+            let (mut system, baseline, owner, _) = handoff_fixture();
+            match fault {
+                0 => system.enumeration_failed = true,
+                1 => {
+                    let mut other = system.windows[1].clone();
+                    other.identity.hwnd = 3;
+                    other.identity.process_id = 30;
+                    system.windows.push(other);
+                }
+                2 => {
+                    system.windows.truncate(1);
+                    system.foreground = 3;
+                }
+                3 => (),
+                4 => (),
+                _ => unreachable!(),
+            }
+            let cancelled = Arc::new(AtomicBool::new(fault == 3));
+            let returned = Arc::new(AtomicBool::new(false));
+            let armed = Arc::new(AtomicBool::new(true));
+            let accepted = Arc::new(Mutex::new(None));
+            let safe = Arc::new(AtomicBool::new(false));
+            let reason = Arc::new(Mutex::new(None));
+            let worker_cancelled = Arc::clone(&cancelled);
+            let worker_returned = Arc::clone(&returned);
+            let worker_armed = Arc::clone(&armed);
+            let worker_accepted = Arc::clone(&accepted);
+            let worker_safe = Arc::clone(&safe);
+            let worker_reason = Arc::clone(&reason);
+            let (done, completed) = std::sync::mpsc::channel();
+            let worker = thread::spawn(move || {
+                if fault == 4 {
+                    done.send(()).unwrap();
+                    panic!("synthetic worker fault");
+                }
+                run_monitor_worker(
+                    &mut system,
+                    owner.hwnd,
+                    baseline,
+                    MonitorWorkerChannels {
+                        cancelled: &worker_cancelled,
+                        api_returned: &worker_returned,
+                        armed: &worker_armed,
+                        accepted: &worker_accepted,
+                        passive_safe: &worker_safe,
+                        reason: &worker_reason,
+                    },
+                );
+                done.send(()).unwrap();
+            });
+            completed.recv_timeout(Duration::from_secs(5)).unwrap();
+            let monitor = WebAuthnForegroundMonitor {
+                cancelled,
+                api_returned: returned,
+                armed,
+                accepted,
+                passive_safe: safe,
+                reason: Arc::clone(&reason),
+                operation: Operation::GetAssertion,
+                pid: owner.process_id,
+                worker: Some(worker),
+            };
+            let observation = monitor.finish_observation();
+            assert!(observation.broker.is_none());
+            assert!(!observation.passive_safe);
+            assert_eq!(*reason.lock().unwrap(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn monitor_api_return_differs_from_cancellation_and_unrelated_loss() {
+        for normal_return in [false, true] {
+            let (mut system, baseline, owner, _) = handoff_fixture();
+            system.windows.truncate(1);
+            system.foreground = 1;
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let returned = Arc::new(AtomicBool::new(false));
+            system.cancel_on_wait = Some(Arc::clone(&cancelled));
+            if normal_return {
+                system.returned_on_wait = Some(Arc::clone(&returned));
+            }
+            let accepted = Mutex::new(None);
+            let safe = AtomicBool::new(false);
+            let reason = Mutex::new(None);
+            run_monitor_worker(
+                &mut system,
+                1,
+                baseline,
+                MonitorWorkerChannels {
+                    cancelled: &cancelled,
+                    api_returned: &returned,
+                    armed: &AtomicBool::new(true),
+                    accepted: &accepted,
+                    passive_safe: &safe,
+                    reason: &reason,
+                },
+            );
+            assert_eq!(
+                *reason.lock().unwrap(),
+                Some(if normal_return {
+                    MonitorStop::ApiReturned
+                } else {
+                    MonitorStop::Cancelled
+                })
+            );
+            assert_eq!(safe.load(Ordering::Acquire), normal_return);
+            let observation = BrokerObservation {
+                broker: accepted.lock().unwrap().take(),
+                passive_safe: safe.load(Ordering::Acquire),
+            };
+            let mut pending = None;
+            complete_registration(&mut pending, Ok((test_registration(), owner, observation)))
+                .unwrap();
+            system.cancel_on_wait = None;
+            system.returned_on_wait = None;
+            system.foreground_sequence = [0, 1].into();
+            let result = prepare_continuation(&mut pending, 1, &[vec![7, 8]], &mut system);
+            assert_eq!(
+                result,
+                if normal_return {
+                    Ok(HandoffOutcome::OwnerForeground)
+                } else {
+                    Err(HandoffRefusal::UnobservedBroker)
+                }
+            );
+            assert!(pending.is_none());
+        }
+        let (mut system, baseline, owner, _) = handoff_fixture();
+        system.windows.truncate(1);
+        system.foreground = 3;
+        let accepted = Mutex::new(None);
+        let mut policy = MonitorPolicy::default();
+        assert!(policy.observe(&mut system, 1, baseline, &AtomicBool::new(false), &accepted));
+        assert_eq!(policy.reason, Some(MonitorStop::ForegroundLost));
+        assert!(!policy.passive_safe);
+        let observation = BrokerObservation {
+            broker: None,
+            passive_safe: policy.passive_safe,
+        };
+        let mut pending = None;
+        complete_registration(&mut pending, Ok((test_registration(), owner, observation))).unwrap();
+        system.foreground_sequence = [0, 1].into();
+        assert_eq!(
+            prepare_continuation(&mut pending, 1, &[vec![7, 8]], &mut system),
+            Err(HandoffRefusal::UnobservedBroker)
+        );
+        assert!(!system.trace.contains(&"wait"));
+    }
+
+    #[test]
+    fn monitor_poisoned_authoritative_channel_cannot_authorize_passive_return() {
+        let accepted = Arc::new(Mutex::new(None));
+        let poisoned = Arc::clone(&accepted);
+        let worker = thread::spawn(move || {
+            let _guard = poisoned.lock().unwrap();
+            panic!("synthetic channel poison");
+        });
+        let _ = worker.join();
+        let reason = Arc::new(Mutex::new(None));
+        let monitor = WebAuthnForegroundMonitor {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            api_returned: Arc::new(AtomicBool::new(false)),
+            armed: Arc::new(AtomicBool::new(true)),
+            accepted,
+            passive_safe: Arc::new(AtomicBool::new(true)),
+            reason: Arc::clone(&reason),
+            operation: Operation::MakeCredential,
+            pid: 10,
+            worker: Some(thread::spawn(|| {})),
+        };
+        let observation = monitor.finish_observation();
+        assert!(observation.broker.is_none());
+        assert!(!observation.passive_safe);
+        assert_eq!(*reason.lock().unwrap(), Some(MonitorStop::ChannelFailed));
+    }
+
+    #[test]
+    fn fix_d1_early_owner_refusal_keeps_foreground_identity_unknown() {
+        for fault in 0..7 {
+            let (mut system, _, owner, _) = handoff_fixture();
+            let mut pending = passive_pending(owner);
+            system.foreground = owner.hwnd;
+            match fault {
+                0..=2 => inject_owner_drift(&mut system, fault),
+                3 => system.inaccessible_hwnd = Some(owner.hwnd),
+                4 => system.inaccessible_session = Some(owner.process_id),
+                5 => system.windows[0].session += 1,
+                6 => {
+                    system.owner_identity_uses_session = true;
+                    system.owner_drift_on_session = Some((2, 0));
+                }
+                _ => unreachable!("closed diagnostic fixtures"),
+            }
+            let mut diagnostic = ContinuationDiagnostics::default();
+            assert_eq!(
+                prepare_continuation_recorded(
+                    &mut pending,
+                    owner.hwnd,
+                    &[vec![7, 8]],
+                    &mut system,
+                    &mut diagnostic
+                ),
+                Err(HandoffRefusal::Owner)
+            );
+            let record = diagnostic.record(owner.process_id);
+            assert_eq!(record["foreground"]["hwnd"], owner.hwnd);
+            for field in ["pid", "tid", "session"] {
+                assert!(
+                    record["foreground"][field].is_null(),
+                    "CONTRACT:D1_FOREGROUND_IDENTITY_UNKNOWN fault={fault} field={field}"
+                );
+            }
+            assert!(pending.is_none());
+            assert!(!system.trace.contains(&"wait"));
+            assert!(!system.trace.contains(&"activate"));
+            assert!(!system.trace.contains(&"restore"));
+        }
+    }
+
+    #[test]
+    fn fix_d1_current_valid_null_and_unrelated_samples() {
+        for foreground in [1, 0, 3] {
+            let (mut system, _, owner, _) = handoff_fixture();
+            system.foreground = foreground;
+            system.native_evidence = session_evidence(Ok(0), Ok(0));
+            let mut pending = passive_pending(owner);
+            // Poison only diagnostic input; it must not supply policy or observations.
+            let mut diagnostic = ContinuationDiagnostics {
+                foreground: WindowScalars {
+                    hwnd: Some(1),
+                    pid: Some(99),
+                    tid: Some(99),
+                    session: Some(99),
+                },
+                identity_match: Some(true),
+                ..Default::default()
+            };
+            let result = prepare_continuation_recorded(
+                &mut pending,
+                owner.hwnd,
+                &[vec![7, 8]],
+                &mut system,
+                &mut diagnostic,
+            );
+            let record = diagnostic.record(owner.process_id);
+            assert_eq!(
+                result,
+                match foreground {
+                    1 => Ok(HandoffOutcome::OwnerForeground),
+                    0 => Err(HandoffRefusal::PassiveSession),
+                    _ => Err(HandoffRefusal::UnobservedBroker),
+                }
+            );
+            if foreground == owner.hwnd {
+                assert_eq!(
+                    record["foreground"],
+                    serde_json::json!({"hwnd":1,"pid":10,"tid":11,"session":2})
+                );
+            } else {
+                assert_eq!(
+                    record["foreground"]["hwnd"],
+                    if foreground == 0 {
+                        Value::Null
+                    } else {
+                        Value::from(foreground)
+                    }
+                );
+                for field in ["pid", "tid", "session"] {
+                    assert!(record["foreground"][field].is_null());
+                }
+            }
+            assert!(system.identity_hwnds.iter().all(|hwnd| *hwnd == owner.hwnd));
+            assert!(system
+                .session_pids
+                .iter()
+                .all(|pid| *pid == owner.process_id));
+            assert!(pending.is_none());
+            assert!(!system.trace.contains(&"wait"));
+            assert!(!system.trace.contains(&"activate"));
+            assert!(!system.trace.contains(&"restore"));
+        }
+    }
+
+    #[test]
+    fn fix_d1_final_identity_metadata_drift_is_not_observation() {
+        let (mut system, _, owner, _) = handoff_fixture();
+        system.foreground = owner.hwnd;
+        system.owner_identity_uses_session = true;
+        system.owner_drift_on_session = Some((3, 0));
+        let mut pending = passive_pending(owner);
+        let mut diagnostic = ContinuationDiagnostics::default();
+        assert_eq!(
+            prepare_continuation_recorded(
+                &mut pending,
+                owner.hwnd,
+                &[vec![7, 8]],
+                &mut system,
+                &mut diagnostic
+            ),
+            Err(HandoffRefusal::Owner)
+        );
+        let record = diagnostic.record(owner.process_id);
+        assert_eq!(record["foreground"]["hwnd"], owner.hwnd);
+        for field in ["pid", "tid", "session"] {
+            assert!(record["foreground"][field].is_null());
+        }
+        assert_eq!(record["identity_match"], false);
+        assert!(system.trace.contains(&"metadata-drift"));
+    }
+
+    #[test]
+    fn passive_diagnostic_fields_never_authorize_or_fabricate_foreign_session() {
+        let (mut system, _, owner, _) = handoff_fixture();
+        let mut pending = passive_pending(owner);
+        system.foreground_sequence = [0, 1].into();
+        system.native_evidence = session_evidence(Ok(0), Ok(0));
+        let mut diagnostic = ContinuationDiagnostics {
+            native: Some(session_evidence(Ok(2), Ok(0))),
+            owner_visible: Some(true),
+            identity_match: Some(true),
+            status: Some(ContinuationStatus::PassiveReturn),
+            ..Default::default()
+        };
+        assert_eq!(
+            prepare_continuation_recorded(
+                &mut pending,
+                1,
+                &[vec![7, 8]],
+                &mut system,
+                &mut diagnostic
+            ),
+            Err(HandoffRefusal::PassiveSession)
+        );
+        assert!(!system.trace.contains(&"wait"));
+        assert!(pending.is_none());
+        assert_eq!(diagnostic.record(10)["native_protocol"], "console");
+        assert_eq!(diagnostic.record(10)["outcome"], "session-refused");
+        let mut pending = passive_pending(owner);
+        system.windows[0].identity.process_id = 99;
+        system.windows[0].identity.session = 3;
+        system.windows[0].session = 3;
+        let mut diagnostic = ContinuationDiagnostics::default();
+        assert_eq!(
+            prepare_continuation_recorded(
+                &mut pending,
+                1,
+                &[vec![7, 8]],
+                &mut system,
+                &mut diagnostic
+            ),
+            Err(HandoffRefusal::Owner)
+        );
+        assert_eq!(diagnostic.record(10)["owner"]["pid"], 99);
+        assert_eq!(diagnostic.record(10)["owner"]["session"], 3);
+        assert_eq!(diagnostic.record(10)["identity_match"], false);
+    }
+
+    #[test]
+    fn native_session_failure_or_non_rdp_stops_before_state_query() {
+        use std::cell::RefCell;
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(1000);
+        for protocol in [
+            Ok(0),
+            Ok(1),
+            Ok(3),
+            Err(QueryStatus::NativeFailure),
+            Err(QueryStatus::NullBuffer),
+            Err(QueryStatus::InvalidLength),
+        ] {
+            let calls = RefCell::new(Vec::new());
+            let evidence = query_native_session(
+                2,
+                deadline,
+                |session| {
+                    calls.borrow_mut().push(("protocol", session));
+                    protocol
+                },
+                |session| {
+                    calls.borrow_mut().push(("state", session));
+                    Ok(WTSActive)
+                },
+                || started,
+            );
+            assert!(!evidence.active_rdp());
+            assert_eq!(
+                *calls.borrow(),
+                vec![("protocol", 2)],
+                "ineligible protocol must refuse without further blocking native query"
+            );
+            assert_eq!(evidence.state_query, QueryStatus::NotQueried);
+        }
+        for late in [false, true] {
+            let calls = RefCell::new(Vec::new());
+            let evidence = query_native_session(
+                2,
+                deadline,
+                |session| {
+                    calls.borrow_mut().push(("protocol", session));
+                    Ok(2)
+                },
+                |session| {
+                    calls.borrow_mut().push(("state", session));
+                    Ok(WTSActive)
+                },
+                || if late { deadline } else { started },
+            );
+            assert_eq!(evidence.active_rdp(), !late);
+            assert_eq!(
+                *calls.borrow(),
+                if late {
+                    vec![("protocol", 2)]
+                } else {
+                    vec![("protocol", 2), ("state", 2)]
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn passive_initial_null_before_slow_owner_metadata_cannot_become_late_ordinary_pass() {
+        let (mut system, _, owner, _) = handoff_fixture();
+        let mut pending = passive_pending(owner);
+        system.foreground = 0;
+        system.owner_query_delay_ms = 1000;
+        system.owner_foreground_on_metadata = true;
+        assert_eq!(
+            prepare_continuation(&mut pending, 1, &[vec![7, 8]], &mut system),
+            Err(HandoffRefusal::PassiveDeadline)
+        );
+        assert_eq!(system.time_ms, 1000);
+        assert!(pending.is_none());
+        assert_eq!(system.native_count, 0);
+        assert!(!system.trace.contains(&"wait"));
+        assert!(!system.trace.contains(&"activate"));
+        assert!(!system.trace.contains(&"restore"));
+    }
+
+    #[test]
+    fn passive_owner_initially_foreground_then_null_does_not_gain_wait_authority() {
+        let (mut system, _, owner, _) = handoff_fixture();
+        let mut pending = passive_pending(owner);
+        system.foreground_sequence = [1, 0, 1].into();
+        assert_eq!(
+            prepare_continuation(&mut pending, 1, &[vec![7, 8]], &mut system),
+            Err(HandoffRefusal::UnobservedBroker)
+        );
+        assert!(pending.is_none());
+        assert_eq!(system.native_count, 0);
+        assert!(!system.trace.contains(&"wait"));
+        assert!(!system.trace.contains(&"activate"));
+        assert!(!system.trace.contains(&"restore"));
     }
 
     fn fixture_vault() -> (crate::vault::Vault, std::path::PathBuf) {
@@ -2581,6 +4572,7 @@ mod tests {
             hwnd: 0x1203ce,
             process_id: 1492,
             thread_id: 2844,
+            session: 2,
         };
         let baseline = HashSet::from([existing]);
         assert!(!is_new_window_identity(existing, &baseline));
@@ -2589,6 +4581,7 @@ mod tests {
                 hwnd: existing.hwnd,
                 process_id: 2000,
                 thread_id: 3000,
+                session: 2,
             },
             &baseline,
         ));
@@ -2600,11 +4593,13 @@ mod tests {
             hwnd: 0x1203ce,
             process_id: 1492,
             thread_id: 2844,
+            session: 2,
         };
         let second = WindowIdentity {
             hwnd: 0xf03fc,
             process_id: 11064,
             thread_id: 9552,
+            session: 2,
         };
         assert_eq!(select_unique_candidate(&[first]), Some(first));
         assert_eq!(select_unique_candidate(&[first, second]), None);
