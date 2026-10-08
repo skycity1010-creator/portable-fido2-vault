@@ -1058,14 +1058,81 @@ fn window_identity(hwnd: HWND) -> Option<WindowIdentity> {
     })
 }
 
+const BASELINE_CAPTURE_MAX_ATTEMPTS: usize = 3;
+const BASELINE_CAPTURE_RETRY_DELAY: Duration = Duration::from_millis(10);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BaselineCaptureStage {
+    WindowEnumeration,
+    WindowIdentity,
+}
+
+impl BaselineCaptureStage {
+    fn label(self) -> &'static str {
+        match self {
+            Self::WindowEnumeration => "window-enumeration",
+            Self::WindowIdentity => "window-identity",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BaselineCaptureError {
+    stage: BaselineCaptureStage,
+    attempts: usize,
+}
+
+struct BaselineWindowSnapshot {
+    identities: HashSet<WindowIdentity>,
+    attempts: usize,
+}
+
 fn baseline_window_identities(
     system: &mut impl ForegroundSystem,
-) -> Result<HashSet<WindowIdentity>, ()> {
-    system
-        .windows()?
-        .into_iter()
-        .map(|hwnd| system.identity(hwnd).ok_or(()))
-        .collect()
+) -> Result<BaselineWindowSnapshot, BaselineCaptureError> {
+    let mut last_failure = BaselineCaptureStage::WindowEnumeration;
+
+    for attempt in 1..=BASELINE_CAPTURE_MAX_ATTEMPTS {
+        let windows = match system.windows() {
+            Ok(windows) => windows,
+            Err(()) => {
+                last_failure = BaselineCaptureStage::WindowEnumeration;
+                if attempt < BASELINE_CAPTURE_MAX_ATTEMPTS {
+                    system.wait(BASELINE_CAPTURE_RETRY_DELAY);
+                }
+                continue;
+            }
+        };
+
+        let mut identities = HashSet::with_capacity(windows.len());
+        let mut identity_failed = false;
+        for hwnd in windows {
+            match system.identity(hwnd) {
+                Some(identity) => {
+                    identities.insert(identity);
+                }
+                None => {
+                    identity_failed = true;
+                    last_failure = BaselineCaptureStage::WindowIdentity;
+                    break;
+                }
+            }
+        }
+        if !identity_failed {
+            return Ok(BaselineWindowSnapshot {
+                identities,
+                attempts: attempt,
+            });
+        }
+        if attempt < BASELINE_CAPTURE_MAX_ATTEMPTS {
+            system.wait(BASELINE_CAPTURE_RETRY_DELAY);
+        }
+    }
+
+    Err(BaselineCaptureError {
+        stage: last_failure,
+        attempts: BASELINE_CAPTURE_MAX_ATTEMPTS,
+    })
 }
 
 fn credential_broker_process_ids() -> Option<HashSet<u32>> {
@@ -1314,16 +1381,34 @@ impl WebAuthnForegroundMonitor {
             log::warn!("[WebAuthN-focus] could not determine the current Windows session");
             None
         })?;
-        let baseline_windows = baseline_window_identities(&mut NativeForegroundSystem).ok()?;
+        let baseline_snapshot = match baseline_window_identities(&mut NativeForegroundSystem) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let operation = match operation {
+                    Operation::MakeCredential => "MakeCredential",
+                    Operation::GetAssertion => "GetAssertion",
+                };
+                log::warn!(
+                    "[WebAuthN-focus] reason=baseline-window-snapshot-failed operation={} stage={} attempts={}",
+                    operation,
+                    error.stage.label(),
+                    error.attempts,
+                );
+                return None;
+            }
+        };
+        let baseline_attempts = baseline_snapshot.attempts;
+        let baseline_windows = baseline_snapshot.identities;
         let baseline_broker_processes = credential_broker_process_ids().or_else(|| {
             log::warn!("[WebAuthN-focus] could not snapshot existing broker processes");
             None
         })?;
         log::info!(
-            "[WebAuthN-focus] prepared operation={} session={} baseline_windows={} baseline_broker_processes={}",
+            "[WebAuthN-focus] prepared operation={} session={} baseline_windows={} baseline_attempts={} baseline_broker_processes={}",
             match operation { Operation::MakeCredential => "MakeCredential", Operation::GetAssertion => "GetAssertion" },
             current_session,
             baseline_windows.len(),
+            baseline_attempts,
             baseline_broker_processes.len(),
         );
 
@@ -2017,6 +2102,9 @@ mod tests {
         broker_path_reads: usize,
         owner_change_on_broker_path: Option<(usize, WindowIdentity)>,
         enumeration_failed: bool,
+        transient_enumeration_failures: usize,
+        transient_identity_failures: std::collections::VecDeque<isize>,
+        window_on_transient_identity_failure: Option<TestWindow>,
         inaccessible_hwnd: Option<isize>,
         unknown_metadata: bool,
         cancel_on_path: Option<Arc<AtomicBool>>,
@@ -2114,6 +2202,13 @@ mod tests {
             if self.inaccessible_hwnd == Some(hwnd) {
                 return None;
             }
+            if self.transient_identity_failures.front() == Some(&hwnd) {
+                self.transient_identity_failures.pop_front();
+                if let Some(window) = self.window_on_transient_identity_failure.take() {
+                    self.windows.push(window);
+                }
+                return None;
+            }
             let identity = self.window(hwnd).map(|w| w.identity)?;
             if self.owner_identity_uses_session && hwnd == 1 {
                 // Mirror Native identity: capture PID/TID before session metadata.
@@ -2142,6 +2237,11 @@ mod tests {
                 .map(|w| (w.identity.process_id, w.identity.thread_id))
         }
         fn windows(&mut self) -> Result<Vec<isize>, ()> {
+            self.trace.push("windows");
+            if self.transient_enumeration_failures > 0 {
+                self.transient_enumeration_failures -= 1;
+                return Err(());
+            }
             if self.enumeration_failed {
                 return Err(());
             }
@@ -2305,6 +2405,9 @@ mod tests {
             broker_path_reads: 0,
             owner_change_on_broker_path: None,
             enumeration_failed: false,
+            transient_enumeration_failures: 0,
+            transient_identity_failures: Default::default(),
+            window_on_transient_identity_failure: None,
             inaccessible_hwnd: None,
             unknown_metadata: false,
             cancel_on_path: None,
@@ -2342,6 +2445,132 @@ mod tests {
             processes: HashSet::new(),
         });
         (system, baseline, owner, broker)
+    }
+
+    #[test]
+    fn baseline_snapshot_retries_a_transient_identity_failure_without_dropping_hidden_windows() {
+        let (mut system, _, owner, broker) = handoff_fixture();
+        system.windows[1].visible = false;
+        system.transient_identity_failures.push_back(broker.hwnd);
+
+        let baseline = baseline_window_identities(&mut system);
+        assert!(
+            baseline.is_ok(),
+            "a transient identity-read failure should retry a complete baseline snapshot"
+        );
+        let baseline = baseline.unwrap();
+        assert_eq!(baseline.identities, HashSet::from([owner, broker]));
+        assert_eq!(baseline.attempts, 2);
+        assert_eq!(
+            system
+                .trace
+                .iter()
+                .filter(|step| **step == "windows")
+                .count(),
+            2
+        );
+        assert_eq!(
+            system.trace.iter().filter(|step| **step == "wait").count(),
+            1
+        );
+        assert_eq!(system.time_ms, 10);
+    }
+
+    #[test]
+    fn baseline_retry_uses_fresh_snapshot_including_new_window() {
+        let (mut system, _, owner, broker) = handoff_fixture();
+        let mut added_window = system.window(broker.hwnd).unwrap().clone();
+        let added_identity = WindowIdentity {
+            hwnd: 3,
+            process_id: 30,
+            thread_id: 31,
+            session: 2,
+        };
+        added_window.identity = added_identity;
+        system.transient_identity_failures.push_back(broker.hwnd);
+        system.window_on_transient_identity_failure = Some(added_window);
+
+        let baseline = baseline_window_identities(&mut system)
+            .expect("the second complete enumeration should include the new window");
+        assert_eq!(
+            baseline.identities,
+            HashSet::from([owner, broker, added_identity])
+        );
+        assert_eq!(baseline.attempts, 2);
+    }
+
+    #[test]
+    fn baseline_enumeration_retries_a_transient_failure() {
+        let (mut system, _, owner, broker) = handoff_fixture();
+        system.transient_enumeration_failures = 1;
+
+        let baseline = baseline_window_identities(&mut system)
+            .expect("a transient enumeration failure should retry the full snapshot");
+        assert_eq!(baseline.identities, HashSet::from([owner, broker]));
+        assert_eq!(baseline.attempts, 2);
+        assert_eq!(
+            system
+                .trace
+                .iter()
+                .filter(|step| **step == "windows")
+                .count(),
+            2
+        );
+        assert_eq!(
+            system.trace.iter().filter(|step| **step == "wait").count(),
+            1
+        );
+        assert_eq!(system.time_ms, 10);
+    }
+
+    #[test]
+    fn baseline_enumeration_failure_retries_are_bounded() {
+        let (mut system, _, _, _) = handoff_fixture();
+        system.enumeration_failed = true;
+
+        let error = baseline_window_identities(&mut system)
+            .err()
+            .expect("persistent enumeration failure must not return a partial snapshot");
+        assert_eq!(error.stage, BaselineCaptureStage::WindowEnumeration);
+        assert_eq!(error.attempts, BASELINE_CAPTURE_MAX_ATTEMPTS);
+        assert_eq!(
+            system
+                .trace
+                .iter()
+                .filter(|step| **step == "windows")
+                .count(),
+            3
+        );
+        assert_eq!(
+            system.trace.iter().filter(|step| **step == "wait").count(),
+            2
+        );
+        assert_eq!(system.time_ms, 20);
+    }
+
+    #[test]
+    fn baseline_identity_failure_retries_are_bounded_without_partial_snapshot() {
+        let (mut system, _, _, broker) = handoff_fixture();
+        system.inaccessible_hwnd = Some(broker.hwnd);
+
+        let error = baseline_window_identities(&mut system)
+            .err()
+            .expect("persistent identity failure must not return a partial snapshot");
+        assert_eq!(error.stage, BaselineCaptureStage::WindowIdentity);
+        assert_eq!(error.attempts, BASELINE_CAPTURE_MAX_ATTEMPTS);
+        assert_eq!(
+            system
+                .trace
+                .iter()
+                .filter(|step| **step == "windows")
+                .count(),
+            3
+        );
+        assert_eq!(
+            system.trace.iter().filter(|step| **step == "wait").count(),
+            2
+        );
+        assert_eq!(system.time_ms, 20);
     }
 
     #[test]
