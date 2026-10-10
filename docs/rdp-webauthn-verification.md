@@ -1,6 +1,6 @@
 ﻿# RDP WebAuthn 手動驗證
 
-本文件是 R1 候選版的 R2–R5 操作 checklist；本次所有 physical acceptance 均為 **NOT_TESTED**。自動化測試與 collector-only metadata 不構成 Console/RDP 金鑰驗收。生產 RDP 支援聲明不變。
+本文件是 R1 候選版的 R2–R5 操作 checklist。2026-10-10 以 main `ab68de0` 的 Release GUI 完成部分 physical acceptance（結果見下表；證據：`docs/reports/rdp-physical-acceptance-2026-10-10.md`）；未列 PASS 者仍為 **NOT_TESTED**。自動化測試與 collector-only metadata 不構成 Console/RDP 金鑰驗收。生產 RDP 支援聲明不變。
 
 ## 證據與角色
 
@@ -39,8 +39,8 @@ MakeCredential/GetAssertion operation JSON 僅允許 operation、error_category�
 
 | Case | PASS 條件 | Actual | Result |
 |---|---|---|---|
-| R3-1 | GUI 同 process API≥4；credential_match=true；output_present=true，output_length=32 | 未執行 | NOT_TESTED |
-| R3-2 | 同一 Console-created 舊測試槽成功解鎖同一 DB，slot count 不變 | 未執行 | NOT_TESTED |
+| R3-1 | GUI 同 process API≥4；credential_match=true；output_present=true，output_length=32 | 2026-10-10 09:47 WS2 RDP（NB 發起）：API v7、local_console=false、credential_match=true、32 bytes | PASS |
+| R3-2 | 同一 Console-created 舊測試槽成功解鎖同一 DB，slot count 不變 | NB Console 建立的測試 DB 複製到 WS2 後在 RDP 解鎖成功（使用者回報）；slot count 未另行讀 DB 核對 | PASS（解鎖）；slot 核對 NOT_TESTED |
 
 API<4 保留拒絕，後續 NOT_TESTED/blocked(capability)。無有效 output 記 unsupported-output。有 output 但 AEAD 失敗立即停止，檢查 raw-salt/credential/UV 一致性，不重建舊槽。一般網站登入不是 PASS。secret 不傳出，若比較只在記憶體比較並清零、回報布林。
 
@@ -48,9 +48,9 @@ API<4 保留拒絕，後續 NOT_TESTED/blocked(capability)。無有效 output �
 
 | Case | 操作與 PASS 條件 | Actual | Result |
 |---|---|---|---|
-| R4-1 | 記 test DB slot baseline，在 RDP 註冊專用 credential，正向 hmac creation confirmed、get output=32、slot 恰 +1 | 未執行 | NOT_TESTED |
-| R4-2 | 上鎖後用新槽在 RDP 解鎖 | 未執行 | NOT_TESTED |
-| R4-3 | 正常離開 RDP，把同 key 移回 host Console；同 DB/new slot 解鎖 | 未執行 | NOT_TESTED |
+| R4-1 | 記 test DB slot baseline，在 RDP 註冊專用 credential，正向 hmac creation confirmed、get output=32、slot 恰 +1 | 2026-10-10 18:28 WS2 RDP 新測試庫 0→1；MakeCredential HMAC confirmed → continuation owner-foreground → GetAssertion credential_match、32 bytes；RDP 未主動 activation | PASS |
+| R4-2 | 上鎖後用新槽在 RDP 解鎖 | 重開後僅金鑰登入成功、假條目可見、slot 仍 1 | PASS |
+| R4-3 | 正常離開 RDP，把同 key 移回 host Console；同 DB/new slot 解鎖 | WS2 host Console 未測；替代：同 DB 以一般權限複製回 NB（client）Console，以同 key 新槽解鎖成功（使用者回報，client-Console 跨機反向覆蓋） | host Console NOT_TESTED；client Console PASS |
 | R4-4 | 註冊後 secret 取得失敗時 slot 不寫入；如有 key-side orphan 如實註記，不自動刪 key credential | 未執行 | NOT_TESTED |
 
 ## R5：Fail-closed 與 Console 回歸
@@ -58,7 +58,7 @@ API<4 保留拒絕，後續 NOT_TESTED/blocked(capability)。無有效 output �
 | Case | 操作與 PASS 條件 | Actual | Result |
 |---|---|---|---|
 | R5-1 | 錯誤／未註冊 key：拒絕、slot 不變 | 未執行 | NOT_TESTED |
-| R5-2 | 取消 PIN/UV/dialog：拒絕、slot 不變 | 未執行 | NOT_TESTED |
+| R5-2 | 取消 PIN/UV/dialog：拒絕、slot 不變 | RDP 內 3 次取消皆 api-error 拒絕，之後登入成功、slot 仍 1 | PASS |
 | R5-3 | 斷線／逾時：原已鎖定 vault 保持鎖定，無殘留成功 token/invalid slot；不宣稱有斷線即自動上鎖 | 未執行 | NOT_TESTED |
 | R5-4 | redirection off/policy deny/consent拒絕，只有 client 插 key：失敗、無 mock fallback。設定變更另外核准 | 未執行 | NOT_TESTED |
 | R5-5 | API<4／不支援 PRF fixture：拒絕、無新槽；缺硬體保留 NOT_TESTED，自動化不可取代 | 未執行 | NOT_TESTED |
