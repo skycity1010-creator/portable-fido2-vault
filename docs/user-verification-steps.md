@@ -2,7 +2,7 @@
 
 > 適用：Win11-NB，`C:\FidoVault`（portable 資料夾）。本文保留部署與已確認驗收紀錄，不是要求重新執行全部舊模板。
 > Windows Release GUI 必須以 `--features real-ctap` 建置；一般權限的檔案總管直接啟動時使用 Windows WebAuthn API，無需環境變數或系統管理員提升。Windows 安全性視窗負責 PIN/UV/觸碰；目標系統需 WebAuthn API v4+。Debug build 預設為 MockBackend；明確跑 mock 流程時設定 `F2V_AUTHENTICATOR=mock`。
-> **RDP 不支援：**目前不支援從 RDP 遠端桌面 session 啟動或操作 FidoVault 硬體金鑰流程；請使用目標機本機 Console session。Win11-NB 的 RDP session 回報 WebAuthn API v1，低於 v4+ 要求，程式會 fail closed；勿降低 API 版本檢查。
+> **RDP 範圍（2026-10-10 更新）：**建立金庫與註冊金鑰請在目標機本機 Console session。已實測：Win11-NB 本機建立的金庫資料夾以一般權限複製到 WS2 後，由 Win11-NB 以 RDP 連入 WS2，可用同一主密碼與插在 Win11-NB 的已註冊金鑰登入（WS2 RDP 回報 API v7）。RDP 中註冊新金鑰未驗收。API 低於 v4 的 session 仍 fail closed；勿降低 API 版本檢查。早期 Win11-NB RDP session 曾回報 API v1。
 
 ## 已確認驗收彙整（文件同步：2026-10-04）
 

@@ -43,7 +43,7 @@ log = { version = "0.4", features = ["std"] }
 authenticator = { path = "../vendor/authenticator-rs", optional = true, default-features = false, features = ["crypto_rust"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Networking_WindowsWebServices", "Win32_System_DataExchange", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Memory", "Win32_System_RemoteDesktop", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Networking_WindowsWebServices", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_RemoteDesktop", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
 
 [features]
 default = ["mock-fido"]
