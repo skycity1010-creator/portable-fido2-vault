@@ -14,7 +14,15 @@ Windows 桌面、**完全離線**、**portable 免安裝**的 FIDO2 密碼金庫
 - 每筆條目可複製目前密碼；60 秒後僅在剪貼簿內容仍相同時嘗試清除
 - 主視窗每次啟動預設最大化；金鑰登入期間不會意外還原成一般視窗；保留標題列及還原／調整大小功能，不進入全螢幕
 - 安全性金鑰可在註冊時設定 FidoVault 本機別名；名稱以明文存於 vault header，請勿輸入敏感資料
+- 本機 Console 金鑰操作時，第一個 Windows 安全性視窗會盡力拉到前景（已知：同一操作的第二個視窗可能仍在背景）
+- 支援在已實測矩陣內以 RDP（WebAuthn 重新導向）使用金鑰；WebAuthn 不可用（API < v4）時程式仍可啟動並以主密碼登入，金鑰操作會說明原因並拒絕
 - ⚠️ **無復原機制**：主密碼遺忘且所有 FIDO2 金鑰全失 = 資料永久無法取回
+
+## 目前狀態（2026-10-11）
+
+- `main` 已包含 PR #2–#26；目前 Win11-NB 正式部署 GUI 來自 PR #25（commit `5b943c7`，`main` `5073642` 起），SHA-256 `3b3f7367be81baab1a37c5249788f815c397b9e5241289880a3e6f7618996322`，2026-10-11 部署至 `C:\FidoVault`。
+- 自動化驗證（GitHub Actions，Windows）：UI 65/65、Rust `--features real-ctap` 200/200、mock Gate E2E 20/20。
+- 部署、驗收與殘餘未測項目見 `docs/PROJECT.md` §17、`docs/user-verification-steps.md` 末節與 `docs/rdp-webauthn-verification.md` R6。
 
 ## 目錄結構
 
@@ -129,7 +137,7 @@ foreach ($name in $programFiles) {
 
 若 Windows 提示**找不到 `WebView2Loader.dll`**，先從可信任的同版 x64 套件補到 EXE 旁，再重試；**不要刪除、覆寫或重建 `vault.db`**。若 DLL 已補齊但仍提示 Runtime 不可用，再處理 Runtime 安裝。若搬移既有 DB 後卻顯示「首次執行／建立帳號」，立即停止，檢查啟動的 EXE 路徑及其同目錄的 `vault.db`，不要建立空白金庫來排錯。
 
-驗證範圍：mock Gate 8、PE imports／DLL 架構或載入檢查，都不等同實體 GUI 跨電腦啟動／金鑰解鎖 PASS；目前未收到該跨機人工 PASS 回報。本次說明更新不修改程式或金庫，也不代表重新部署。
+驗證範圍：mock Gate 8、PE imports／DLL 架構或載入檢查，都不等同實體 GUI 跨電腦啟動／金鑰解鎖 PASS。實體 GUI 跨機已有人工 PASS（2026-10-10，專用測試金庫）：Win11-NB 本機 Console 建立的測試金庫以一般權限複製到 WS2，在 RDP session 以同一主密碼與同一把金鑰解鎖；WS2 RDP 建立的測試金庫複製回 Win11-NB 本機 Console 以同一金鑰解鎖。正式金庫未做跨機搬移。詳見 `docs/reports/rdp-physical-acceptance-2026-10-10.md`。
 
 ## 測試 / Gate 驗證
 

@@ -1,9 +1,9 @@
 # 可攜式 FIDO2 密碼金庫（portable-fido2-vault）— 專案彙整文件
 
-> 彙整日期：2026-10-04｜建置機：WS2｜部署/驗證機：Win11-NB（`C:\FidoVault`）
+> 彙整日期：2026-10-11｜建置機：WS2｜部署/驗證機：Win11-NB（`C:\FidoVault`）
 > 本檔彙整 README.md、docs/spec.md、docs/user-verification-steps.md 與近期修復紀錄（§9），
 > 作為單一入口文件；細節以各原始文件為準。
-> 本檔保留各次工程驗證、部署與使用者回報的歷史快照；最新全庫 Rust 格式維護、Release 部署與使用者驗收見 §16。歷史雜湊／槽位數不代表驗收後目標金庫的即時狀態；本輪收尾不再部署或操作金庫。
+> 本檔保留各次工程驗證、部署與使用者回報的歷史快照；最新狀態（Console 前景、RDP 支援、WebAuthn 不可用時保留主密碼登入與 2026-10-11 正式部署）見 §17；§16 以前為歷史快照。歷史雜湊／槽位數不代表驗收後目標金庫的即時狀態。
 
 ## 1. 專案概況
 
@@ -127,7 +127,7 @@ cargo +stable-x86_64-pc-windows-gnu build --release --features real-ctap --bin p
 - Windows Release GUI 無需 `F2V_AUTHENTICATOR` 或系統管理員權限即可走 brokered backend；Debug 預設 mock，mock demo 可明確設 `F2V_AUTHENTICATOR=mock`。
 - 歷史驗證與部署（截至 2026-10-02）：MSVC `cargo test --lib --locked --features real-ctap` 64/64；Release backend-mode 7/7；Node UI 24/24（Feature 4 targeted 5/5）；`node --check src/app.js`、`git diff --check` 通過。Windows GNU Release GUI + CLI（`--locked --features real-ctap`）建置成功；GUI 6,729,216 bytes，SHA-256 `7deba32418fb173d5ada126e600c81a748ffa51bcfe503afc7bed683fb928ed1`；CLI 2,427,392 bytes，SHA-256 `1493ab5d09fb942a61f77cc9e82827b2fa08f60e3e74d81e5d1cd657771ab3c2`。當時 `cargo clippy -D warnings` 受 11 個既有其他模組警告阻擋，新增別名路徑無相關警告；此歷史限制已由後續 PR #12 處理，PR #11/#12 已合併，既有整合驗證與 main CI 讀回結果見 §15（本次未重跑）。Feature 4 獨立 review 已通過並部署至 Win11-NB（GUI 目標端 SHA-256 `7deba32418fb173d5ada126e600c81a748ffa51bcfe503afc7bed683fb928ed1`）；舊 EXE 與 vault 均有驗證備份，部署前後 live vault hash 不變、3 slots。使用者於 2026-10-02 確認 Feature 2、3、4 集中 Win11-NB 本機 Console 驗收全部通過；Feature 1 先前亦已通過。此 GUI 部署快照已由後續 Feature 5–7 部署取代（superseded）。
 - 實體驗收已由使用者在 Win11-NB 互動桌面通過：舊 raw-CTAP 槽可由 Windows WebAuthn 解鎖、新金鑰註冊與登入成功，第二支 YubiKey NFC 交叉登入亦通過；不再執行原 Kanban 規劃的 raw-CTAP CLI 實體路線。
-- 2026-10-01 單一登入入口/提示前景修改（歷史紀錄，GUI 版本已由後續功能部署取代）：使用者確認 Console 啟動正常；H1、H3、H4、H5 通過。H2 通用按鈕免選金鑰通過；上一候選的安全性視窗仍在背景。Console 唯讀 EnumWindows 探測確認 FidoVault 前景 z-order 17，獨立 `CredentialUIBroker`「Windows 安全性」視窗 z-order 18、`OWNER=0`。新增窄範圍 best-effort broker-window monitor：baseline 所有 top-level HWND 與既有 broker PID，只針對唯一的新同-session System32 CredentialUIBroker 視窗，在 FidoVault 仍為 foreground 時嘗試一次 SetForegroundWindow；不設 topmost、不用 ASFW_ANY。程式碼獨立審查通過；commit `45d3aa6` 已推至 PR #3 branch；Rust 53/53、UI 4/4、Windows GNU Release build 成功。該 commit 的新 GUI 已部署至 Win11-NB，SHA256 `59BBAB25C21A419702D02FA7E97242392C388149432BAF733AC0C715F06085D8`，6,140,928 bytes；舊 exe 備份 `C:\FidoVault\portable-fido-vault.exe.pre-H2focus-20261001-223428-2985cea4.bak`。vault 備份 `C:\FidoVault\vault.db.pre-H2focus-20261001-223428-2985cea4.bak`；部署前後均為 3 slots、SHA256 `58A1D4877C2274B3D403E1D87CD1E9BA7C5404D450C3F69E1D9486501F02D780`。本機 Console H2 測試已由使用者確認 OK：通用登入免選金鑰，Windows 安全性操作提示置前；H2 驗收通過並結案。前景交接仍是 best-effort。RDP-Tcp#0 Session 2 曾回報 WebAuthn API v1，維持 v4+ fail-closed；RDP／WebAuthn redirection 不支援，並已在 README 明確說明；硬體驗收使用本機 Console session。
+- 2026-10-01 單一登入入口/提示前景修改（歷史紀錄，GUI 版本已由後續功能部署取代）：使用者確認 Console 啟動正常；H1、H3、H4、H5 通過。H2 通用按鈕免選金鑰通過；上一候選的安全性視窗仍在背景。Console 唯讀 EnumWindows 探測確認 FidoVault 前景 z-order 17，獨立 `CredentialUIBroker`「Windows 安全性」視窗 z-order 18、`OWNER=0`。新增窄範圍 best-effort broker-window monitor：baseline 所有 top-level HWND 與既有 broker PID，只針對唯一的新同-session System32 CredentialUIBroker 視窗，在 FidoVault 仍為 foreground 時嘗試一次 SetForegroundWindow；不設 topmost、不用 ASFW_ANY。程式碼獨立審查通過；commit `45d3aa6` 已推至 PR #3 branch；Rust 53/53、UI 4/4、Windows GNU Release build 成功。該 commit 的新 GUI 已部署至 Win11-NB，SHA256 `59BBAB25C21A419702D02FA7E97242392C388149432BAF733AC0C715F06085D8`，6,140,928 bytes；舊 exe 備份 `C:\FidoVault\portable-fido-vault.exe.pre-H2focus-20261001-223428-2985cea4.bak`。vault 備份 `C:\FidoVault\vault.db.pre-H2focus-20261001-223428-2985cea4.bak`；部署前後均為 3 slots、SHA256 `58A1D4877C2274B3D403E1D87CD1E9BA7C5404D450C3F69E1D9486501F02D780`。本機 Console H2 測試已由使用者確認 OK：通用登入免選金鑰，Windows 安全性操作提示置前；H2 驗收通過並結案。前景交接仍是 best-effort。RDP-Tcp#0 Session 2 曾回報 WebAuthn API v1，維持 v4+ fail-closed；RDP／WebAuthn redirection 當時不支援（已由 §17 的 R6 GO 取代）；硬體驗收使用本機 Console session。
 - 建置檔參數：release `strip + lto`。
 
 ## 7. 部署（Win11-NB，WinRM）
@@ -155,10 +155,12 @@ cargo +stable-x86_64-pc-windows-gnu build --release --features real-ctap --bin p
 | 5 | CRUD + 時間戳 | ✅（mock E2E） |
 | 6 | 軌跡完整/無明文密碼 | ✅（mock E2E） |
 | 7 | 閒置自動上鎖 | ✅ 使用者確認驗收通過（D1–D4） |
-| 8 | 加密檔直拷別機可解密 | ✅ mock E2E copy-test 通過；此結論限於 mock 測試，未見實體 GUI 跨機人工 PASS 回報 |
+| 8 | 加密檔直拷別機可解密 | ✅ mock E2E copy-test 通過；2026-10-10 實體 GUI 跨機（Win11-NB ↔ WS2，專用測試金庫）人工 PASS，見 §17 |
 | 9 | 每筆條目舊密碼歷史（預設 3，可設 1–20） | ✅ 使用者於 2026-10-02 確認 Feature 2/3/4 集中本機 Console 驗收全部 PASS，已取代先前延後狀態 |
 | 10 | 條目複製密碼（60 秒 Win32 原子條件清除） | ✅ 同次 2026-10-02 集中驗收全部 PASS；60 秒清除、外部替換保留與連續複製結果見使用者驗收文件 |
 | 11 | 註冊時設定安全性金鑰本機別名 | ✅ 同次 2026-10-02 集中驗收全部 PASS；別名驗證、註冊與重登入結果見使用者驗收文件 |
+| 12 | RDP（WebAuthn 重新導向）使用金鑰 | ✅ R6 GO（2026-10-10），限已測矩陣；殘餘未測見 §17 |
+| 13 | WebAuthn 不可用時保留主密碼登入 | ✅ 2026-10-10 WS2 RDP W1–W6 PASS（PR #25） |
 
 ### 已確認功能彙整
 
@@ -172,8 +174,11 @@ cargo +stable-x86_64-pc-windows-gnu build --release --features real-ctap --bin p
 | 6 | 條目即時搜尋 | ✅ 2026-10-03 明確 PASS（PR #14；§13） |
 | 7 | 預設最大化與金鑰登入期間維持最大化 | ✅ 2026-10-03 明確 PASS（PR #15 修正版；§14） |
 | 修正 | 主畫面條目刪除確認（PR #17） | ✅ 使用者明確確認 D1–D5 PASS；D6 已免測、不列待辦（歷史 NOT_TESTED 非 PASS） |
+| 修正 | Console 金鑰提示前景（PR #23） | ✅ 2026-10-10 C1–C6 PASS；已知 F2：同一操作第二個安全性視窗可能在背景（使用者接受） |
+| 功能 | RDP 支援（PR #20–#22、#24、#26） | ✅ R2–R5 實機驗收、R6 GO（限已測矩陣） |
+| 修正 | WebAuthn 不可用時保留主密碼登入（PR #25） | ✅ 2026-10-10 W1–W6 PASS；2026-10-11 正式部署 |
 
-先前 PR #13/#14/#15 均已合併，當時 8 張 `[FidoVault]` Kanban 卡已完成；新增刪除確認任務 `t_7001952b` 的使用者結果為 D1–D5 PASS，D6 歷史未測、目前已免測且排除待辦，已授權收尾及合併，實際狀態以 PR #17／該卡片讀回為準。驗收、PR 合併與任務完成不等同所有舊模板都逐項人工 PASS：`user-verification-steps.md` 的 A–C/E/F 保留未勾選，D5 為未回報的選測；Gate 8 仍僅有上述 mock 證據。RDP 為不支援、raw CTAP CLI 實體路線為已退役／由 GUI 驗收取代（superseded），均不是待驗項。
+先前 PR #13/#14/#15 均已合併，當時 8 張 `[FidoVault]` Kanban 卡已完成；新增刪除確認任務 `t_7001952b` 的使用者結果為 D1–D5 PASS，D6 歷史未測、目前已免測且排除待辦，已授權收尾及合併，實際狀態以 PR #17／該卡片讀回為準。驗收、PR 合併與任務完成不等同所有舊模板都逐項人工 PASS：`user-verification-steps.md` 的 A–C/E/F 保留未勾選，D5 為未回報的選測；Gate 8 仍僅有上述 mock 證據。RDP 已於 2026-10-10 R6 GO（限已測矩陣，§17）；raw CTAP CLI 實體路線為已退役／由 GUI 驗收取代（superseded），不是待驗項。
 
 ## 9. 2026-09-29 Win11-NB log 問題：根因與修復
 
@@ -237,7 +242,7 @@ cargo +stable-x86_64-pc-windows-gnu build --release --features real-ctap --bin p
 
 - 使用者於 2026-10-03 明確確認 Win11-NB 本機 Console 驗收 PASS：啟動最大化（非全螢幕）、金鑰登入提示出現與完成／取消後維持最大化、可還原／移動／調整大小、重新啟動仍預設最大化。PR #15 原先 stacked on PR #14，兩者均已合併。
 - 初次版本 commit `a7fb6a0` 曾在金鑰登入時還原視窗，已由修正版取代（superseded），不是待驗收候選。前景處理僅在視窗已最小化時 restore，不改變可見最大化／一般視窗的狀態；規格見 `docs/plans/feature-07-default-maximized-window.md`。
-- 最近一次已記錄 GUI 部署（2026-10-03）來源 fix commit `1bf77fd23d27dcea2235821fc36bc74a21c269db`；`C:\FidoVault\portable-fido-vault.exe` 為 7,172,096 bytes，SHA-256 `0910d0cd5f29518e83c5ebd60b562572165adda91fae335f4771a386f52570f6`。來源 commit、雜湊、大小與下列備份紀錄皆逐字取自 `docs/user-verification-steps.md`，本次未部署或重新回讀目標機。
+- （歷史，已由 §16、§17 的部署取代）當時最近一次已記錄 GUI 部署（2026-10-03）來源 fix commit `1bf77fd23d27dcea2235821fc36bc74a21c269db`；`C:\FidoVault\portable-fido-vault.exe` 為 7,172,096 bytes，SHA-256 `0910d0cd5f29518e83c5ebd60b562572165adda91fae335f4771a386f52570f6`。來源 commit、雜湊、大小與下列備份紀錄皆逐字取自 `docs/user-verification-steps.md`，本次未部署或重新回讀目標機。
 - 當時部署前備份目錄 `C:\FidoVault\backups\key-login-maximized-20261003-1bf77fd`；舊 GUI SHA-256 `a874a96026e1c2a6baa7857a9fe3c7b564758347f2458aba5bd254ddd70e2092`，vault SHA-256 `35b669a0c720314ccb9f602faa89b7e8b5adf82d09f1c43831f40f5968fdf1a1`。當時部署後 GUI hash 相符、vault hash 不變、header 有效且有 1 個 key slot；無相關程序、持久 authenticator override 或傳輸暫存檔，WinRM 未啟動 GUI。較早部署與備份紀錄保留於使用者驗收文件，不把歷史 3-slot 快照當作本次槽位數。
 
 ## 主畫面條目刪除確認 — 使用者驗收與收尾授權（PR #17）
@@ -266,3 +271,12 @@ cargo +stable-x86_64-pc-windows-gnu build --release --features real-ctap --bin p
 - 舊 EXE／exact sibling vault 非覆寫備份位於 `C:\FidoVault\backup-rustfmt-99ff0e5-20261004-204309-c3957955`。部署前後 vault hash 與 1 個 key slot 不變；CLI、已簽章 x64 WebView2Loader 未替換。這是使用者啟動前的部署快照，不代表登入／audit 後的即時金庫 hash；詳細 metadata 見 `docs/reports/rust-format-deployment.json`。
 - 使用者於 `2026-10-04T21:03:42.075+08:00` 明確回報：「我驗證成功，進行收尾與合併」（message `1556290719763665058`）。本次已部署格式維護版本記為使用者整體驗收 PASS，並已授權 PR #18 收尾／合併；不補造逐項檢查結果或延伸其他歷史／跨機 gates。
 - 本輪不再建置、部署或操作 Win11-NB GUI／WebAuthn／金庫；收尾僅補充部署與使用者回報文件。已驗收 production source 不變；PR／Kanban 的實際合併及結案狀態以後續讀回為準，原始證據與 release artifact 保留於 `D:/project/_archives/portable-fido2-vault/20261004-rustfmt-maintenance`。
+
+## 17. 2026-10-06～10-11：Console 前景、RDP 支援與正式部署（PR #20–#26）
+
+- **PR 與合併**：#20 RDP 診斷與驗證框架、#21 RDP 註冊前景交接、#22 RDP 被動前景觀察、#23 Console WebAuthn 提示前景（candidate-04）、#24 RDP 實機驗收文件、#25 WebAuthn 不可用時保留主密碼登入、#26 R6 GO 文件；全部已合併，`main` 最新為 `709e98b`。合併後 `main` CI（UI 65/65、Rust 200/200、Gate E2E 20/20）success。GitHub 無 open PR／issue。
+- **Console 前景（PR #23）**：Win11-NB 本機 Console C1–C6 PASS；每次金鑰操作的第一個 Windows 安全性視窗一次性 best-effort 拉到前景，RDP 下不主動拉前景。已知 F2：同一操作的第二個視窗（指紋／觸碰提示）可能仍在背景，直接操作金鑰即可完成，使用者決定不處理。驗收見 `docs/reports/console-webauthn-foreground-acceptance.md`。
+- **RDP 支援（R6 GO，2026-10-10）**：支援限已測矩陣——Win11-NB（Windows 11 24H2 26100.9457，mstsc 10.0.26100.8875，YubiKey Bio 插此端）→ RDP（WebAuthn 重新導向）→ WS2（Windows Server 2025 24H2 26100.33438，API v7）。RDP 內主密碼登入、既有金鑰登入、註冊新金鑰、未註冊金鑰／取消／逾時拒絕皆 PASS。殘餘未測：WS2 本機 Console（R4-3 host）、R4-4、RDP 斷線（R5-3，使用者豁免）、policy deny／consent 拒絕（R5-4）、API<4／非 PRF 金鑰（R5-5）、R3-2 slot 核對、R2-4 測前備份缺項。見 `docs/rdp-webauthn-verification.md`、`docs/reports/rdp-physical-acceptance-2026-10-10.md`。
+- **WebAuthn 不可用時保留主密碼登入（PR #25）**：同 process WebAuthn API < v4（例如 RDP 關閉重新導向時 v0）時，GUI 以 key-unavailable backend 啟動，主密碼與非金鑰功能可用，金鑰偵測／註冊／登入以繁中說明 fail closed、不寫入；不 fallback mock，API v4+ 與 HMAC/PRF/credential-match/32-byte 檢查不變，其他後端建構錯誤仍致命。TDD 7 新測試、兩路獨立審查 passed、WS2 RDP W1–W6 PASS。見 `docs/reports/webauthn-unavailable-password-login-acceptance.md`。
+- **正式部署（2026-10-11 00:13，使用者授權）**：Win11-NB `C:\FidoVault\portable-fido-vault.exe` 由 `be089077…`（§16 版本）更新為 SHA-256 `3b3f7367be81baab1a37c5249788f815c397b9e5241289880a3e6f7618996322`（7,206,912 bytes，GNU Release `--locked --features real-ctap`，來源 PR #25 commit `5b943c7`；`main` 非文件檔與審查凍結版逐檔一致）。舊 EXE 與 `vault.db` 非覆寫備份於 `C:\FidoVault\backups\webauthn-unavailable-20261011-5073642`（hash 相符）；`vault.db` SHA-256 `b8423f97626309e0…`、1 個 key slot，部署前後不變；`WebView2Loader.dll`、`vault_cli.exe` 未替換。流程為唯讀 preflight → 備份 → 唯一 staging 讀回 → 全條件重驗後原子替換 → 獨立讀回；未經 WinRM 啟動 GUI 或操作金鑰。部署後本機 Console 實際開啟確認尚待使用者回報。
+- **Kanban**：board `portable-fido-vault` 的 RDP-R2～R6、PR #23 與 PR #25 卡均已結案或依使用者決定手動封存；新卡一律 `--completion-contract local-only`（私有 repo 讀取 branch rules 需 GitHub Pro）。
