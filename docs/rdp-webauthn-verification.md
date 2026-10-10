@@ -1,6 +1,6 @@
 ﻿# RDP WebAuthn 手動驗證
 
-本文件是 R1 候選版的 R2–R5 操作 checklist。2026-10-10 以 main `ab68de0` 的 Release GUI 完成部分 physical acceptance（結果見下表；證據：`docs/reports/rdp-physical-acceptance-2026-10-10.md`）；未列 PASS 者仍為 **NOT_TESTED**。自動化測試與 collector-only metadata 不構成 Console/RDP 金鑰驗收。生產 RDP 支援聲明不變。
+本文件是 R1 候選版的 R2–R5 操作 checklist 與 R6 裁決紀錄。2026-10-10 以 main `ab68de0`／PR #25 的 Release GUI 完成 physical acceptance，**R6 裁決：GO（限已測矩陣）**（結果見下表；證據：`docs/reports/rdp-physical-acceptance-2026-10-10.md`）；未列 PASS 者仍為 **NOT_TESTED**。自動化測試與 collector-only metadata 不構成 Console/RDP 金鑰驗收。生產 RDP 支援聲明不變。
 
 ## 證據與角色
 
@@ -26,12 +26,12 @@ MakeCredential/GetAssertion operation JSON 僅允許 operation、error_category�
 
 | Case | 操作與 PASS 條件 | Actual | Result |
 |---|---|---|---|
-| R2-1 | 確認 Windows client/host 角色，記 OS/client/key 精確矩陣與候選 hash；未知先停 | 未執行 | NOT_TESTED |
-| R2-2 | 唯讀收集雙端 metadata；確認 redirection request、policy、resource consent。變更設定需另行使用者核准 | 未執行 | NOT_TESTED |
-| R2-3 | 確認無其他 FIDO pending request；未知停止，不 force-kill | 未執行 | NOT_TESTED |
-| R2-4 | 選唯一不存在的 `C:/FidoVault-RdpTest/<run-id>`，只建立專用測試 DB；本機輸入測試密碼。記 slot/hash/backup baseline | 未執行 | NOT_TESTED |
-| R2-5 | Console 專用 key 註冊，hmac creation confirmed；32-byte output，slot +1，Console 解鎖成功 | 未執行 | NOT_TESTED |
-| R2-6 | 同候選 GUI process 的 capability log 為門檻證據；API≥4，非 WinRM/session0 操作 | 未執行 | NOT_TESTED |
+| R2-1 | 確認 Windows client/host 角色，記 OS/client/key 精確矩陣與候選 hash；未知先停 | 2026-10-10 唯讀收集：連線發起端 Win11-NB（Windows 11 24H2 build 26100.9457，mstsc 10.0.26100.8875，金鑰插此端）→ RDP（mstsc 啟用 WebAuthn 重新導向）→ 目標 WS2（Windows Server 2025 Standard 24H2 build 26100.33438，RDP session 回報 WebAuthn API v7）；金鑰 YubiKey Bio（USB PID 0402，推定韌體 5.7.2）；FidoVault Release GUI（PR #25 起，含 WebAuthn 不可用時保留主密碼登入）；候選 EXE `7dd28a6b…`（main `ab68de0`） | PASS |
+| R2-2 | 唯讀收集雙端 metadata；確認 redirection request、policy、resource consent。變更設定需另行使用者核准 | 兩端 `fDisableWebAuthn` 未設定；redirection 由使用者在 mstsc 啟用；WS2 未插金鑰 | PASS |
+| R2-3 | 確認無其他 FIDO pending request；未知停止，不 force-kill | 測前兩端無 FidoVault／vault_cli 程序 | PASS |
+| R2-4 | 選唯一不存在的 `C:/FidoVault-RdpTest/<run-id>`，只建立專用測試 DB；本機輸入測試密碼。記 slot/hash/backup baseline | 使用新建專用測試資料夾；**測前 fixture 備份／hash 未保存**（R5 前已補 baseline 與備份） | PARTIAL（備份缺項如實記錄） |
+| R2-5 | Console 專用 key 註冊，hmac creation confirmed；32-byte output，slot +1，Console 解鎖成功 | Win11-NB 本機 Console C1–C6 PASS（註冊 0→1、僅金鑰解鎖） | PASS |
+| R2-6 | 同候選 GUI process 的 capability log 為門檻證據；API≥4，非 WinRM/session0 操作 | NB Console API v9；WS2 RDP API v7（session 2） | PASS |
 
 ## R3：Console 舊槽 → RDP
 
@@ -57,12 +57,22 @@ API<4 保留拒絕，後續 NOT_TESTED/blocked(capability)。無有效 output �
 
 | Case | 操作與 PASS 條件 | Actual | Result |
 |---|---|---|---|
-| R5-1 | 錯誤／未註冊 key：拒絕、slot 不變 | 未執行 | NOT_TESTED |
+| R5-1 | 錯誤／未註冊 key：拒絕、slot 不變 | 2026-10-10 19:11 RDP 未註冊金鑰 → api-error 拒絕、仍鎖定、slot 1；換回正確金鑰可登入 | PASS |
 | R5-2 | 取消 PIN/UV/dialog：拒絕、slot 不變 | RDP 內 3 次取消皆 api-error 拒絕，之後登入成功、slot 仍 1 | PASS |
-| R5-3 | 斷線／逾時：原已鎖定 vault 保持鎖定，無殘留成功 token/invalid slot；不宣稱有斷線即自動上鎖 | 未執行 | NOT_TESTED |
+| R5-3 | 斷線／逾時：原已鎖定 vault 保持鎖定，無殘留成功 token/invalid slot；不宣稱有斷線即自動上鎖 | 逾時：monitor `deadline` → api-error、仍鎖定、之後可登入。斷線：無法執行，使用者豁免（未實測，不是 PASS） | 逾時 PASS；斷線 WAIVED |
 | R5-4 | redirection off/policy deny/consent拒絕，只有 client 插 key：失敗、無 mock fallback。設定變更另外核准 | 2026-10-10 mstsc redirection off：main `e27b0c9` GUI 啟動即結束（API v0，密碼亦無法登入）→ FAIL；修正版（PR #25，EXE `3b3f7367…`）API v0 → key-unavailable，GUI 啟動、主密碼登入成功、金鑰登入／註冊顯示繁中不可用說明、slot 不變、無 mock fallback；redirection 重開後金鑰登入 PASS。policy deny／consent 拒絕未測。見 `docs/reports/webauthn-unavailable-password-login-acceptance.md` | redirection off PASS（修正版）；policy／consent NOT_TESTED |
 | R5-5 | API<4／不支援 PRF fixture：拒絕、無新槽；缺硬體保留 NOT_TESTED，自動化不可取代 | 未執行 | NOT_TESTED |
-| R5-6 | Console 正常登入、註冊、owner/Windows Security 前景行為回歸 | 未執行 | NOT_TESTED |
-| R5-7 | 後測 test slot count 正確、fixture 仍可解鎖，保存非敏感 hash/backup | 未執行 | NOT_TESTED |
+| R5-6 | Console 正常登入、註冊、owner/Windows Security 前景行為回歸 | 引用 Win11-NB Console C1–C6 PASS（PR #23 c04）；PR #25 版 NB Console 金鑰登入 PASS（W6）；已知 F2 第二個安全性視窗可能在背景 | PASS（引用） |
+| R5-7 | 後測 test slot count 正確、fixture 仍可解鎖，保存非敏感 hash/backup | 測後僅金鑰登入成功、slot 1；測前 `a8428331…`／測後 `224a2422…` 備份封存 | PASS |
 
-同一操作失敗超過三次先查根因，不反覆 UV。正式 vault 不讀寫；本輪未授權任何正式 baseline 操作。R6 由 Parent/使用者依 required gates 作 GO/NO-GO/Pending；不得因 automated/collector/API pass 宣告 RDP 支援。部署與支援文件變更需後續授權。
+同一操作失敗超過三次先查根因，不反覆 UV。正式 vault 不讀寫；本輪未授權任何正式 baseline 操作。R6 由 Parent/使用者依 required gates 作 GO/NO-GO/Pending；不得因 automated/collector/API pass 宣告 RDP 支援。R6 裁決結果見文末。
+
+## R6：GO／NO-GO 裁決
+
+**裁決：GO**（使用者於 2026-10-10 核准 R5 結案並宣告支援 RDP）。支援範圍**只限已實測矩陣**：
+
+- 連線發起端 Win11-NB（Windows 11 24H2 build 26100.9457，mstsc 10.0.26100.8875，金鑰插此端）→ RDP（mstsc 啟用 WebAuthn 重新導向）→ 目標 WS2（Windows Server 2025 Standard 24H2 build 26100.33438，RDP session 回報 WebAuthn API v7）；金鑰 YubiKey Bio（USB PID 0402，推定韌體 5.7.2）；FidoVault Release GUI（PR #25 起，含 WebAuthn 不可用時保留主密碼登入）。
+- 已驗證功能：RDP session 內以主密碼登入；以 Console 註冊的金鑰登入（R3）；在 RDP 內註冊新金鑰並以之解鎖（R4-1／R4-2）；RDP 建立的金庫複製回發起端本機 Console 解鎖（R4-3 替代覆蓋）；取消、逾時、未註冊金鑰皆拒絕且槽數不變（R5-1／2／3 逾時）；WebAuthn 重新導向關閉時程式仍啟動、主密碼可用、金鑰操作以說明拒絕（R5-4，PR #25）。
+- Windows 安全性提示由 WebAuthn 重新導向顯示在**連線發起端**；RDP 下 FidoVault 不主動拉前景。
+
+殘餘風險與未測（不回填 PASS）：R4-3 目標機本機 Console、R4-4、R5-3 斷線（使用者豁免）、R5-4 policy deny／consent 拒絕、R5-5（無 API<4／非 PRF 硬體）、R3-2 slot count 未另行核對、R2-4 測前備份缺項。其他 OS 版本、RDP 用戶端（如 macOS／行動版／第三方）、金鑰型號、巢狀 RDP、RemoteApp 與 WinRM／session 0 均**未支援**。證據：`docs/reports/rdp-physical-acceptance-2026-10-10.md`、`docs/reports/webauthn-unavailable-password-login-acceptance.md`。
