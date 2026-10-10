@@ -285,5 +285,5 @@ Feature 3 standalone 候選 GUI（6,589,440 bytes，SHA-256 `58ba298f7f2bcd5fa4d
 - 驗收：2026-10-10 WS2 RDP W1–W6 PASS（重新導向關閉時程式開啟、主密碼登入、金鑰登入／註冊顯示繁中說明且槽數不變；重新導向開啟後金鑰登入；Win11-NB 本機 Console 金鑰登入）。詳見 `docs/reports/webauthn-unavailable-password-login-acceptance.md`。
 - 部署：2026-10-11 00:13 經使用者授權，`C:\FidoVault\portable-fido-vault.exe` 更新為 7,206,912 bytes、SHA-256 `3b3f7367be81baab1a37c5249788f815c397b9e5241289880a3e6f7618996322`（來源 commit `5b943c7`，GNU Release `--locked --features real-ctap`）；部署後獨立讀回相符。
 - 備份：`C:\FidoVault\backups\webauthn-unavailable-20261011-5073642`（舊 EXE `be089077c6a37d57…`、`vault.db` `b8423f97626309e0…`，hash 均已驗證）。部署前後 `vault.db` hash 與 1 個 key slot 不變；`WebView2Loader.dll`（簽章 Valid）與 `vault_cli.exe` 未替換。
-- 待使用者確認（部署後首次啟動）：
-  - [ ] 在 Win11-NB 本機 Console 以一般權限開啟 `C:\FidoVault\portable-fido-vault.exe`，以主密碼或已註冊金鑰登入，確認既有條目正常。
+- 部署後首次啟動（使用者回報「驗證成功」）：
+  - [x] 在 Win11-NB 本機 Console 以一般權限開啟 `C:\FidoVault\portable-fido-vault.exe`，以主密碼或已註冊金鑰登入，確認既有條目正常。唯讀 log 佐證：2026-10-11 00:48 pid 5880，API v9，GetAssertion `credential_match=true`、32 bytes；登入寫入 audit 後 `vault.db` 仍為 1 個 key slot。
