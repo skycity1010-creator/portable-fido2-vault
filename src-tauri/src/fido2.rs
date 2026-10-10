@@ -156,6 +156,32 @@ impl std::fmt::Display for FidoError {
 
 impl std::error::Error for FidoError {}
 
+/// 硬體後端建構失敗分類：只有 WebAuthn API 能力不足（< v4 HMAC-secret）可改用
+/// [`UnavailableBackend`]；其餘錯誤一律維持啟動失敗（fail closed）。
+#[derive(Debug)]
+pub enum BackendInitError {
+    WebAuthnApiBelowV4 { api_version: u32 },
+    Fido(FidoError),
+}
+
+impl From<FidoError> for BackendInitError {
+    fn from(error: FidoError) -> Self {
+        Self::Fido(error)
+    }
+}
+
+impl std::fmt::Display for BackendInitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WebAuthnApiBelowV4 { api_version } => write!(
+                f,
+                "Windows WebAuthn API v{api_version} lacks HMAC-secret assertion support (requires v4+)"
+            ),
+            Self::Fido(error) => error.fmt(f),
+        }
+    }
+}
+
 /// FIDO2 後端 trait。`get_prf_secret` 對應 CTAP2 getAssertion + hmac-secret extension
 /// （固定 salt = crate::crypto::PRF_SALT），回傳 32-byte secret → HKDF → KEK。
 pub trait FidoBackend: Send {
@@ -220,6 +246,86 @@ pub trait FidoBackend: Send {
     /// mock 回 "mock"；hw 偵測後回實際值。供遠端排程不須使用者互動。
     fn info_diag(&self) -> String {
         "mock".to_string()
+    }
+
+    /// Some(訊息) = 此工作階段無任何可用金鑰路徑（UI 不得假裝偵測到金鑰）。
+    fn key_unavailable_reason(&self) -> Option<String> {
+        None
+    }
+}
+
+// ─────────────────────────── UnavailableBackend ───────────────────────────
+
+/// Windows WebAuthn API 能力不足（< v4）時的「金鑰不可用」後端：每個金鑰操作 fail closed，
+/// 讓 GUI 仍可啟動並使用主密碼。絕不 fallback 到 MockBackend。
+pub struct UnavailableBackend {
+    api_version: u32,
+}
+
+impl UnavailableBackend {
+    pub fn new(api_version: u32) -> Self {
+        Self { api_version }
+    }
+
+    fn message(&self) -> String {
+        format!(
+            "此工作階段無法使用 Windows 安全金鑰（WebAuthn API v{}，需 v4 以上）。請在 RDP 啟用 WebAuthn（Windows Hello 或安全性金鑰）重新導向，或改在本機 Console 使用金鑰；主密碼登入不受影響。",
+            self.api_version
+        )
+    }
+
+    fn error(&self) -> FidoError {
+        FidoError::NotSupported(self.message())
+    }
+}
+
+impl FidoBackend for UnavailableBackend {
+    fn detect(&mut self) -> Result<DetectedKey, FidoError> {
+        Err(self.error())
+    }
+
+    fn register_credential(
+        &mut self,
+        _detected: &DetectedKey,
+        _pin: Option<&str>,
+    ) -> Result<RegisteredCredential, FidoError> {
+        Err(self.error())
+    }
+
+    fn get_prf_secret(
+        &mut self,
+        _credential_id: &[u8],
+        _pin: Option<&str>,
+    ) -> Result<[u8; 32], FidoError> {
+        Err(self.error())
+    }
+
+    fn get_prf_secret_for_any(
+        &mut self,
+        _credential_ids: &[Vec<u8>],
+        _pin: Option<&str>,
+    ) -> Result<(Vec<u8>, [u8; 32]), FidoError> {
+        Err(self.error())
+    }
+
+    /// 維持 Windows 單一「以金鑰登入」入口的 UI。
+    fn uses_brokered_key_selection(&self) -> bool {
+        true
+    }
+
+    fn peek_kind(&self) -> KeyKind {
+        KeyKind::WindowsManaged
+    }
+
+    fn info_diag(&self) -> String {
+        format!(
+            "windows-webauthn-unavailable api_version={}",
+            self.api_version
+        )
+    }
+
+    fn key_unavailable_reason(&self) -> Option<String> {
+        Some(self.message())
     }
 }
 
@@ -1165,6 +1271,120 @@ mod tests {
     #[test]
     fn mock_backend_keeps_non_brokered_key_selection_ui() {
         assert!(!MockBackend::new().uses_brokered_key_selection());
+    }
+
+    fn assert_key_unavailable_message(error: &FidoError, api_version: u32) {
+        assert!(matches!(error, FidoError::NotSupported(_)), "{error:?}");
+        let message = error.to_string();
+        for expected in [
+            format!("v{api_version}"),
+            "v4".to_string(),
+            "Windows 安全金鑰".to_string(),
+            "RDP".to_string(),
+            "Console".to_string(),
+            "主密碼".to_string(),
+        ] {
+            assert!(message.contains(&expected), "missing {expected}: {message}");
+        }
+        // Inputs of the failed operation (PIN, credential bytes) never leak into the message.
+        for secret in ["924613", "c0ffee", "192, 254"] {
+            assert!(!message.contains(secret), "leaked {secret}: {message}");
+        }
+    }
+
+    #[test]
+    fn unavailable_backend_fails_every_key_operation_closed() {
+        let mut backend = UnavailableBackend::new(3);
+        let pin = Some("924613");
+        let credential_id = vec![0xc0, 0xfe, 0xee];
+
+        assert!(backend.uses_brokered_key_selection());
+        assert!(!backend.prf_supported());
+        let reason = backend.key_unavailable_reason().expect("reason");
+        assert_key_unavailable_message(&FidoError::NotSupported(reason), 3);
+
+        let error = backend.detect().expect_err("detect");
+        assert_key_unavailable_message(&error, 3);
+        let detected = DetectedKey {
+            kind: KeyKind::WindowsManaged,
+            label: "x".into(),
+            aaguid: [0; 16],
+        };
+        let error = backend
+            .register_credential(&detected, pin)
+            .expect_err("register");
+        assert_key_unavailable_message(&error, 3);
+        let error = backend
+            .get_prf_secret(&credential_id, pin)
+            .expect_err("get_prf_secret");
+        assert_key_unavailable_message(&error, 3);
+        let error = backend
+            .get_prf_secret_for_any(&[credential_id.clone()], pin)
+            .expect_err("get_prf_secret_for_any");
+        assert_key_unavailable_message(&error, 3);
+        let error = backend
+            .get_prf_secret_for_any(&[], pin)
+            .expect_err("get_prf_secret_for_any empty");
+        assert_key_unavailable_message(&error, 3);
+        backend.set_webauthn_parent_hwnd(1234);
+        assert!(backend.enrollment_count().is_none());
+    }
+
+    #[test]
+    fn unavailable_backend_leaves_password_vault_untouched_and_password_login_working() {
+        use crate::vault::{Vault, VaultError};
+
+        let dir = std::env::temp_dir().join(format!(
+            "f2v-test-unavailable-backend-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vault.db");
+
+        // Password-created vault with one existing slot so key login reaches the backend.
+        let mut vault = Vault::create(&path, "Pw-12345").unwrap();
+        vault
+            .register_key_with_label(&mut MockBackend::new(), None, "Existing Key")
+            .unwrap();
+        let existing_id = vault.keys_meta()[0].0.clone();
+        drop(vault);
+
+        let mut unavailable = UnavailableBackend::new(0);
+        let before = std::fs::read(&path).unwrap();
+        let any = Vault::open_any_key(&path, None, &mut unavailable);
+        assert!(
+            matches!(&any, Err(VaultError::Fido(e)) if matches!(e, FidoError::NotSupported(m) if m.contains("主密碼"))),
+            "open_any_key must fail with the unavailable error"
+        );
+        let one = Vault::open_key(&path, &existing_id, None, &mut unavailable);
+        assert!(
+            matches!(&one, Err(VaultError::Fido(FidoError::NotSupported(_)))),
+            "open_key must fail with the unavailable error"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "key login wrote vault"
+        );
+
+        let mut vault = Vault::open_password(&path, "Pw-12345").expect("password login");
+        assert_eq!(vault.keys_meta().len(), 1);
+        let after_password_login = std::fs::read(&path).unwrap();
+        let register = vault.register_key_with_label(&mut unavailable, None, "New Key");
+        assert!(
+            matches!(&register, Err(VaultError::Fido(FidoError::NotSupported(_)))),
+            "register must fail with the unavailable error"
+        );
+        assert_eq!(vault.keys_meta().len(), 1);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            after_password_login,
+            "failed registration wrote vault"
+        );
+        drop(vault);
+        assert!(Vault::open_password(&path, "Pw-12345").is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
