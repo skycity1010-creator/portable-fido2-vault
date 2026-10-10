@@ -4,7 +4,7 @@
 > Windows Release GUI 必須以 `--features real-ctap` 建置；一般權限的檔案總管直接啟動時使用 Windows WebAuthn API，無需環境變數或系統管理員提升。Windows 安全性視窗負責 PIN/UV/觸碰；目標系統需 WebAuthn API v4+。Debug build 預設為 MockBackend；明確跑 mock 流程時設定 `F2V_AUTHENTICATOR=mock`。
 > **RDP 範圍（2026-10-10 R6 GO）：**已支援（限已測矩陣，見 `docs/rdp-webauthn-verification.md` R6）：由 Win11-NB 以 mstsc（啟用 WebAuthn 重新導向、YubiKey Bio 插在 Win11-NB）連入 WS2，在 RDP session 內以主密碼或已註冊金鑰登入、註冊新金鑰；WS2 RDP 回報 API v7。資料夾須以一般權限複製（避免 os error 5）。重新導向關閉時 GUI 仍啟動、僅主密碼可用。下方各節「從本機 Console 啟動、不要從 RDP」的文字是當時快照，已由本段取代。API 低於 v4 的 session 仍 fail closed；勿降低 API 版本檢查。早期 Win11-NB RDP session 曾回報 API v1。
 
-## 已確認驗收彙整（文件同步：2026-10-04）
+## 已確認驗收彙整（文件同步：2026-10-11）
 
 | 項目 | 已確認結果（Win11-NB 本機 Console） |
 |---|---|
@@ -14,10 +14,13 @@
 | Feature 6 — 條目即時搜尋 | 2026-10-03 明確 PASS（PR #14 已合併） |
 | Feature 7 — 預設最大化與金鑰登入期間維持最大化 | 2026-10-03 明確 PASS（PR #15 修正版，已合併） |
 | 主畫面條目刪除確認（PR #17） | 使用者確認 D1–D5 PASS；D6 已免測、不列待辦（歷史 NOT_TESTED 非 PASS） |
+| Console 金鑰提示前景（PR #23） | 2026-10-10 C1–C6 PASS；已知 F2 第二個安全性視窗可能在背景（使用者接受） |
+| RDP 支援（R2–R6，PR #20–#26） | 2026-10-10 實機驗收；R6 GO 限已測矩陣（見 `docs/rdp-webauthn-verification.md`） |
+| WebAuthn 不可用時保留主密碼登入（PR #25） | 2026-10-10 WS2 RDP W1–W6 PASS；2026-10-11 正式部署（見本文末節） |
 
-各節部署雜湊、備份、槽位數與操作說明保留為**當時快照**；2026-10-01 的 3 slots 不代表後續部署數量。最新已記錄部署為本文末尾的 Rust 格式維護版本（來源 `99ff0e5e537c5485f6fb65819f45662c2769c0a1`），使用者已回報整體驗證成功並授權收尾與合併；本輪文件收尾不再部署或操作目標金庫。
+各節部署雜湊、備份、槽位數與操作說明保留為**當時快照**；2026-10-01 的 3 slots 不代表後續部署數量。最新已記錄部署為本文末節的 PR #25 版本（2026-10-11，GUI SHA-256 `3b3f7367be81baab…`）；Rust 格式維護版本（來源 `99ff0e5e537c5485f6fb65819f45662c2769c0a1`）已被取代。
 
-A–C/E/F 是舊模板，沒有逐項人工 PASS 回報，不因功能／任務結案而補勾；D1–D4 已確認，D5 為選測且未回報。Gate 8 目前僅有 mock E2E copy-test，未見實體 GUI 跨機人工 PASS。H1–H5 與下方 Feature 1–7 的既有確認維持完成；RDP 已於 2026-10-10 R6 GO（限已測矩陣，見上方）、raw CTAP CLI 實體 register/login 路線已由 GUI 驗收取代（superseded），不是待驗項。
+A–C/E/F 是舊模板，沒有逐項人工 PASS 回報，不因功能／任務結案而補勾；D1–D4 已確認，D5 為選測且未回報。Gate 8 除 mock E2E copy-test 外，2026-10-10 已有專用測試金庫的實體 GUI 跨機人工 PASS（Win11-NB ↔ WS2）。H1–H5 與下方 Feature 1–7 的既有確認維持完成；RDP 已於 2026-10-10 R6 GO（限已測矩陣，見上方）、raw CTAP CLI 實體 register/login 路線已由 GUI 驗收取代（superseded），不是待驗項。
 
 ## 部署後驗證前確認（2026-10-01，歷史部署／已取代）
 已部署 PR #3 的 Windows GNU Release GUI，SHA256：`E9A28C81C73456800E3F1FAF0E8F1A9F6576146C8A675F5AB125FF9135ED8503`。替換前舊 exe 已備份為 `C:\FidoVault\portable-fido-vault.exe.pre-single-key-20261001-112834.bak`（SHA256 `06B1C5BE7A5E760D28D594B128A1B5BC681C31A6FD26D672E942E5F1062F0EA2`）。`vault.db` 未替換，SHA256 `848F961C4C5CB741EF1ADE452008F1D3F17649D06582B4809CEBFC4E16877B99`，3 個 key slots；備份 `C:\FidoVault\vault.db.pre-single-key-20261001-112834.bak` SHA256 相同。部署前 WinRM read-only process check 為 0 個 FIDO client，`F2V_AUTHENTICATOR` 使用者/系統變數均未設定。
@@ -47,7 +50,7 @@ PR #3 commit `ab3d123` 的 Windows GNU Release GUI 已部署至 `C:\FidoVault\po
 - 目標機須有 **WebView2 Runtime**；Windows 11／Edge 已安裝不代替可用性檢查。DLL 與 Runtime 是不同元件，互不取代；缺少 Runtime 的離線電腦可用微軟官方 x64 Evergreen Standalone Installer。官方依據與打包範例見 README 的 portable 部署章節。
 - 在來源機正常關閉 GUI／CLI 後先另做備份，複製至**全新**且可寫入的目的資料夾；不可覆寫目的機另一份金庫。啟動前核對 EXE／DLL／DB 來源與目的 SHA-256，保留來源與備份；登入可能寫入 audit，不用登入後的 DB hash 判斷傳輸是否一致。
 - 遇到「找不到 `WebView2Loader.dll`」：從可信任同版 x64 套件補到 EXE 旁；**不要刪除、覆寫或重建 DB，也不要重新註冊／移除金鑰**。搬移舊 DB 卻顯示首次建立帳號時立即停止，核對該 EXE 同目錄的 `vault.db`。
-- 硬體版 GUI 仍要求 Windows WebAuthn API v4+ 與目標機**本機 Console**；不以 RDP／WinRM 取代驗證。mock Gate 8、PE import 或 DLL 載入檢查不代表實體 GUI 跨機解鎖 PASS；目前沒有該跨機人工 PASS 回報，本次只更新說明，未再部署或操作金庫。
+- 硬體版 GUI 要求 Windows WebAuthn API v4+，在目標機本機 Console 或已測矩陣內的 RDP session 操作；不以 WinRM 取代驗證。mock Gate 8、PE import 或 DLL 載入檢查不代表實體 GUI 跨機解鎖 PASS。實體 GUI 跨機已有人工 PASS（2026-10-10，專用測試金庫）：Win11-NB 本機 Console 建立的測試金庫以一般權限複製到 WS2，在 RDP session 以同一主密碼與同一把金鑰解鎖；WS2 RDP 建立的測試金庫複製回 Win11-NB 本機 Console 以同一金鑰解鎖。正式金庫未做跨機搬移。
 
 > 2026-10-01 的 NB 部署已有既存 `vault.db`，當時有 3 個 key slots。A–F 是全新測試金庫的舊 Gate 流程；G4–G6 與 H1–H5 的實體驗收已完成，步驟中的槽位數僅為當時紀錄。後續部署快照見 Feature 5/7；不要把舊槽位數當作目前數量，勿建立、清空或重建現有金庫。
 
@@ -276,3 +279,11 @@ Feature 3 standalone 候選 GUI（6,589,440 bytes，SHA-256 `58ba298f7f2bcd5fa4d
 - 備份：`C:\FidoVault\backup-rustfmt-99ff0e5-20261004-204309-c3957955`，舊 EXE／金庫備份雜湊均已驗證。部署前後 exact sibling `vault.db` hash 及 1 個 key slot 不變，既有 CLI／WebView2Loader 未替換；這些是部署時快照，非人工登入後即時狀態。
 - 交接要求由使用者在 Win11-NB 本機 Console、一般權限操作，確認正常啟動／最大化、既有金鑰解鎖及 Windows 安全性提示前景、鎖定後主密碼解鎖。使用者於 `2026-10-04T21:03:42.075+08:00` 回報：「我驗證成功，進行收尾與合併」（message `1556290719763665058`）。據此記錄本次版本的**整體使用者驗收 PASS**及收尾／合併授權；回報未逐項展開，因此不新增逐項勾選或延伸其他歷史／跨機 gates。
 - 詳細 metadata／provenance：`docs/reports/rust-format-deployment.json`；格式、測試、獨立審查與發布邊界見 `docs/reports/rust-format-verification.md`。本輪後續僅更新文件及已授權合併，不再部署、啟動 GUI、操作 WebAuthn 或覆寫金庫。
+
+## WebAuthn 不可用時保留主密碼登入 — 正式部署（PR #25，2026-10-11）
+
+- 驗收：2026-10-10 WS2 RDP W1–W6 PASS（重新導向關閉時程式開啟、主密碼登入、金鑰登入／註冊顯示繁中說明且槽數不變；重新導向開啟後金鑰登入；Win11-NB 本機 Console 金鑰登入）。詳見 `docs/reports/webauthn-unavailable-password-login-acceptance.md`。
+- 部署：2026-10-11 00:13 經使用者授權，`C:\FidoVault\portable-fido-vault.exe` 更新為 7,206,912 bytes、SHA-256 `3b3f7367be81baab1a37c5249788f815c397b9e5241289880a3e6f7618996322`（來源 commit `5b943c7`，GNU Release `--locked --features real-ctap`）；部署後獨立讀回相符。
+- 備份：`C:\FidoVault\backups\webauthn-unavailable-20261011-5073642`（舊 EXE `be089077c6a37d57…`、`vault.db` `b8423f97626309e0…`，hash 均已驗證）。部署前後 `vault.db` hash 與 1 個 key slot 不變；`WebView2Loader.dll`（簽章 Valid）與 `vault_cli.exe` 未替換。
+- 待使用者確認（部署後首次啟動）：
+  - [ ] 在 Win11-NB 本機 Console 以一般權限開啟 `C:\FidoVault\portable-fido-vault.exe`，以主密碼或已註冊金鑰登入，確認既有條目正常。
