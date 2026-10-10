@@ -1,7 +1,9 @@
 //! Windows GUI FIDO backend based on Microsoft's WebAuthn API.
 //! The raw CTAP backend remains available for the CLI and diagnostics.
 
-use crate::fido2::{DetectedKey, FidoBackend, FidoError, KeyKind, RegisteredCredential};
+use crate::fido2::{
+    BackendInitError, DetectedKey, FidoBackend, FidoError, KeyKind, RegisteredCredential,
+};
 use crate::webauthn_diagnostics::{
     capability_record, diagnose, monitor_record, ContinuationDiagnostics, ContinuationStatus,
     FailureStage, MonitorStop, NativeSessionEvidence, Operation, OperationDiagnostics, QueryStatus,
@@ -1978,7 +1980,7 @@ pub struct WindowsWebAuthnBackend {
 }
 
 impl WindowsWebAuthnBackend {
-    pub fn new(hwnd: isize) -> Result<Self, FidoError> {
+    pub fn new(hwnd: isize) -> Result<Self, BackendInitError> {
         let api_version = unsafe { WebAuthNGetApiVersionNumber() };
         let process_id = unsafe { GetCurrentProcessId() };
         log::info!(
@@ -1990,9 +1992,7 @@ impl WindowsWebAuthnBackend {
             ),
         );
         if !hmac_secret_api_supported(api_version) {
-            return Err(FidoError::NotSupported(format!(
-                "Windows WebAuthn API v{api_version} lacks HMAC-secret assertion support (requires v4+)"
-            )));
+            return Err(BackendInitError::WebAuthnApiBelowV4 { api_version });
         }
         Ok(Self {
             hwnd,
@@ -6753,6 +6753,39 @@ mod tests {
         assert!(!hmac_secret_api_supported(3));
         assert!(hmac_secret_api_supported(4));
         assert!(hmac_secret_api_supported(9));
+    }
+
+    #[test]
+    fn api_below_v4_is_classified_as_webauthn_unavailable_not_generic_failure() {
+        // The constructor calls FFI, so pin its guard outcome at source level (same style as the
+        // webauthn_diagnostics wiring contracts): only the closed category may leave the guard.
+        // Patterns are split with concat! so this test does not add extra matches for the
+        // unique-locator source contracts in webauthn_diagnostics.
+        let source = include_str!("windows_webauthn.rs").replace("\r\n", "\n");
+        let start = source
+            .find(concat!("pub fn ", "new(hwnd:"))
+            .expect("constructor");
+        let end = start
+            + source[start..]
+                .find(concat!("fn ", "hwnd("))
+                .expect("constructor end");
+        let constructor = &source[start..end];
+        let guard = constructor
+            .find(concat!("if !hmac_secret_api_", "supported(api_version) {"))
+            .expect("API guard");
+        let guard_end = constructor[guard..].find("\n        }").expect("guard end");
+        let guard_body = &constructor[guard..guard + guard_end];
+        assert!(
+            guard_body.contains(concat!(
+                "return Err(BackendInitError::",
+                "WebAuthnApiBelowV4 { api_version });"
+            )),
+            "API < v4 must return WebAuthnApiBelowV4: {guard_body}"
+        );
+        assert!(
+            !constructor.contains("NotSupported"),
+            "constructor must not report API < v4 as a generic NotSupported error"
+        );
     }
 
     #[test]

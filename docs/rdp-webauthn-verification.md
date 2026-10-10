@@ -60,7 +60,7 @@ API<4 保留拒絕，後續 NOT_TESTED/blocked(capability)。無有效 output �
 | R5-1 | 錯誤／未註冊 key：拒絕、slot 不變 | 未執行 | NOT_TESTED |
 | R5-2 | 取消 PIN/UV/dialog：拒絕、slot 不變 | RDP 內 3 次取消皆 api-error 拒絕，之後登入成功、slot 仍 1 | PASS |
 | R5-3 | 斷線／逾時：原已鎖定 vault 保持鎖定，無殘留成功 token/invalid slot；不宣稱有斷線即自動上鎖 | 未執行 | NOT_TESTED |
-| R5-4 | redirection off/policy deny/consent拒絕，只有 client 插 key：失敗、無 mock fallback。設定變更另外核准 | 未執行 | NOT_TESTED |
+| R5-4 | redirection off/policy deny/consent拒絕，只有 client 插 key：失敗、無 mock fallback。設定變更另外核准 | 2026-10-10 mstsc redirection off：main `e27b0c9` GUI 啟動即結束（API v0，密碼亦無法登入）→ FAIL；修正版（PR #25，EXE `3b3f7367…`）API v0 → key-unavailable，GUI 啟動、主密碼登入成功、金鑰登入／註冊顯示繁中不可用說明、slot 不變、無 mock fallback；redirection 重開後金鑰登入 PASS。policy deny／consent 拒絕未測。見 `docs/reports/webauthn-unavailable-password-login-acceptance.md` | redirection off PASS（修正版）；policy／consent NOT_TESTED |
 | R5-5 | API<4／不支援 PRF fixture：拒絕、無新槽；缺硬體保留 NOT_TESTED，自動化不可取代 | 未執行 | NOT_TESTED |
 | R5-6 | Console 正常登入、註冊、owner/Windows Security 前景行為回歸 | 未執行 | NOT_TESTED |
 | R5-7 | 後測 test slot count 正確、fixture 仍可解鎖，保存非敏感 hash/backup | 未執行 | NOT_TESTED |

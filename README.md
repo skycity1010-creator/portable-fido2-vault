@@ -51,7 +51,7 @@ Windows Release GUI（`real-ctap`）從檔案總管啟動時使用 Windows WebAu
 
 已實測可用（2026-10-10）：在 Win11-NB 本機 Console 建立金庫並註冊金鑰後，把整個 FidoVault 資料夾複製到 WS2，再從 Win11-NB 以 RDP 連到 WS2，在 WS2 的 RDP session 內以**同一主密碼**或**插在 Win11-NB 上的已註冊金鑰**登入。RDP 下金鑰驗證經 Windows WebAuthn redirection 轉送到連線發起端，Windows 安全性提示依 Windows 預設通常顯示在發起端本機畫面；FidoVault 在 RDP 下不主動拉提示到前景。硬體 GUI 仍要求同一 process 回報 WebAuthn API v4+（WS2 RDP 實測 v7）；版本不足會 fail closed。
 
-2026-10-10 亦實測：在 WS2 的 RDP session 中建立新測試金庫並註冊插在 Win11-NB 的金鑰（兩段 ceremony、槽數 0→1），之後在 RDP 以新槽解鎖，並把資料夾複製回 Win11-NB 本機 Console 以同一金鑰解鎖成功。未驗收：WS2 本機 Console 解鎖、R5 其餘失敗情境（見 `docs/rdp-webauthn-verification.md`）。WinRM／session 0 不可操作 GUI 或金鑰。
+2026-10-10 亦實測：在 WS2 的 RDP session 中建立新測試金庫並註冊插在 Win11-NB 的金鑰（兩段 ceremony、槽數 0→1），之後在 RDP 以新槽解鎖，並把資料夾複製回 Win11-NB 本機 Console 以同一金鑰解鎖成功。若 RDP 未開啟 WebAuthn 重新導向（或 Windows WebAuthn API 低於 v4），程式仍會啟動、主密碼登入照常可用，金鑰登入／註冊會顯示「此 session 無法使用安全金鑰」的說明（2026-10-10 WS2 RDP 實測）。未驗收：WS2 本機 Console 解鎖、R5 其餘失敗情境（見 `docs/rdp-webauthn-verification.md`）。WinRM／session 0 不可操作 GUI 或金鑰。
 
 > portable 部署必須一起攜帶 GUI EXE 與同版 `WebView2Loader.dll`；搬移既有金庫時，還須攜帶 EXE 同目錄的 `vault.db`。首次建立新金庫才會產生 DB；搬移舊金庫**不得刪除或重建 DB**。完整檔案清單與目標環境見下方部署說明。
 >

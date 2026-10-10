@@ -13,7 +13,12 @@ Topology: connection origin Win11-NB (security key inserted there) → mstsc RDP
 | R4-3 | WS2 host Console: not run. Same DB copied back to Win11-NB (client) Console and unlocked with the new slot (user report) | host NOT_TESTED / client-Console reverse PASS |
 | R4-4 | — | NOT_TESTED |
 | R5-2 | pid 2012: three cancels → `api-error`, then successful login, slot 1 | PASS |
-| R5-1, R5-3, R5-4, R5-5, R5-7 | — | NOT_TESTED |
+| R5-1 | 19:11 unregistered key → `api-error`, still locked, slot 1 (user report + log) | PASS |
+| R5-3 | timeout: monitor `deadline` → `api-error`, later login OK; RDP-disconnect variant could not be run, waived by the user (not a PASS) | timeout PASS / disconnect WAIVED |
+| R5-4 | main `e27b0c9`: redirection off → API v0 → GUI exits at startup, password login impossible → FAIL. Fixed in PR #25 (see `webauthn-unavailable-password-login-acceptance.md`): redirection-off PASS | FAIL on e27b0c9 / PASS with PR #25 |
+| R5-5 | no API<4 / non-PRF hardware | NOT_TESTED |
+| R5-6 | Console regression: c04 NB Console C1–C6 | PASS (cited) |
+| R5-7 | post-test: key-only login, slot 1; pre/post fixture backups archived | PASS |
 
 Earlier same-day failure ("檔案錯誤：存取被拒。 (os error 5)") was a folder ACL issue (folder and `vault.db` copied with administrator rights under `C:\`, users read-only), not an RDP or key problem; resolved by the user.
 

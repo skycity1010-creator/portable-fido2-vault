@@ -174,6 +174,24 @@ fn resolve_backend_mode(
     }
 }
 
+/// Hardware backend construction result → GUI backend. Only the closed "WebAuthn API below v4"
+/// category degrades to the key-unavailable backend; every other error stays fatal.
+#[cfg_attr(not(all(windows, feature = "real-ctap")), allow(dead_code))]
+fn select_hardware_backend<B: fido2::FidoBackend + 'static>(
+    constructed: std::result::Result<B, fido2::BackendInitError>,
+) -> Result<Box<dyn fido2::FidoBackend>> {
+    match constructed {
+        Ok(backend) => Ok(Box::new(backend)),
+        Err(fido2::BackendInitError::WebAuthnApiBelowV4 { api_version }) => {
+            log::warn!(
+                "GUI FIDO backend selected: key-unavailable (windows_webauthn_api_version={api_version}, requires v4); master-password login remains available"
+            );
+            Ok(Box::new(fido2::UnavailableBackend::new(api_version)))
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 /// On Windows, Release hardware GUI uses the brokered WebAuthn API for standard-user launches.
 /// Debug builds retain MockBackend by default; F2V_AUTHENTICATOR=hw/mock remains an explicit override.
 fn make_backend(window_handle: isize) -> Result<Box<dyn fido2::FidoBackend>> {
@@ -190,9 +208,7 @@ fn make_backend(window_handle: isize) -> Result<Box<dyn fido2::FidoBackend>> {
             #[cfg(all(windows, feature = "real-ctap"))]
             {
                 log::info!("GUI FIDO backend selected: windows-webauthn");
-                Ok(Box::new(
-                    WindowsWebAuthnBackend::new(window_handle).map_err(|e| e.to_string())?,
-                ))
+                select_hardware_backend(WindowsWebAuthnBackend::new(window_handle))
             }
             #[cfg(all(not(windows), feature = "real-ctap"))]
             {
@@ -774,13 +790,18 @@ fn clear_clipboard_if_matches(app: tauri::AppHandle, expected: String) -> Result
 /// 偵測金鑰（註冊前預覽：類型 + label）。**不消耗**後端狀態 → 與緊接的 register_key 一致。
 #[tauri::command]
 fn detect_key(state: tauri::State<VaultState>) -> Result<fido2::DetectedKey> {
-    state.with_lock(|g| {
-        let kind = g.backend.peek_kind();
-        Ok(fido2::DetectedKey {
-            kind,
-            label: format!("偵測到金鑰（{}）", kind.label_zh()),
-            aaguid: [0u8; 16], // 預覽不含金鑰實作細節
-        })
+    state.with_lock(|g| detected_key_preview(g.backend.as_ref()))
+}
+
+fn detected_key_preview(backend: &dyn fido2::FidoBackend) -> Result<fido2::DetectedKey> {
+    if let Some(reason) = backend.key_unavailable_reason() {
+        return Err(reason);
+    }
+    let kind = backend.peek_kind();
+    Ok(fido2::DetectedKey {
+        kind,
+        label: format!("偵測到金鑰（{}）", kind.label_zh()),
+        aaguid: [0u8; 16], // 預覽不含金鑰實作細節
     })
 }
 
@@ -906,6 +927,84 @@ mod backend_mode_tests {
     #[test]
     fn release_without_real_ctap_does_not_silently_select_mock() {
         assert!(resolve_backend_mode(None, false, false, true).is_err());
+    }
+}
+
+#[cfg(test)]
+mod hardware_backend_selection_tests {
+    use super::{detected_key_preview, select_hardware_backend};
+    use crate::fido2::{
+        BackendInitError, DetectedKey, FidoBackend, FidoError, MockBackend, RegisteredCredential,
+        UnavailableBackend,
+    };
+
+    /// Stand-in for a successfully constructed hardware backend.
+    struct ConstructedBackend;
+
+    impl FidoBackend for ConstructedBackend {
+        fn detect(&mut self) -> std::result::Result<DetectedKey, FidoError> {
+            Err(FidoError::NoDevice)
+        }
+        fn register_credential(
+            &mut self,
+            _detected: &DetectedKey,
+            _pin: Option<&str>,
+        ) -> std::result::Result<RegisteredCredential, FidoError> {
+            Err(FidoError::NoDevice)
+        }
+        fn get_prf_secret(
+            &mut self,
+            _credential_id: &[u8],
+            _pin: Option<&str>,
+        ) -> std::result::Result<[u8; 32], FidoError> {
+            Err(FidoError::NoDevice)
+        }
+        fn info_diag(&self) -> String {
+            "constructed".into()
+        }
+    }
+
+    #[test]
+    fn webauthn_api_below_v4_selects_key_unavailable_backend() {
+        let backend = select_hardware_backend::<ConstructedBackend>(Err(
+            BackendInitError::WebAuthnApiBelowV4 { api_version: 0 },
+        ))
+        .expect("API capability shortfall must not abort GUI startup");
+        assert!(backend.uses_brokered_key_selection());
+        assert_ne!(backend.info_diag(), "constructed");
+        let reason = backend
+            .key_unavailable_reason()
+            .expect("unavailable backend must report why keys are unusable");
+        assert!(reason.contains("v0"), "{reason}");
+    }
+
+    #[test]
+    fn other_backend_construction_errors_remain_fatal() {
+        for error in [
+            FidoError::Internal("boom".into()),
+            FidoError::NotSupported("Windows WebAuthn API v0 lacks HMAC-secret".into()),
+            FidoError::NoDevice,
+        ] {
+            assert!(
+                select_hardware_backend::<ConstructedBackend>(Err(BackendInitError::Fido(error)))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn successful_construction_keeps_real_backend() {
+        let backend = select_hardware_backend(Ok(ConstructedBackend)).unwrap();
+        assert_eq!(backend.info_diag(), "constructed");
+        assert!(backend.key_unavailable_reason().is_none());
+    }
+
+    #[test]
+    fn detect_key_preview_fails_closed_when_keys_unavailable() {
+        let error = detected_key_preview(&UnavailableBackend::new(0))
+            .expect_err("must not pretend a key was detected");
+        assert!(error.contains("主密碼"), "{error}");
+        assert!(detected_key_preview(&MockBackend::new()).is_ok());
     }
 }
 
