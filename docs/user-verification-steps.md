@@ -2,7 +2,7 @@
 
 > 適用：Win11-NB，`C:\FidoVault`（portable 資料夾）。本文保留部署與已確認驗收紀錄，不是要求重新執行全部舊模板。
 > Windows Release GUI 必須以 `--features real-ctap` 建置；一般權限的檔案總管直接啟動時使用 Windows WebAuthn API，無需環境變數或系統管理員提升。Windows 安全性視窗負責 PIN/UV/觸碰；目標系統需 WebAuthn API v4+。Debug build 預設為 MockBackend；明確跑 mock 流程時設定 `F2V_AUTHENTICATOR=mock`。
-> **RDP 範圍（2026-10-10 更新）：**建立金庫與註冊金鑰請在目標機本機 Console session。已實測：Win11-NB 本機建立的金庫資料夾以一般權限複製到 WS2 後，由 Win11-NB 以 RDP 連入 WS2，可用同一主密碼與插在 Win11-NB 的已註冊金鑰登入（WS2 RDP 回報 API v7）。RDP 中註冊新金鑰未驗收。API 低於 v4 的 session 仍 fail closed；勿降低 API 版本檢查。早期 Win11-NB RDP session 曾回報 API v1。
+> **RDP 範圍（2026-10-10 R6 GO）：**已支援（限已測矩陣，見 `docs/rdp-webauthn-verification.md` R6）：由 Win11-NB 以 mstsc（啟用 WebAuthn 重新導向、YubiKey Bio 插在 Win11-NB）連入 WS2，在 RDP session 內以主密碼或已註冊金鑰登入、註冊新金鑰；WS2 RDP 回報 API v7。資料夾須以一般權限複製（避免 os error 5）。重新導向關閉時 GUI 仍啟動、僅主密碼可用。下方各節「從本機 Console 啟動、不要從 RDP」的文字是當時快照，已由本段取代。API 低於 v4 的 session 仍 fail closed；勿降低 API 版本檢查。早期 Win11-NB RDP session 曾回報 API v1。
 
 ## 已確認驗收彙整（文件同步：2026-10-04）
 
@@ -17,7 +17,7 @@
 
 各節部署雜湊、備份、槽位數與操作說明保留為**當時快照**；2026-10-01 的 3 slots 不代表後續部署數量。最新已記錄部署為本文末尾的 Rust 格式維護版本（來源 `99ff0e5e537c5485f6fb65819f45662c2769c0a1`），使用者已回報整體驗證成功並授權收尾與合併；本輪文件收尾不再部署或操作目標金庫。
 
-A–C/E/F 是舊模板，沒有逐項人工 PASS 回報，不因功能／任務結案而補勾；D1–D4 已確認，D5 為選測且未回報。Gate 8 目前僅有 mock E2E copy-test，未見實體 GUI 跨機人工 PASS。H1–H5 與下方 Feature 1–7 的既有確認維持完成；RDP 不支援、raw CTAP CLI 實體 register/login 路線已由 GUI 驗收取代（superseded），不是待驗項。
+A–C/E/F 是舊模板，沒有逐項人工 PASS 回報，不因功能／任務結案而補勾；D1–D4 已確認，D5 為選測且未回報。Gate 8 目前僅有 mock E2E copy-test，未見實體 GUI 跨機人工 PASS。H1–H5 與下方 Feature 1–7 的既有確認維持完成；RDP 已於 2026-10-10 R6 GO（限已測矩陣，見上方）、raw CTAP CLI 實體 register/login 路線已由 GUI 驗收取代（superseded），不是待驗項。
 
 ## 部署後驗證前確認（2026-10-01，歷史部署／已取代）
 已部署 PR #3 的 Windows GNU Release GUI，SHA256：`E9A28C81C73456800E3F1FAF0E8F1A9F6576146C8A675F5AB125FF9135ED8503`。替換前舊 exe 已備份為 `C:\FidoVault\portable-fido-vault.exe.pre-single-key-20261001-112834.bak`（SHA256 `06B1C5BE7A5E760D28D594B128A1B5BC681C31A6FD26D672E942E5F1062F0EA2`）。`vault.db` 未替換，SHA256 `848F961C4C5CB741EF1ADE452008F1D3F17649D06582B4809CEBFC4E16877B99`，3 個 key slots；備份 `C:\FidoVault\vault.db.pre-single-key-20261001-112834.bak` SHA256 相同。部署前 WinRM read-only process check 為 0 個 FIDO client，`F2V_AUTHENTICATOR` 使用者/系統變數均未設定。

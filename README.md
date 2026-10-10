@@ -49,9 +49,11 @@ Windows Release GUI（`real-ctap`）從檔案總管啟動時使用 Windows WebAu
 
 ### RDP 遠端桌面使用範圍
 
+**支援（R6 GO，2026-10-10）——僅限已實測矩陣：**連線發起端 Win11-NB（Windows 11 24H2 build 26100.9457，mstsc 10.0.26100.8875，金鑰插此端）→ RDP（mstsc 啟用 WebAuthn 重新導向）→ 目標 WS2（Windows Server 2025 Standard 24H2 build 26100.33438，RDP session 回報 WebAuthn API v7）；金鑰 YubiKey Bio（USB PID 0402，推定韌體 5.7.2）；FidoVault Release GUI（PR #25 起，含 WebAuthn 不可用時保留主密碼登入）。矩陣外的 OS、RDP 用戶端、金鑰型號、巢狀 RDP、RemoteApp 不在支援範圍。完整裁決與殘餘風險見 `docs/rdp-webauthn-verification.md` 的 R6。
+
 已實測可用（2026-10-10）：在 Win11-NB 本機 Console 建立金庫並註冊金鑰後，把整個 FidoVault 資料夾複製到 WS2，再從 Win11-NB 以 RDP 連到 WS2，在 WS2 的 RDP session 內以**同一主密碼**或**插在 Win11-NB 上的已註冊金鑰**登入。RDP 下金鑰驗證經 Windows WebAuthn redirection 轉送到連線發起端，Windows 安全性提示依 Windows 預設通常顯示在發起端本機畫面；FidoVault 在 RDP 下不主動拉提示到前景。硬體 GUI 仍要求同一 process 回報 WebAuthn API v4+（WS2 RDP 實測 v7）；版本不足會 fail closed。
 
-2026-10-10 亦實測：在 WS2 的 RDP session 中建立新測試金庫並註冊插在 Win11-NB 的金鑰（兩段 ceremony、槽數 0→1），之後在 RDP 以新槽解鎖，並把資料夾複製回 Win11-NB 本機 Console 以同一金鑰解鎖成功。若 RDP 未開啟 WebAuthn 重新導向（或 Windows WebAuthn API 低於 v4），程式仍會啟動、主密碼登入照常可用，金鑰登入／註冊會顯示「此 session 無法使用安全金鑰」的說明（2026-10-10 WS2 RDP 實測）。未驗收：WS2 本機 Console 解鎖、R5 其餘失敗情境（見 `docs/rdp-webauthn-verification.md`）。WinRM／session 0 不可操作 GUI 或金鑰。
+2026-10-10 亦實測：在 WS2 的 RDP session 中建立新測試金庫並註冊插在 Win11-NB 的金鑰（兩段 ceremony、槽數 0→1），之後在 RDP 以新槽解鎖，並把資料夾複製回 Win11-NB 本機 Console 以同一金鑰解鎖成功。若 RDP 未開啟 WebAuthn 重新導向（或 Windows WebAuthn API 低於 v4），程式仍會啟動、主密碼登入照常可用，金鑰登入／註冊會顯示「此 session 無法使用安全金鑰」的說明（2026-10-10 WS2 RDP 實測）。未驗收：WS2 本機 Console 解鎖、RDP 斷線中的金鑰操作（使用者豁免）、群組原則停用 WebAuthn／拒絕資源同意、API 低於 v4 或不支援 PRF 的金鑰（見 `docs/rdp-webauthn-verification.md`）。WinRM／session 0 不可操作 GUI 或金鑰。
 
 > portable 部署必須一起攜帶 GUI EXE 與同版 `WebView2Loader.dll`；搬移既有金庫時，還須攜帶 EXE 同目錄的 `vault.db`。首次建立新金庫才會產生 DB；搬移舊金庫**不得刪除或重建 DB**。完整檔案清單與目標環境見下方部署說明。
 >
@@ -91,7 +93,7 @@ FidoVault\
 
 ### 目標電腦 prerequisites
 
-1. Windows x64，硬體版 GUI 需 Windows WebAuthn API v4+；建立金庫與註冊金鑰使用目標機**本機 Console**。在 RDP session 以已註冊金鑰或主密碼登入的範圍見上方「RDP 遠端桌面使用範圍」；不使用 WinRM 操作 GUI 或金鑰。
+1. Windows x64，硬體版 GUI 需 Windows WebAuthn API v4+；建立金庫、註冊金鑰與登入可在目標機**本機 Console**，或在上方「RDP 遠端桌面使用範圍」的已測矩陣內於 RDP session 進行（需啟用 mstsc WebAuthn 重新導向，金鑰插在連線發起端）；不使用 WinRM 操作 GUI 或金鑰。
 2. **Microsoft WebView2 Runtime** 可用。不要只因 Windows 11 或已安裝 Edge 瀏覽器就假定 Runtime 可用；若缺少，依微軟官方說明安裝 Evergreen Runtime。離線電腦可由其他電腦先下載 x64 **Evergreen Standalone Installer** 再搬入安裝；Bootstrapper 需要連網下載，不適合完全離線安裝。[1]
 3. 可寫入的本機資料夾（以一般權限複製、目前使用者有修改權限；否則存檔會出現 os error 5）；需要以金鑰登入時，使用原金庫已註冊的實體安全金鑰。補啟動依賴不需要重新註冊或移除金鑰。
 

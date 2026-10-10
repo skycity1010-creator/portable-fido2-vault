@@ -1,7 +1,7 @@
 # 可攜式 FIDO2 密碼金庫 v0.1 — 技術規格書
 
 > 專案：`portable-fido2-vault`｜卡：t_31e9ef5e｜語言介面：繁體中文
-> 目標平台：Windows 10/11 x64；目標機須確認 WebView2 Runtime 可用，硬體版 GUI 需 Windows WebAuthn API v4+ 及本機 Console。Windows 11／Edge 已安裝不代替 Runtime 檢查。
+> 目標平台：Windows 10/11 x64；目標機須確認 WebView2 Runtime 可用，硬體版 GUI 需 Windows WebAuthn API v4+，於本機 Console 或已驗證矩陣內的 RDP session（WebAuthn 重新導向）操作；RDP 支援範圍見 `docs/rdp-webauthn-verification.md` R6。WebAuthn 不可用（API < v4）時 GUI 仍啟動，僅主密碼可用、金鑰操作 fail closed。Windows 11／Edge 已安裝不代替 Runtime 檢查。
 
 ## 1. 目標 / 非目標
 
