@@ -142,7 +142,7 @@ cargo +stable-x86_64-pc-windows-gnu build --release --features real-ctap --bin p
   - 當時流程為推檔 → session-0 啟動 GUI → 10s 存活檢查（程序 + WebView2 子程序；截圖僅供參考）。此流程已由本機 Console GUI 驗收取代（superseded），不可作為目前的 GUI／WebAuthn 操作方式。
   - 腳本有 vault_cli 時會在 NB 新建測試金庫並執行 mock CLI E2E；此腳本本身未搬移既有金庫，不構成既有金庫或實體 GUI 跨機人工驗收證據。
 - 注意：PS 5.1 讀無 BOM 腳本會當 ANSI(950) 解碼 → 所有遠端 PS 腳本純 ASCII（nb_push.py 已用 base64 內層迴避）。
-- **GUI／實體 FIDO2 驗證僅由使用者在本機 Console 互動 session 操作**；WinRM 僅供唯讀檢查、備份與核准部署，不啟動 GUI 或執行 WebAuthn。RDP／WebAuthn redirection 不支援，不是待驗項。
+- **GUI／實體 FIDO2 驗證僅由使用者在本機 Console 互動 session 操作**；WinRM 僅供唯讀檢查、備份與核准部署，不啟動 GUI 或執行 WebAuthn。RDP：2026-10-10 已實測 Win11-NB → RDP → WS2 以主密碼與既有金鑰登入可用（API v7、local_console=false、不主動拉前景）；RDP 中註冊新金鑰未驗收。見 `docs/reports/console-webauthn-foreground-acceptance.md`。
 
 ## 8. Gate 與功能驗收狀態（既有與新增驗收分項記錄）
 

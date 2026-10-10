@@ -47,11 +47,15 @@ cargo +stable-x86_64-pc-windows-gnu build --release --features real-ctap --bin p
 
 Windows Release GUI（`real-ctap`）從檔案總管啟動時使用 Windows WebAuthn API；PIN、指紋與觸碰提示由 Windows 安全性視窗處理，無需設定 `F2V_AUTHENTICATOR` 或以系統管理員身分啟動。目標系統需提供 WebAuthn API v4 或更新版本。Debug 建置仍預設 MockBackend；若需在 Release 明確執行 mock 測試，可設定 `F2V_AUTHENTICATOR=mock`。未設定覆寫值且 Release 缺少 `real-ctap` 時會拒絕啟動。`vault_cli --authenticator hw` 保留 raw CTAP/HID 診斷路徑，與 GUI 使用的 Windows API 不同。
 
-### 不支援 RDP 遠端桌面啟動
+### RDP 遠端桌面使用範圍
 
-目前**不支援從 RDP 遠端桌面 session 啟動 FidoVault，也不支援在 RDP session 中操作硬體金鑰流程**。請在目標 Windows 電腦的本機 Console session 啟動程式，並在該 session 完成 Windows 安全性提示。Win11-NB 的 RDP session 曾回報 WebAuthn API v1，低於本程式要求的 v4+；程式會 fail closed，不會為了支援 RDP 而降低版本檢查。RDP／WebAuthn redirection 不屬於目前支援的使用情境。
+已實測可用（2026-10-10）：在 Win11-NB 本機 Console 建立金庫並註冊金鑰後，把整個 FidoVault 資料夾複製到 WS2，再從 Win11-NB 以 RDP 連到 WS2，在 WS2 的 RDP session 內以**同一主密碼**或**插在 Win11-NB 上的已註冊金鑰**登入。RDP 下金鑰驗證經 Windows WebAuthn redirection 轉送到連線發起端，Windows 安全性提示依 Windows 預設通常顯示在發起端本機畫面；FidoVault 在 RDP 下不主動拉提示到前景。硬體 GUI 仍要求同一 process 回報 WebAuthn API v4+（WS2 RDP 實測 v7）；版本不足會 fail closed。
+
+未驗收：在 RDP session 中註冊新金鑰。WinRM／session 0 不可操作 GUI 或金鑰。
 
 > portable 部署必須一起攜帶 GUI EXE 與同版 `WebView2Loader.dll`；搬移既有金庫時，還須攜帶 EXE 同目錄的 `vault.db`。首次建立新金庫才會產生 DB；搬移舊金庫**不得刪除或重建 DB**。完整檔案清單與目標環境見下方部署說明。
+>
+> **複製到另一台電腦時請用一般權限**，放在自己有修改權限的位置（例如 `D:\FidoVault`、使用者資料夾底下）。若以系統管理員權限複製到 `C:\` 底下的新資料夾，一般權限執行的 FidoVault 無法覆寫 `vault.db`，登入時會出現「檔案錯誤：存取被拒。 (os error 5)」（密碼／金鑰本身正確，存檔被拒並留下 `vault.db.tmp`）；改放可寫位置或補上自己的修改權限即可。程式不會在兩台電腦間同步金庫：資料要回到另一台時請自行複製整個資料夾，且同一份 `vault.db` 不可同時由兩台開啟。
 
 ## 使用流程
 
@@ -66,7 +70,7 @@ Windows Release GUI（`real-ctap`）從檔案總管啟動時使用 Windows WebAu
 
 Windows Release 硬體模式以單一通用「以金鑰登入」入口呼叫 Windows WebAuthn；金鑰選擇、PIN/UV 與觸碰由 Windows 安全性提示處理。操作期間，程式會對唯一的新同 session 安全性 broker 視窗做一次受限的前景請求，但只有在 FidoVault 仍為前景時才嘗試；不會把提示設成 topmost，也不會繞過 Windows 的全域前景政策。這是 best-effort，Windows 仍可能切換焦點。
 
-Win11-NB 本機 Console 已確認通用登入不需先選金鑰，Windows 安全性操作提示也出現在前景。Windows WebAuthn API v4+ 仍是硬體 GUI 的必要條件；較舊 API 版本會 fail closed。
+Win11-NB 本機 Console 已確認通用登入不需先選金鑰。每次金鑰操作的第一個 Windows 安全性視窗會被拉到前景；已知問題：同一次操作的第二個視窗（按指紋／觸碰提示）仍可能被 FidoVault 擋住，直接操作金鑰即可完成，不影響使用（需同一操作多次拉前景才能修正，目前未授權）。Windows WebAuthn API v4+ 仍是硬體 GUI 的必要條件；較舊 API 版本會 fail closed。
 
 ## portable 部署到別台電腦（含 Win11-NB）
 
@@ -87,9 +91,9 @@ FidoVault\
 
 ### 目標電腦 prerequisites
 
-1. Windows x64，硬體版 GUI 需 Windows WebAuthn API v4+；使用目標機**本機 Console**，不使用 RDP／WinRM 操作 GUI 或金鑰。
+1. Windows x64，硬體版 GUI 需 Windows WebAuthn API v4+；建立金庫與註冊金鑰使用目標機**本機 Console**。在 RDP session 以已註冊金鑰或主密碼登入的範圍見上方「RDP 遠端桌面使用範圍」；不使用 WinRM 操作 GUI 或金鑰。
 2. **Microsoft WebView2 Runtime** 可用。不要只因 Windows 11 或已安裝 Edge 瀏覽器就假定 Runtime 可用；若缺少，依微軟官方說明安裝 Evergreen Runtime。離線電腦可由其他電腦先下載 x64 **Evergreen Standalone Installer** 再搬入安裝；Bootstrapper 需要連網下載，不適合完全離線安裝。[1]
-3. 可寫入的本機資料夾；需要以金鑰登入時，使用原金庫已註冊的實體安全金鑰。補啟動依賴不需要重新註冊或移除金鑰。
+3. 可寫入的本機資料夾（以一般權限複製、目前使用者有修改權限；否則存檔會出現 os error 5）；需要以金鑰登入時，使用原金庫已註冊的實體安全金鑰。補啟動依賴不需要重新註冊或移除金鑰。
 
 官方 Runtime 部署、離線安裝及隨附檔案說明與下載入口，見文末 Sources 的 Microsoft Learn 文件。[1]
 
