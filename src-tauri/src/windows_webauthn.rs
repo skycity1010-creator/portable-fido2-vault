@@ -12,17 +12,16 @@ use std::{
     ffi::c_void,
     ptr, slice,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
         Arc, Mutex,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM};
-use windows_sys::Win32::Networking::WindowsWebServices::*;
-use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+use windows_sys::Win32::Foundation::{
+    CloseHandle, GetLastError, SetLastError, HANDLE, HWND, LPARAM,
 };
+use windows_sys::Win32::Networking::WindowsWebServices::*;
 use windows_sys::Win32::System::RemoteDesktop::{
     ProcessIdToSessionId, WTSActive, WTSClientProtocolType, WTSConnectState, WTSFreeMemory,
     WTSQuerySessionInformationW, WTS_INFO_CLASS,
@@ -33,7 +32,7 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClassNameW, GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId,
-    IsIconic, IsWindow, IsWindowVisible, SetForegroundWindow, ShowWindow, SW_RESTORE,
+    IsIconic, IsWindow, IsWindowVisible, SetForegroundWindow,
 };
 
 const RP_ID: &str = "fido-vault.local";
@@ -95,9 +94,10 @@ struct WindowsSecurityDialogCandidate<'a> {
     current_session: u32,
     window_session: u32,
     is_new_window: bool,
-    is_new_process: bool,
 }
 
+// A fresh identity is only temporal evidence; it does not prove that this broker
+// window belongs to the current WebAuthn operation.
 fn is_new_windows_security_dialog(candidate: WindowsSecurityDialogCandidate<'_>) -> bool {
     let title_matches = candidate
         .title
@@ -116,7 +116,6 @@ fn is_new_windows_security_dialog(candidate: WindowsSecurityDialogCandidate<'_>)
     candidate.visible
         && candidate.current_session == candidate.window_session
         && candidate.is_new_window
-        && candidate.is_new_process
         && title_matches
         && candidate
             .class_name
@@ -132,8 +131,13 @@ struct WindowIdentity {
     session: u32,
 }
 
-fn is_new_window_identity(identity: WindowIdentity, baseline: &HashSet<WindowIdentity>) -> bool {
+fn is_new_window_identity(
+    identity: WindowIdentity,
+    baseline: &HashSet<WindowIdentity>,
+    unattributed: &HashSet<(isize, u32, u32)>,
+) -> bool {
     !baseline.contains(&identity)
+        && !unattributed.contains(&(identity.hwnd, identity.process_id, identity.thread_id))
 }
 
 fn select_unique_candidate(candidates: &[WindowIdentity]) -> Option<WindowIdentity> {
@@ -147,8 +151,10 @@ fn select_unique_candidate(candidates: &[WindowIdentity]) -> Option<WindowIdenti
 struct BrokerBaseline {
     system_directory: String,
     session: u32,
+    local_console: bool,
     windows: HashSet<WindowIdentity>,
-    processes: HashSet<u32>,
+    // (hwnd, pid, tid) of baseline windows whose session could not be read.
+    unattributed_windows: HashSet<(isize, u32, u32)>,
 }
 
 #[derive(Clone)]
@@ -211,7 +217,6 @@ enum HandoffRefusal {
     UnobservedBroker,
     Foreground,
     Broker,
-    Activation,
     PassiveSession,
     PassiveDeadline,
 }
@@ -224,7 +229,6 @@ impl HandoffRefusal {
             Self::UnobservedBroker => "broker-not-observed",
             Self::Foreground => "foreground-not-associated-broker",
             Self::Broker => "broker-revalidation-failed",
-            Self::Activation => "activation-failed",
             Self::PassiveSession => "passive-session-ineligible",
             Self::PassiveDeadline => "passive-deadline",
         }
@@ -274,7 +278,6 @@ fn prepare_continuation_recorded(
         Err(HandoffRefusal::UnobservedBroker) => ContinuationStatus::UnobservedBroker,
         Err(HandoffRefusal::Foreground) => ContinuationStatus::Foreground,
         Err(HandoffRefusal::Broker) => ContinuationStatus::Broker,
-        Err(HandoffRefusal::Activation) => ContinuationStatus::Activation,
         Err(HandoffRefusal::PassiveSession) => ContinuationStatus::Session,
         Err(HandoffRefusal::PassiveDeadline) => ContinuationStatus::Deadline,
     });
@@ -424,22 +427,13 @@ fn prepare_continuation_inner(
         return Err(HandoffRefusal::Broker);
     }
     if system.minimized(owner) {
-        if !current_broker(system, &broker)
-            || !valid_owner(system, context.owner)
-            || system.foreground() != broker.identity.hwnd
-        {
-            return Err(HandoffRefusal::Broker);
-        }
-        system.restore(owner);
-        if !valid_owner(system, context.owner) || system.minimized(owner) {
-            return Err(HandoffRefusal::Owner);
-        }
-        if system.foreground() == owner {
-            return Ok(HandoffOutcome::Recovered);
-        }
+        return Err(HandoffRefusal::Owner);
     }
-    // All potentially blocking identity queries precede this last activation
-    // sample. No retry or focus bypass; the later API guard remains separate.
+    // The accepted broker proves prior association only. Continuation cannot
+    // restore or activate the owner; it succeeds only if Windows/user action
+    // naturally returns focus to the validated owner.
+    // All potentially blocking identity queries precede this final passive
+    // focus sample. No retry or focus bypass; the later API guard remains separate.
     if !current_broker(system, &broker) || !valid_owner(system, context.owner) {
         return Err(HandoffRefusal::Broker);
     }
@@ -448,17 +442,8 @@ fn prepare_continuation_inner(
     {
         return Err(HandoffRefusal::Broker);
     }
-    if system.foreground() != broker.identity.hwnd {
+    if system.foreground() != owner {
         return Err(HandoffRefusal::Foreground);
-    }
-    if !system.activate(owner) {
-        return Err(HandoffRefusal::Activation);
-    }
-    if system.foreground() != owner
-        || !valid_owner(system, context.owner)
-        || system.minimized(owner)
-    {
-        return Err(HandoffRefusal::Activation);
     }
     Ok(HandoffOutcome::Recovered)
 }
@@ -581,6 +566,10 @@ fn session_evidence(
     }
 }
 
+fn is_local_console_session(evidence: NativeSessionEvidence) -> bool {
+    evidence.protocol_query == QueryStatus::Valid && evidence.protocol == SessionProtocol::Console
+}
+
 // The BOOL and byte count are native API output, not environment heuristics.
 unsafe fn parse_wts<T: Copy>(
     success: i32,
@@ -677,6 +666,181 @@ fn current_broker(system: &mut impl ForegroundSystem, broker: &AcceptedBroker) -
         && trusted_broker(system, &broker.baseline, broker.identity)
 }
 
+const PHASE_WATCHING: u8 = 0;
+const PHASE_ACTIVATION_CLAIMED: u8 = 1;
+const PHASE_ACTIVATED: u8 = 2;
+const PHASE_PUBLICATION_CLAIMED: u8 = 3;
+const PHASE_PUBLISHED: u8 = 4;
+const PHASE_API_RETURNED: u8 = 5;
+const PHASE_CANCELLED: u8 = 6;
+const PHASE_FAILED: u8 = 7;
+const PHASE_ACTIVATION_COMMITTED: u8 = 8;
+
+#[derive(Default)]
+struct MonitorTerminal {
+    gate: Mutex<()>,
+    phase: AtomicU8,
+}
+
+impl MonitorTerminal {
+    fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, ()>> {
+        self.gate.lock()
+    }
+
+    fn try_lock(&self) -> std::sync::TryLockResult<std::sync::MutexGuard<'_, ()>> {
+        self.gate.try_lock()
+    }
+
+    fn mark_api_returned(&self) {
+        loop {
+            let phase = self.phase.load(Ordering::Acquire);
+            let next = match phase {
+                PHASE_WATCHING | PHASE_ACTIVATION_CLAIMED | PHASE_ACTIVATED => {
+                    PHASE_API_RETURNED
+                }
+                _ => return,
+            };
+            if self
+                .phase
+                .compare_exchange(phase, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
+    fn mark_cancelled(&self) {
+        loop {
+            let phase = self.phase.load(Ordering::Acquire);
+            let next = match phase {
+                PHASE_WATCHING | PHASE_ACTIVATION_CLAIMED | PHASE_ACTIVATED => PHASE_CANCELLED,
+                _ => return,
+            };
+            if self
+                .phase
+                .compare_exchange(phase, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
+    fn claim_activation(&self) -> Result<(), MonitorStop> {
+        self.phase
+            .compare_exchange(
+                PHASE_WATCHING,
+                PHASE_ACTIVATION_CLAIMED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map(|_| ())
+            .map_err(|phase| Self::phase_reason(phase, MonitorStop::ActivationFailed))
+    }
+
+    fn commit_activation(&self) -> Result<(), MonitorStop> {
+        self.phase
+            .compare_exchange(
+                PHASE_ACTIVATION_CLAIMED,
+                PHASE_ACTIVATION_COMMITTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map(|_| ())
+            .map_err(|phase| Self::phase_reason(phase, MonitorStop::ActivationFailed))
+    }
+
+    fn finish_activation(&self, succeeded: bool) {
+        let next = if succeeded {
+            PHASE_ACTIVATED
+        } else {
+            PHASE_FAILED
+        };
+        let _ = self.phase.compare_exchange(
+            PHASE_ACTIVATION_COMMITTED,
+            next,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn abort_activation(&self, reason: MonitorStop) {
+        let next = match reason {
+            MonitorStop::ApiReturned => PHASE_API_RETURNED,
+            MonitorStop::Cancelled => PHASE_CANCELLED,
+            _ => PHASE_FAILED,
+        };
+        let _ = self.phase.compare_exchange(
+            PHASE_ACTIVATION_CLAIMED,
+            next,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn claim_publication(&self, activated: bool) -> Result<(), MonitorStop> {
+        let expected = if activated {
+            PHASE_ACTIVATED
+        } else {
+            PHASE_WATCHING
+        };
+        self.phase
+            .compare_exchange(
+                expected,
+                PHASE_PUBLICATION_CLAIMED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map(|_| ())
+            .map_err(|phase| Self::phase_reason(phase, MonitorStop::ChannelFailed))
+    }
+
+    fn finish_publication(&self) {
+        let _ = self.phase.compare_exchange(
+            PHASE_PUBLICATION_CLAIMED,
+            PHASE_PUBLISHED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn abort_publication(&self, reason: MonitorStop) {
+        let next = match reason {
+            MonitorStop::ApiReturned => PHASE_API_RETURNED,
+            MonitorStop::Cancelled => PHASE_CANCELLED,
+            _ => PHASE_FAILED,
+        };
+        let _ = self.phase.compare_exchange(
+            PHASE_PUBLICATION_CLAIMED,
+            next,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn phase_reason(phase: u8, fallback: MonitorStop) -> MonitorStop {
+        match phase {
+            PHASE_API_RETURNED => MonitorStop::ApiReturned,
+            PHASE_CANCELLED => MonitorStop::Cancelled,
+            _ => fallback,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActivationResult {
+    Activated,
+    FocusLost,
+    CandidateChanged,
+    Ambiguous,
+    Incomplete,
+    NonConsoleSession,
+    ApiReturned,
+    Cancelled,
+    Failed,
+}
+
 // Native observations and mutations are injected together, so tests execute the
 // same identity policy and ordering as production without calling Windows UI.
 trait ForegroundSystem {
@@ -694,8 +858,136 @@ trait ForegroundSystem {
     fn title(&mut self, hwnd: isize) -> Option<String>;
     fn class(&mut self, hwnd: isize) -> Option<String>;
     fn current_pid(&mut self) -> u32;
-    fn restore(&mut self, hwnd: isize);
     fn activate(&mut self, hwnd: isize) -> bool;
+    fn after_monitor_publish_check(&mut self) {}
+    fn after_broker_candidate_scan(&mut self) {}
+    fn before_activation_guard(&mut self) {}
+    fn after_activation_claim(&mut self) {}
+    #[cfg(test)]
+    fn before_final_activation_call(
+        &mut self,
+        _: &MonitorTerminal,
+        _: &AtomicBool,
+        _: &AtomicBool,
+    ) {}
+    fn activate_if_foreground(
+        &mut self,
+        baseline: &BrokerBaseline,
+        owner: isize,
+        candidate: WindowIdentity,
+        terminal: &MonitorTerminal,
+        cancelled: &AtomicBool,
+        api_returned: &AtomicBool,
+    ) -> ActivationResult
+    where
+        Self: Sized,
+    {
+        if !baseline.local_console {
+            return ActivationResult::NonConsoleSession;
+        }
+        self.before_activation_guard();
+        if api_returned.load(Ordering::Acquire) {
+            return ActivationResult::ApiReturned;
+        }
+        if cancelled.load(Ordering::Acquire) {
+            return ActivationResult::Cancelled;
+        }
+        let candidates = match broker_candidates(self, baseline) {
+            Ok(candidates) => candidates,
+            Err(ScanError::Pending) => return ActivationResult::Ambiguous,
+            Err(ScanError::Failed) => return ActivationResult::Incomplete,
+        };
+        match candidates.as_slice() {
+            [current] if *current == candidate => {}
+            [] => return ActivationResult::CandidateChanged,
+            [_] => return ActivationResult::CandidateChanged,
+            _ => return ActivationResult::Ambiguous,
+        }
+        if self.identity(candidate.hwnd) != Some(candidate) || !self.visible(candidate.hwnd) {
+            return ActivationResult::CandidateChanged;
+        }
+        if self.foreground() != owner {
+            return ActivationResult::FocusLost;
+        }
+        if api_returned.load(Ordering::Acquire) {
+            return ActivationResult::ApiReturned;
+        }
+        if cancelled.load(Ordering::Acquire) {
+            return ActivationResult::Cancelled;
+        }
+        if let Err(reason) = terminal.claim_activation() {
+            return match reason {
+                MonitorStop::ApiReturned => ActivationResult::ApiReturned,
+                MonitorStop::Cancelled => ActivationResult::Cancelled,
+                _ => ActivationResult::Failed,
+            };
+        }
+
+        self.after_activation_claim();
+        if api_returned.load(Ordering::Acquire) {
+            terminal.abort_activation(MonitorStop::ApiReturned);
+            return ActivationResult::ApiReturned;
+        }
+        if cancelled.load(Ordering::Acquire) {
+            terminal.abort_activation(MonitorStop::Cancelled);
+            return ActivationResult::Cancelled;
+        }
+        let candidates = match broker_candidates(self, baseline) {
+            Ok(candidates) => candidates,
+            Err(ScanError::Pending) => {
+                terminal.abort_activation(MonitorStop::Ambiguous);
+                return ActivationResult::Ambiguous;
+            }
+            Err(ScanError::Failed) => {
+                terminal.abort_activation(MonitorStop::Incomplete);
+                return ActivationResult::Incomplete;
+            }
+        };
+        match candidates.as_slice() {
+            [current] if *current == candidate => {}
+            [] | [_] => {
+                terminal.abort_activation(MonitorStop::CandidateChanged);
+                return ActivationResult::CandidateChanged;
+            }
+            _ => {
+                terminal.abort_activation(MonitorStop::Ambiguous);
+                return ActivationResult::Ambiguous;
+            }
+        }
+        if self.identity(candidate.hwnd) != Some(candidate) || !self.visible(candidate.hwnd) {
+            terminal.abort_activation(MonitorStop::CandidateChanged);
+            return ActivationResult::CandidateChanged;
+        }
+        if self.foreground() != owner {
+            terminal.abort_activation(MonitorStop::ForegroundLost);
+            return ActivationResult::FocusLost;
+        }
+        if api_returned.load(Ordering::Acquire) {
+            terminal.abort_activation(MonitorStop::ApiReturned);
+            return ActivationResult::ApiReturned;
+        }
+        if cancelled.load(Ordering::Acquire) {
+            terminal.abort_activation(MonitorStop::Cancelled);
+            return ActivationResult::Cancelled;
+        }
+
+        #[cfg(test)]
+        self.before_final_activation_call(terminal, cancelled, api_returned);
+        if let Err(reason) = terminal.commit_activation() {
+            return match reason {
+                MonitorStop::ApiReturned => ActivationResult::ApiReturned,
+                MonitorStop::Cancelled => ActivationResult::Cancelled,
+                _ => ActivationResult::Failed,
+            };
+        }
+        let succeeded = self.activate(candidate.hwnd);
+        terminal.finish_activation(succeeded);
+        if succeeded {
+            ActivationResult::Activated
+        } else {
+            ActivationResult::Failed
+        }
+    }
 }
 
 struct NativeForegroundSystem;
@@ -758,11 +1050,6 @@ impl ForegroundSystem for NativeForegroundSystem {
     fn current_pid(&mut self) -> u32 {
         unsafe { GetCurrentProcessId() }
     }
-    fn restore(&mut self, hwnd: isize) {
-        unsafe {
-            ShowWindow(hwnd as HWND, SW_RESTORE);
-        }
-    }
     fn activate(&mut self, hwnd: isize) -> bool {
         (unsafe { SetForegroundWindow(hwnd as HWND) }) != 0
     }
@@ -788,8 +1075,11 @@ fn observe_broker(
         visible: system.visible(identity.hwnd),
         current_session: baseline.session,
         window_session: session,
-        is_new_window: is_new_window_identity(identity, &baseline.windows),
-        is_new_process: !baseline.processes.contains(&identity.process_id),
+        is_new_window: is_new_window_identity(
+            identity,
+            &baseline.windows,
+            &baseline.unattributed_windows,
+        ),
     });
     if system.identity(identity.hwnd) != Some(identity) {
         return Err(());
@@ -805,22 +1095,35 @@ fn trusted_broker(
     observe_broker(system, baseline, identity) == Ok(true)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScanError {
+    Failed,
+    // A visible broker host whose caption is not assigned yet: neither a
+    // candidate nor evidence that no broker-like window exists.
+    Pending,
+}
+
 fn broker_candidates(
     system: &mut impl ForegroundSystem,
     baseline: &BrokerBaseline,
-) -> Result<Vec<WindowIdentity>, ()> {
+) -> Result<Vec<WindowIdentity>, ScanError> {
     let mut candidates = Vec::new();
-    for hwnd in system.windows()? {
+    let mut pending = false;
+    for hwnd in system.windows().map_err(|()| ScanError::Failed)? {
         if !system.visible(hwnd) {
             continue;
         }
         // Positive ordinary class evidence avoids slow process queries. Unknown
         // class/title is conservative: it cannot prove an unrelated window.
-        let class = system.class(hwnd).ok_or(())?;
+        let class = system.class(hwnd).ok_or(ScanError::Failed)?;
         if !class.eq_ignore_ascii_case("Credential Dialog Xaml Host") {
             continue;
         }
-        let title = system.title(hwnd).ok_or(())?;
+        let title = system.title(hwnd).ok_or(ScanError::Failed)?;
+        if title.is_empty() {
+            pending = true;
+            continue;
+        }
         if !title.trim().eq_ignore_ascii_case("Windows Security")
             && !title
                 .trim()
@@ -828,14 +1131,19 @@ fn broker_candidates(
         {
             continue;
         }
-        let identity = system.identity(hwnd).ok_or(())?;
-        if observe_broker(system, baseline, identity)? {
+        let identity = system.identity(hwnd).ok_or(ScanError::Failed)?;
+        if observe_broker(system, baseline, identity).map_err(|()| ScanError::Failed)? {
             candidates.push(identity);
         }
+    }
+    system.after_broker_candidate_scan();
+    if pending {
+        return Err(ScanError::Pending);
     }
     Ok(candidates)
 }
 
+#[cfg(test)]
 fn capture_broker(
     system: &mut impl ForegroundSystem,
     baseline: Arc<BrokerBaseline>,
@@ -858,29 +1166,6 @@ fn capture_broker(
     })
 }
 
-fn record_broker(
-    system: &mut impl ForegroundSystem,
-    baseline: Arc<BrokerBaseline>,
-    candidate: WindowIdentity,
-    cancelled: &AtomicBool,
-    accepted: &Mutex<Option<AcceptedBroker>>,
-) -> MonitorStop {
-    if cancelled.load(Ordering::Acquire) {
-        return MonitorStop::Cancelled;
-    }
-    let Some(broker) = capture_broker(system, baseline, candidate) else {
-        return MonitorStop::CandidateChanged;
-    };
-    let Ok(mut result) = accepted.lock() else {
-        return MonitorStop::ChannelFailed;
-    };
-    if cancelled.load(Ordering::Acquire) {
-        return MonitorStop::Cancelled;
-    }
-    *result = Some(broker);
-    MonitorStop::Accepted
-}
-
 #[derive(Default)]
 struct MonitorPolicy {
     stopped: bool,
@@ -888,6 +1173,7 @@ struct MonitorPolicy {
     passive_safe: bool,
 }
 impl MonitorPolicy {
+    #[cfg(test)]
     fn observe(
         &mut self,
         system: &mut impl ForegroundSystem,
@@ -896,14 +1182,39 @@ impl MonitorPolicy {
         cancelled: &AtomicBool,
         accepted: &Mutex<Option<AcceptedBroker>>,
     ) -> bool {
+        let api_returned = AtomicBool::new(false);
+        let terminal_gate = MonitorTerminal::default();
+        self.observe_with_api_return(
+            system,
+            owner,
+            baseline,
+            cancelled,
+            &api_returned,
+            &terminal_gate,
+            accepted,
+        )
+    }
+
+    fn observe_with_api_return(
+        &mut self,
+        system: &mut impl ForegroundSystem,
+        owner: isize,
+        baseline: Arc<BrokerBaseline>,
+        cancelled: &AtomicBool,
+        api_returned: &AtomicBool,
+        terminal_gate: &MonitorTerminal,
+        accepted: &Mutex<Option<AcceptedBroker>>,
+    ) -> bool {
         if !self.stopped {
             self.reason = monitor_observe_reason(
                 system,
                 owner,
                 baseline,
                 cancelled,
-                accepted,
+                api_returned,
+                terminal_gate,
                 &mut self.passive_safe,
+                accepted,
             );
             self.stopped = self.reason.is_some();
         }
@@ -919,7 +1230,17 @@ fn monitor_observe(
     cancelled: &AtomicBool,
     accepted: &Mutex<Option<AcceptedBroker>>,
 ) -> bool {
-    monitor_observe_reason(system, owner, baseline, cancelled, accepted, &mut false).is_some()
+    monitor_observe_reason(
+        system,
+        owner,
+        baseline,
+        cancelled,
+        &AtomicBool::new(false),
+        &MonitorTerminal::default(),
+        &mut false,
+        accepted,
+    )
+    .is_some()
 }
 
 fn monitor_observe_reason(
@@ -927,17 +1248,34 @@ fn monitor_observe_reason(
     owner: isize,
     baseline: Arc<BrokerBaseline>,
     cancelled: &AtomicBool,
-    accepted: &Mutex<Option<AcceptedBroker>>,
+    api_returned: &AtomicBool,
+    terminal_gate: &MonitorTerminal,
     passive_safe: &mut bool,
+    accepted: &Mutex<Option<AcceptedBroker>>,
 ) -> Option<MonitorStop> {
+    if api_returned.load(Ordering::Acquire) {
+        return Some(MonitorStop::ApiReturned);
+    }
     if cancelled.load(Ordering::Acquire) {
         *passive_safe = false;
         return Some(MonitorStop::Cancelled);
     }
-    let Ok(candidates) = broker_candidates(system, &baseline) else {
-        *passive_safe = false;
-        return Some(MonitorStop::Incomplete);
+    let candidates = match broker_candidates(system, &baseline) {
+        Ok(candidates) => candidates,
+        // An untitled broker host is still being created: keep polling, but
+        // this round proves neither a candidate nor broker absence.
+        Err(ScanError::Pending) => {
+            *passive_safe = false;
+            return None;
+        }
+        Err(ScanError::Failed) => {
+            *passive_safe = false;
+            return Some(MonitorStop::Incomplete);
+        }
     };
+    if api_returned.load(Ordering::Acquire) {
+        return Some(MonitorStop::ApiReturned);
+    }
     if cancelled.load(Ordering::Acquire) {
         *passive_safe = false;
         return Some(MonitorStop::Cancelled);
@@ -946,74 +1284,184 @@ fn monitor_observe_reason(
         *passive_safe = false;
         return Some(MonitorStop::Ambiguous);
     }
-    let Some(candidate) = select_unique_candidate(&candidates) else {
+    if candidates.is_empty() {
         // Complete absence is policy evidence; terminal disqualification cannot
         // be undone by a later disappearing competitor or diagnostic label.
+        let Ok(_terminal_guard) = terminal_gate.lock() else {
+            *passive_safe = false;
+            return Some(MonitorStop::ChannelFailed);
+        };
+        if api_returned.load(Ordering::Acquire) {
+            return Some(MonitorStop::ApiReturned);
+        }
+        if cancelled.load(Ordering::Acquire) {
+            *passive_safe = false;
+            return Some(MonitorStop::Cancelled);
+        }
         let foreground = system.foreground();
+        if api_returned.load(Ordering::Acquire) {
+            return Some(MonitorStop::ApiReturned);
+        }
+        if cancelled.load(Ordering::Acquire) {
+            *passive_safe = false;
+            return Some(MonitorStop::Cancelled);
+        }
         *passive_safe = foreground == owner || foreground == 0;
         return (foreground != owner).then_some(MonitorStop::ForegroundLost);
-    };
+    }
     *passive_safe = false;
-    let foreground = system.foreground();
-    if foreground == candidate.hwnd {
-        return Some(record_broker(
-            system, baseline, candidate, cancelled, accepted,
-        ));
-    }
-    if !should_attempt_dialog_activation(
-        owner,
-        candidate.hwnd,
-        foreground,
-        cancelled.load(Ordering::Acquire),
-    ) {
-        return Some(if cancelled.load(Ordering::Acquire) {
-            MonitorStop::Cancelled
-        } else {
-            MonitorStop::ForegroundLost
-        });
-    }
-    if broker_candidates(system, &baseline)
-        .ok()
-        .and_then(|c| select_unique_candidate(&c))
-        != Some(candidate)
-    {
-        return Some(MonitorStop::CandidateChanged);
+    if api_returned.load(Ordering::Acquire) {
+        return Some(MonitorStop::ApiReturned);
     }
     if cancelled.load(Ordering::Acquire) {
         return Some(MonitorStop::Cancelled);
     }
-    if system.identity(candidate.hwnd) != Some(candidate) {
+    let candidate = candidates[0];
+    let initial_foreground = system.foreground();
+    if api_returned.load(Ordering::Acquire) {
+        return Some(MonitorStop::ApiReturned);
+    }
+    if initial_foreground != owner && initial_foreground != candidate.hwnd {
+        return Some(MonitorStop::ForegroundLost);
+    }
+
+    // Re-scan after the initial focus sample so the final identity/visibility
+    // checks and foreground guard sit directly before the one allowed attempt.
+    let revalidated = match broker_candidates(system, &baseline) {
+        Ok(candidates) => candidates,
+        Err(ScanError::Pending) => return Some(MonitorStop::Ambiguous),
+        Err(ScanError::Failed) => return Some(MonitorStop::Incomplete),
+    };
+    if api_returned.load(Ordering::Acquire) {
+        return Some(MonitorStop::ApiReturned);
+    }
+    if revalidated.len() > 1 {
+        return Some(MonitorStop::Ambiguous);
+    }
+    if select_unique_candidate(&revalidated) != Some(candidate)
+        || system.identity(candidate.hwnd) != Some(candidate)
+        || !system.visible(candidate.hwnd)
+    {
         return Some(MonitorStop::CandidateChanged);
     }
-    if !should_attempt_dialog_activation(
-        owner,
-        candidate.hwnd,
-        system.foreground(),
-        cancelled.load(Ordering::Acquire),
-    ) {
-        return Some(if cancelled.load(Ordering::Acquire) {
-            MonitorStop::Cancelled
-        } else {
-            MonitorStop::ForegroundLost
-        });
+    if api_returned.load(Ordering::Acquire) {
+        return Some(MonitorStop::ApiReturned);
     }
-    system.activate(candidate.hwnd);
-    if system.foreground() == candidate.hwnd {
-        Some(record_broker(
-            system, baseline, candidate, cancelled, accepted,
-        ))
-    } else {
-        Some(MonitorStop::ActivationFailed)
+    if cancelled.load(Ordering::Acquire) {
+        return Some(MonitorStop::Cancelled);
     }
-}
 
-fn should_attempt_dialog_activation(
-    owner: isize,
-    dialog: isize,
-    foreground: isize,
-    cancelled: bool,
-) -> bool {
-    !cancelled && dialog != owner && foreground == owner
+    let mut activated = false;
+    if initial_foreground != candidate.hwnd {
+        if !baseline.local_console {
+            return Some(MonitorStop::NonConsoleSession);
+        }
+        // The final phase CAS decides whether this one-shot application-level
+        // activation may be attempted; it cannot make the Windows call atomic.
+        let Ok(_terminal_guard) = terminal_gate.lock() else {
+            return Some(MonitorStop::ChannelFailed);
+        };
+        if api_returned.load(Ordering::Acquire) {
+            return Some(MonitorStop::ApiReturned);
+        }
+        if cancelled.load(Ordering::Acquire) {
+            return Some(MonitorStop::Cancelled);
+        }
+        if system.foreground() != owner {
+            return Some(MonitorStop::ForegroundLost);
+        }
+        match system.activate_if_foreground(
+            &baseline,
+            owner,
+            candidate,
+            terminal_gate,
+            cancelled,
+            api_returned,
+        ) {
+            ActivationResult::Activated => activated = true,
+            ActivationResult::FocusLost => return Some(MonitorStop::ForegroundLost),
+            ActivationResult::CandidateChanged => return Some(MonitorStop::CandidateChanged),
+            ActivationResult::Ambiguous => return Some(MonitorStop::Ambiguous),
+            ActivationResult::Incomplete => return Some(MonitorStop::Incomplete),
+            ActivationResult::NonConsoleSession => return Some(MonitorStop::NonConsoleSession),
+            ActivationResult::ApiReturned => return Some(MonitorStop::ApiReturned),
+            ActivationResult::Cancelled => return Some(MonitorStop::Cancelled),
+            ActivationResult::Failed => return Some(MonitorStop::ActivationFailed),
+        }
+        if api_returned.load(Ordering::Acquire) {
+            return Some(MonitorStop::ApiReturned);
+        }
+        if cancelled.load(Ordering::Acquire) {
+            return Some(MonitorStop::Cancelled);
+        }
+    }
+
+    if api_returned.load(Ordering::Acquire) {
+        return Some(MonitorStop::ApiReturned);
+    }
+    if cancelled.load(Ordering::Acquire) {
+        return Some(MonitorStop::Cancelled);
+    }
+    let Ok(_terminal_guard) = terminal_gate.lock() else {
+        return Some(MonitorStop::ChannelFailed);
+    };
+    let Ok(mut accepted) = accepted.lock() else {
+        return Some(MonitorStop::ChannelFailed);
+    };
+    system.after_monitor_publish_check();
+    if api_returned.load(Ordering::Acquire) {
+        return Some(MonitorStop::ApiReturned);
+    }
+    if cancelled.load(Ordering::Acquire) {
+        return Some(MonitorStop::Cancelled);
+    }
+    let final_candidates = match broker_candidates(system, &baseline) {
+        Ok(candidates) => candidates,
+        Err(ScanError::Pending) => return Some(MonitorStop::Ambiguous),
+        Err(ScanError::Failed) => return Some(MonitorStop::Incomplete),
+    };
+    if api_returned.load(Ordering::Acquire) {
+        return Some(MonitorStop::ApiReturned);
+    }
+    if cancelled.load(Ordering::Acquire) {
+        return Some(MonitorStop::Cancelled);
+    }
+    if final_candidates.len() > 1 {
+        return Some(MonitorStop::Ambiguous);
+    }
+    if select_unique_candidate(&final_candidates) != Some(candidate)
+        || system.identity(candidate.hwnd) != Some(candidate)
+        || !system.visible(candidate.hwnd)
+    {
+        return Some(MonitorStop::CandidateChanged);
+    }
+    let final_foreground = system.foreground();
+    if api_returned.load(Ordering::Acquire) {
+        return Some(MonitorStop::ApiReturned);
+    }
+    if cancelled.load(Ordering::Acquire) {
+        return Some(MonitorStop::Cancelled);
+    }
+    if final_foreground != candidate.hwnd {
+        return Some(MonitorStop::ForegroundLost);
+    }
+    if let Err(reason) = terminal_gate.claim_publication(activated) {
+        return Some(reason);
+    }
+    if api_returned.load(Ordering::Acquire) {
+        terminal_gate.abort_publication(MonitorStop::ApiReturned);
+        return Some(MonitorStop::ApiReturned);
+    }
+    if cancelled.load(Ordering::Acquire) {
+        terminal_gate.abort_publication(MonitorStop::Cancelled);
+        return Some(MonitorStop::Cancelled);
+    }
+    *accepted = Some(AcceptedBroker {
+        identity: candidate,
+        baseline,
+    });
+    terminal_gate.finish_publication();
+    Some(MonitorStop::CandidateForeground)
 }
 
 fn focus_monitor_timeout() -> Duration {
@@ -1084,6 +1532,7 @@ struct BaselineCaptureError {
 
 struct BaselineWindowSnapshot {
     identities: HashSet<WindowIdentity>,
+    unattributed: HashSet<(isize, u32, u32)>,
     attempts: usize,
 }
 
@@ -1105,6 +1554,7 @@ fn baseline_window_identities(
         };
 
         let mut identities = HashSet::with_capacity(windows.len());
+        let mut unattributed = HashSet::new();
         let mut identity_failed = false;
         for hwnd in windows {
             match system.identity(hwnd) {
@@ -1112,6 +1562,15 @@ fn baseline_window_identities(
                     identities.insert(identity);
                 }
                 None => {
+                    // Owner ids exist but the session is unreadable (e.g. dwm.exe):
+                    // keep the window in the baseline so it can never become new.
+                    if let Some((pid, tid)) = system
+                        .owner_ids(hwnd)
+                        .filter(|&(pid, tid)| pid != 0 && tid != 0)
+                    {
+                        unattributed.insert((hwnd, pid, tid));
+                        continue;
+                    }
                     identity_failed = true;
                     last_failure = BaselineCaptureStage::WindowIdentity;
                     break;
@@ -1121,6 +1580,7 @@ fn baseline_window_identities(
         if !identity_failed {
             return Ok(BaselineWindowSnapshot {
                 identities,
+                unattributed,
                 attempts: attempt,
             });
         }
@@ -1133,39 +1593,6 @@ fn baseline_window_identities(
         stage: last_failure,
         attempts: BASELINE_CAPTURE_MAX_ATTEMPTS,
     })
-}
-
-fn credential_broker_process_ids() -> Option<HashSet<u32>> {
-    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
-    if snapshot.is_null() || snapshot as isize == -1 {
-        return None;
-    }
-    let _snapshot = ProcessHandle(snapshot);
-    let mut entry = PROCESSENTRY32W {
-        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
-        ..Default::default()
-    };
-    if unsafe { Process32FirstW(snapshot, &mut entry) } == 0 {
-        return None;
-    }
-
-    let mut process_ids = HashSet::new();
-    loop {
-        let name_length = entry
-            .szExeFile
-            .iter()
-            .position(|character| *character == 0)
-            .unwrap_or(entry.szExeFile.len());
-        if String::from_utf16_lossy(&entry.szExeFile[..name_length])
-            .eq_ignore_ascii_case("CredentialUIBroker.exe")
-        {
-            process_ids.insert(entry.th32ProcessID);
-        }
-        if unsafe { Process32NextW(snapshot, &mut entry) } == 0 {
-            break;
-        }
-    }
-    Some(process_ids)
 }
 
 fn system_directory() -> Option<String> {
@@ -1209,8 +1636,15 @@ fn process_image_path(process_id: u32) -> Option<String> {
 
 fn window_text(hwnd: HWND) -> Option<String> {
     let mut buffer = [0u16; 256];
+    unsafe { SetLastError(0) };
     let length = unsafe { GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32) };
-    if length <= 0 || length as usize >= buffer.len() - 1 {
+    if length == 0 {
+        // A zero length is an empty caption only when no error was reported
+        // and the window still exists; otherwise the query failed.
+        let error = unsafe { GetLastError() };
+        return (error == 0 && unsafe { IsWindow(hwnd) } != 0).then(String::new);
+    }
+    if length < 0 || length as usize >= buffer.len() - 1 {
         None
     } else {
         Some(String::from_utf16_lossy(&buffer[..length as usize]))
@@ -1230,6 +1664,7 @@ fn window_class(hwnd: HWND) -> Option<String> {
 struct MonitorWorkerChannels<'a> {
     cancelled: &'a AtomicBool,
     api_returned: &'a AtomicBool,
+    terminal_gate: &'a MonitorTerminal,
     armed: &'a AtomicBool,
     accepted: &'a Mutex<Option<AcceptedBroker>>,
     passive_safe: &'a AtomicBool,
@@ -1243,14 +1678,17 @@ fn run_monitor_worker(
     channels: MonitorWorkerChannels<'_>,
 ) {
     while !channels.armed.load(Ordering::Acquire) {
+        if channels.api_returned.load(Ordering::Acquire) {
+            channels.passive_safe.store(false, Ordering::Release);
+            if let Ok(mut reason) = channels.reason.lock() {
+                *reason = Some(MonitorStop::ApiReturnedBeforeArm);
+            }
+            return;
+        }
         if channels.cancelled.load(Ordering::Acquire) {
             channels.passive_safe.store(false, Ordering::Release);
             if let Ok(mut reason) = channels.reason.lock() {
-                *reason = Some(if channels.api_returned.load(Ordering::Acquire) {
-                    MonitorStop::ApiReturnedBeforeArm
-                } else {
-                    MonitorStop::CancelledBeforeArm
-                });
+                *reason = Some(MonitorStop::CancelledBeforeArm);
             }
             return;
         }
@@ -1258,17 +1696,35 @@ fn run_monitor_worker(
     }
     let deadline = system.monotonic() + focus_monitor_timeout();
     let mut policy = MonitorPolicy::default();
-    while !channels.cancelled.load(Ordering::Acquire) && system.monotonic() < deadline {
-        let terminal = policy.observe(
+    while !channels.cancelled.load(Ordering::Acquire)
+        && !channels.api_returned.load(Ordering::Acquire)
+        && system.monotonic() < deadline
+    {
+        let terminal = policy.observe_with_api_return(
             system,
             owner,
             Arc::clone(&baseline),
             channels.cancelled,
+            channels.api_returned,
+            channels.terminal_gate,
             channels.accepted,
         );
-        channels
-            .passive_safe
-            .store(policy.passive_safe, Ordering::Release);
+        if !policy.passive_safe {
+            channels.passive_safe.store(false, Ordering::Release);
+        } else if !terminal {
+            let Ok(_terminal_guard) = channels.terminal_gate.lock() else {
+                channels.passive_safe.store(false, Ordering::Release);
+                if let Ok(mut reason) = channels.reason.lock() {
+                    *reason = Some(MonitorStop::ChannelFailed);
+                }
+                return;
+            };
+            if !channels.api_returned.load(Ordering::Acquire)
+                && !channels.cancelled.load(Ordering::Acquire)
+            {
+                channels.passive_safe.store(true, Ordering::Release);
+            }
+        }
         if terminal {
             let terminal_reason = if policy.reason == Some(MonitorStop::Cancelled)
                 && channels.api_returned.load(Ordering::Acquire)
@@ -1284,13 +1740,11 @@ fn run_monitor_worker(
         }
         system.wait(Duration::from_millis(100));
     }
-    let reason = if channels.cancelled.load(Ordering::Acquire) {
-        if channels.api_returned.load(Ordering::Acquire) {
-            MonitorStop::ApiReturned
-        } else {
-            channels.passive_safe.store(false, Ordering::Release);
-            MonitorStop::Cancelled
-        }
+    let reason = if channels.api_returned.load(Ordering::Acquire) {
+        MonitorStop::ApiReturned
+    } else if channels.cancelled.load(Ordering::Acquire) {
+        channels.passive_safe.store(false, Ordering::Release);
+        MonitorStop::Cancelled
     } else {
         channels.passive_safe.store(false, Ordering::Release);
         MonitorStop::Deadline
@@ -1300,9 +1754,36 @@ fn run_monitor_worker(
     }
 }
 
+fn request_monitor_cancellation(terminal_gate: &MonitorTerminal, cancelled: &AtomicBool) {
+    cancelled.store(true, Ordering::Release);
+    terminal_gate.mark_cancelled();
+    drop(terminal_gate.lock());
+}
+
+fn mark_monitor_api_returned(
+    terminal_gate: &MonitorTerminal,
+    cancelled: &AtomicBool,
+    api_returned: &AtomicBool,
+) -> bool {
+    if !cancelled.load(Ordering::Acquire) {
+        api_returned.store(true, Ordering::Release);
+        terminal_gate.mark_api_returned();
+    }
+    match terminal_gate.lock() {
+        Ok(_guard) => cancelled.load(Ordering::Acquire),
+        Err(_) => {
+            cancelled.store(true, Ordering::Release);
+            terminal_gate.mark_cancelled();
+            api_returned.store(true, Ordering::Release);
+            true
+        }
+    }
+}
+
 struct WebAuthnForegroundMonitor {
     cancelled: Arc<AtomicBool>,
     api_returned: Arc<AtomicBool>,
+    terminal_gate: Arc<MonitorTerminal>,
     armed: Arc<AtomicBool>,
     accepted: Arc<Mutex<Option<AcceptedBroker>>>,
     worker: Option<JoinHandle<()>>,
@@ -1314,7 +1795,7 @@ struct WebAuthnForegroundMonitor {
 
 impl WebAuthnForegroundMonitor {
     fn stop(&mut self) {
-        self.cancelled.store(true, Ordering::Release);
+        request_monitor_cancellation(&self.terminal_gate, &self.cancelled);
         if let Some(worker) = self.worker.take() {
             if worker.join().is_err() {
                 self.passive_safe.store(false, Ordering::Release);
@@ -1352,10 +1833,8 @@ impl WebAuthnForegroundMonitor {
     fn finish_observation(mut self) -> BrokerObservation {
         // Only this native-call-return path distinguishes normal worker shutdown.
         // Cancellation already observed before it remains permanently disqualified.
-        let was_cancelled = self.cancelled.load(Ordering::Acquire);
-        if !was_cancelled {
-            self.api_returned.store(true, Ordering::Release);
-        }
+        let was_cancelled =
+            mark_monitor_api_returned(&self.terminal_gate, &self.cancelled, &self.api_returned);
         self.stop();
         if was_cancelled {
             if let Ok(mut accepted) = self.accepted.lock() {
@@ -1381,6 +1860,9 @@ impl WebAuthnForegroundMonitor {
             log::warn!("[WebAuthN-focus] could not determine the current Windows session");
             None
         })?;
+        let session_evidence = NativeForegroundSystem
+            .native_session(current_session, Instant::now() + Duration::from_secs(2));
+        let local_console = is_local_console_session(session_evidence);
         let baseline_snapshot = match baseline_window_identities(&mut NativeForegroundSystem) {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -1399,22 +1881,21 @@ impl WebAuthnForegroundMonitor {
         };
         let baseline_attempts = baseline_snapshot.attempts;
         let baseline_windows = baseline_snapshot.identities;
-        let baseline_broker_processes = credential_broker_process_ids().or_else(|| {
-            log::warn!("[WebAuthN-focus] could not snapshot existing broker processes");
-            None
-        })?;
         log::info!(
-            "[WebAuthN-focus] prepared operation={} session={} baseline_windows={} baseline_attempts={} baseline_broker_processes={}",
+            "[WebAuthN-focus] prepared operation={} session={} local_console={} baseline_windows={} baseline_unattributed={} baseline_attempts={}",
             match operation { Operation::MakeCredential => "MakeCredential", Operation::GetAssertion => "GetAssertion" },
             current_session,
+            local_console,
             baseline_windows.len(),
+            baseline_snapshot.unattributed.len(),
             baseline_attempts,
-            baseline_broker_processes.len(),
         );
 
         let cancelled = Arc::new(AtomicBool::new(false));
+        let terminal_gate = Arc::new(MonitorTerminal::default());
         let armed = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
+        let worker_terminal_gate = Arc::clone(&terminal_gate);
         let api_returned = Arc::new(AtomicBool::new(false));
         let worker_api_returned = Arc::clone(&api_returned);
         let worker_armed = Arc::clone(&armed);
@@ -1427,8 +1908,9 @@ impl WebAuthnForegroundMonitor {
         let baseline = Arc::new(BrokerBaseline {
             system_directory: system_directory.clone(),
             session: current_session,
+            local_console,
             windows: baseline_windows.clone(),
-            processes: baseline_broker_processes.clone(),
+            unattributed_windows: baseline_snapshot.unattributed,
         });
         let owner_hwnd_value = owner_hwnd as isize;
         let worker = match thread::Builder::new()
@@ -1441,6 +1923,7 @@ impl WebAuthnForegroundMonitor {
                     MonitorWorkerChannels {
                         cancelled: &worker_cancelled,
                         api_returned: &worker_api_returned,
+                        terminal_gate: &worker_terminal_gate,
                         armed: &worker_armed,
                         accepted: &worker_accepted,
                         passive_safe: &worker_passive_safe,
@@ -1458,6 +1941,7 @@ impl WebAuthnForegroundMonitor {
         Some(Self {
             cancelled,
             api_returned,
+            terminal_gate,
             armed,
             accepted,
             worker: Some(worker),
@@ -2097,15 +2581,38 @@ mod tests {
         windows: Vec<TestWindow>,
         foreground: isize,
         activation_succeeds: bool,
+        activation_pause: Option<GatePause>,
+        final_activation_transition: Option<TerminalTransition>,
+        publish_pause: Option<GatePause>,
+        focus_change_before_activation: Option<isize>,
+        focus_change_after_activation_claim: Option<isize>,
+        focus_change_before_publish: Option<isize>,
+        candidate_reuse_before_activation: Option<WindowIdentity>,
+        candidate_reuse_after_activation_claim: Option<WindowIdentity>,
+        competing_window_after_activation_claim: Option<TestWindow>,
+        api_returned_before_activation: Option<Arc<AtomicBool>>,
+        cancelled_before_activation: Option<Arc<AtomicBool>>,
+        api_returned_after_activation_claim: Option<Arc<AtomicBool>>,
+        cancelled_after_activation_claim: Option<Arc<AtomicBool>>,
+        remove_window_after_broker_scan: Option<isize>,
+        window_after_broker_scan: Option<(usize, TestWindow)>,
+        // The broker host is visible before Windows assigns its caption.
+        empty_title_reads: Option<(isize, usize)>,
+        title_unavailable_hwnd: Option<isize>,
+        broker_candidate_scans: usize,
         foreground_sequence: std::collections::VecDeque<isize>,
-        restore_succeeds: bool,
+        foreground_reads: usize,
+        api_returned_on_foreground: Option<(usize, Arc<AtomicBool>)>,
         broker_path_reads: usize,
         owner_change_on_broker_path: Option<(usize, WindowIdentity)>,
         enumeration_failed: bool,
         transient_enumeration_failures: usize,
         transient_identity_failures: std::collections::VecDeque<isize>,
         window_on_transient_identity_failure: Option<TestWindow>,
+        transient_owner_ids_failure: Option<isize>,
         inaccessible_hwnd: Option<isize>,
+        // Owner ids are readable but the session query fails (e.g. dwm.exe).
+        session_unavailable_hwnd: Option<isize>,
         unknown_metadata: bool,
         cancel_on_path: Option<Arc<AtomicBool>>,
         inaccessible_session: Option<u32>,
@@ -2134,6 +2641,26 @@ mod tests {
         wait_until_stopped: Option<Arc<AtomicBool>>,
         native_evidence: NativeSessionEvidence,
         trace: Vec<&'static str>,
+    }
+
+    struct GatePause {
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+        terminal_flag: Arc<AtomicBool>,
+        observed_terminal: Arc<AtomicBool>,
+    }
+
+    impl GatePause {
+        fn wait_and_sample(self) {
+            self.entered.send(()).unwrap();
+            self.release
+                .recv_timeout(Duration::from_secs(5))
+                .expect("test synchronization timed out");
+            self.observed_terminal.store(
+                self.terminal_flag.load(Ordering::Acquire),
+                Ordering::Release,
+            );
+        }
     }
 
     impl TestSystem {
@@ -2199,11 +2726,15 @@ mod tests {
         fn identity(&mut self, hwnd: isize) -> Option<WindowIdentity> {
             self.trace.push("identity");
             self.identity_hwnds.push(hwnd);
-            if self.inaccessible_hwnd == Some(hwnd) {
+            if self.inaccessible_hwnd == Some(hwnd)
+                || self.session_unavailable_hwnd == Some(hwnd)
+            {
                 return None;
             }
             if self.transient_identity_failures.front() == Some(&hwnd) {
                 self.transient_identity_failures.pop_front();
+                // A transient identity failure also hides the owner ids for this read.
+                self.transient_owner_ids_failure = Some(hwnd);
                 if let Some(window) = self.window_on_transient_identity_failure.take() {
                     self.windows.push(window);
                 }
@@ -2223,6 +2754,12 @@ mod tests {
         }
         fn foreground(&mut self) -> isize {
             self.trace.push("foreground");
+            self.foreground_reads += 1;
+            if let Some((read, returned)) = &self.api_returned_on_foreground {
+                if *read == self.foreground_reads {
+                    returned.store(true, Ordering::Release);
+                }
+            }
             if let Some(hwnd) = self.foreground_sequence.pop_front() {
                 self.foreground = hwnd;
             }
@@ -2231,6 +2768,10 @@ mod tests {
         fn owner_ids(&mut self, hwnd: isize) -> Option<(u32, u32)> {
             self.trace.push("owner-ids");
             if self.inaccessible_hwnd == Some(hwnd) {
+                return None;
+            }
+            if self.transient_owner_ids_failure == Some(hwnd) {
+                self.transient_owner_ids_failure = None;
                 return None;
             }
             self.window(hwnd)
@@ -2322,8 +2863,14 @@ mod tests {
             old_path
         }
         fn title(&mut self, hwnd: isize) -> Option<String> {
-            if self.unknown_metadata && hwnd == 3 {
+            if self.unknown_metadata && hwnd == 3 || self.title_unavailable_hwnd == Some(hwnd) {
                 return None;
+            }
+            if let Some((pending, reads)) = &mut self.empty_title_reads {
+                if *pending == hwnd && *reads > 0 {
+                    *reads -= 1;
+                    return self.window(hwnd).map(|_| String::new());
+                }
             }
             self.window(hwnd).map(|w| w.title.clone())
         }
@@ -2336,24 +2883,101 @@ mod tests {
         fn current_pid(&mut self) -> u32 {
             self.test_pid
         }
-        fn restore(&mut self, hwnd: isize) {
-            self.trace.push("restore");
-            if self.restore_succeeds {
-                let window = self
-                    .windows
-                    .iter_mut()
-                    .find(|w| w.identity.hwnd == hwnd)
-                    .unwrap();
-                window.minimized = false;
-                window.maximized = false;
-            }
-        }
         fn activate(&mut self, hwnd: isize) -> bool {
             self.trace.push("activate");
             if self.activation_succeeds {
                 self.foreground = hwnd;
             }
+            if let Some(pause) = self.activation_pause.take() {
+                pause.wait_and_sample();
+            }
             self.activation_succeeds
+        }
+        fn after_broker_candidate_scan(&mut self) {
+            self.broker_candidate_scans += 1;
+            if self.broker_candidate_scans == 1 {
+                if let Some(hwnd) = self.remove_window_after_broker_scan.take() {
+                    self.windows.retain(|window| window.identity.hwnd != hwnd);
+                }
+            }
+            if self
+                .window_after_broker_scan
+                .as_ref()
+                .is_some_and(|(scan, _)| *scan == self.broker_candidate_scans)
+            {
+                let (_, window) = self.window_after_broker_scan.take().unwrap();
+                self.windows.push(window);
+            }
+        }
+        fn before_activation_guard(&mut self) {
+            if let Some(hwnd) = self.focus_change_before_activation.take() {
+                self.foreground = hwnd;
+            }
+            if let Some(identity) = self.candidate_reuse_before_activation.take() {
+                if let Some(window) = self
+                    .windows
+                    .iter_mut()
+                    .find(|window| window.identity.hwnd == identity.hwnd)
+                {
+                    window.identity = identity;
+                }
+            }
+            if let Some(api_returned) = self.api_returned_before_activation.take() {
+                api_returned.store(true, Ordering::Release);
+            }
+            if let Some(cancelled) = self.cancelled_before_activation.take() {
+                cancelled.store(true, Ordering::Release);
+            }
+        }
+        fn after_activation_claim(&mut self) {
+            if let Some(hwnd) = self.focus_change_after_activation_claim.take() {
+                self.foreground = hwnd;
+            }
+            if let Some(identity) = self.candidate_reuse_after_activation_claim.take() {
+                if let Some(window) = self
+                    .windows
+                    .iter_mut()
+                    .find(|window| window.identity.hwnd == identity.hwnd)
+                {
+                    window.identity = identity;
+                }
+            }
+            if let Some(window) = self.competing_window_after_activation_claim.take() {
+                self.windows.push(window);
+            }
+            if let Some(api_returned) = self.api_returned_after_activation_claim.take() {
+                api_returned.store(true, Ordering::Release);
+            }
+            if let Some(cancelled) = self.cancelled_after_activation_claim.take() {
+                cancelled.store(true, Ordering::Release);
+            }
+        }
+        fn before_final_activation_call(
+            &mut self,
+            terminal: &MonitorTerminal,
+            cancelled: &AtomicBool,
+            api_returned: &AtomicBool,
+        ) {
+            if let Some(transition) = self.final_activation_transition.take() {
+                match transition {
+                    TerminalTransition::ApiReturned => {
+                        api_returned.store(true, Ordering::Release);
+                        terminal.mark_api_returned();
+                    }
+                    TerminalTransition::Cancelled => {
+                        cancelled.store(true, Ordering::Release);
+                        terminal.mark_cancelled();
+                    }
+                }
+            }
+        }
+        fn after_monitor_publish_check(&mut self) {
+            if let Some(hwnd) = self.focus_change_before_publish.take() {
+                self.foreground = hwnd;
+            }
+            if let Some(pause) = self.publish_pause.take() {
+                pause.wait_and_sample();
+            }
         }
     }
 
@@ -2400,15 +3024,36 @@ mod tests {
             ],
             foreground: broker.hwnd,
             activation_succeeds: true,
+            activation_pause: None,
+            final_activation_transition: None,
+            publish_pause: None,
+            focus_change_before_activation: None,
+            focus_change_after_activation_claim: None,
+            focus_change_before_publish: None,
+            candidate_reuse_before_activation: None,
+            candidate_reuse_after_activation_claim: None,
+            competing_window_after_activation_claim: None,
+            api_returned_before_activation: None,
+            cancelled_before_activation: None,
+            api_returned_after_activation_claim: None,
+            cancelled_after_activation_claim: None,
+            remove_window_after_broker_scan: None,
+            window_after_broker_scan: None,
+            empty_title_reads: None,
+            title_unavailable_hwnd: None,
+            broker_candidate_scans: 0,
             foreground_sequence: Default::default(),
-            restore_succeeds: true,
+            foreground_reads: 0,
+            api_returned_on_foreground: None,
             broker_path_reads: 0,
             owner_change_on_broker_path: None,
             enumeration_failed: false,
             transient_enumeration_failures: 0,
             transient_identity_failures: Default::default(),
             window_on_transient_identity_failure: None,
+            transient_owner_ids_failure: None,
             inaccessible_hwnd: None,
+            session_unavailable_hwnd: None,
             unknown_metadata: false,
             cancel_on_path: None,
             inaccessible_session: None,
@@ -2441,10 +3086,274 @@ mod tests {
         let baseline = Arc::new(BrokerBaseline {
             system_directory: r"C:\Windows\System32".into(),
             session: 2,
+            // Monitor-policy tests model the specifically authorized local Console path.
+            local_console: true,
             windows: HashSet::from([owner]),
-            processes: HashSet::new(),
+            unattributed_windows: HashSet::new(),
         });
         (system, baseline, owner, broker)
+    }
+
+    #[derive(Clone, Copy)]
+    enum TerminalTransition {
+        ApiReturned,
+        Cancelled,
+    }
+
+    fn apply_terminal_transition(
+        transition: TerminalTransition,
+        terminal_gate: &MonitorTerminal,
+        cancelled: &AtomicBool,
+        api_returned: &AtomicBool,
+    ) {
+        match transition {
+            TerminalTransition::ApiReturned => {
+                assert!(!mark_monitor_api_returned(
+                    terminal_gate,
+                    cancelled,
+                    api_returned
+                ));
+            }
+            TerminalTransition::Cancelled => {
+                request_monitor_cancellation(terminal_gate, cancelled);
+            }
+        }
+    }
+
+    fn spawn_terminal_transition(
+        transition: TerminalTransition,
+        terminal_gate: Arc<MonitorTerminal>,
+        cancelled: Arc<AtomicBool>,
+        api_returned: Arc<AtomicBool>,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Receiver<()>,
+        thread::JoinHandle<()>,
+    ) {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (complete_tx, complete_rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            apply_terminal_transition(transition, &terminal_gate, &cancelled, &api_returned);
+            complete_tx.send(()).unwrap();
+        });
+        (started_rx, complete_rx, worker)
+    }
+
+    #[test]
+    fn terminal_transition_is_serialized_with_activation_attempt() {
+        for transition in [
+            TerminalTransition::ApiReturned,
+            TerminalTransition::Cancelled,
+        ] {
+            let (mut system, baseline, owner, _) = handoff_fixture();
+            system.foreground = owner.hwnd;
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let api_returned = Arc::new(AtomicBool::new(false));
+            let terminal_flag = match transition {
+                TerminalTransition::ApiReturned => Arc::clone(&api_returned),
+                TerminalTransition::Cancelled => Arc::clone(&cancelled),
+            };
+            let observed_terminal = Arc::new(AtomicBool::new(false));
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            system.activation_pause = Some(GatePause {
+                entered: entered_tx,
+                release: release_rx,
+                terminal_flag: Arc::clone(&terminal_flag),
+                observed_terminal: Arc::clone(&observed_terminal),
+            });
+
+            let terminal_gate = Arc::new(MonitorTerminal::default());
+            let accepted = Arc::new(Mutex::new(None));
+            let worker_gate = Arc::clone(&terminal_gate);
+            let worker_cancelled = Arc::clone(&cancelled);
+            let worker_returned = Arc::clone(&api_returned);
+            let worker_accepted = Arc::clone(&accepted);
+            let worker = thread::spawn(move || {
+                let mut policy = MonitorPolicy::default();
+                policy.observe_with_api_return(
+                    &mut system,
+                    owner.hwnd,
+                    baseline,
+                    &worker_cancelled,
+                    &worker_returned,
+                    &worker_gate,
+                    &worker_accepted,
+                );
+                system
+            });
+
+            entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("monitor did not reach the one-shot activation attempt");
+            assert_eq!(
+                terminal_gate.phase.load(Ordering::Acquire),
+                PHASE_ACTIVATION_COMMITTED,
+                "the fake activation is paused after its one-shot attempt is committed"
+            );
+
+            let gate_held = match terminal_gate.try_lock() {
+                Err(std::sync::TryLockError::WouldBlock) => true,
+                Ok(guard) => {
+                    drop(guard);
+                    false
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    panic!("terminal gate unexpectedly poisoned")
+                }
+            };
+            // Mirror the wrappers' nonblocking marker stores and phase helper
+            // while activation is paused. The wrappers themselves acquire the
+            // gate after marking, so calling one here would deadlock the test.
+            match transition {
+                TerminalTransition::ApiReturned => {
+                    api_returned.store(true, Ordering::Release);
+                    terminal_gate.mark_api_returned();
+                }
+                TerminalTransition::Cancelled => {
+                    cancelled.store(true, Ordering::Release);
+                    terminal_gate.mark_cancelled();
+                }
+            }
+            assert!(terminal_flag.load(Ordering::Acquire));
+            assert_eq!(
+                terminal_gate.phase.load(Ordering::Acquire),
+                PHASE_ACTIVATION_COMMITTED,
+                "the committed activation phase remains stable until activation returns"
+            );
+
+            release_tx.send(()).unwrap();
+            let system = worker.join().unwrap();
+            assert_eq!(terminal_gate.phase.load(Ordering::Acquire), PHASE_ACTIVATED);
+
+            // Run the real wrapper after activation has joined. It completes
+            // the terminal transition without racing finish_activation's
+            // committed-to-activated phase update.
+            let (started_rx, complete_rx, transition_worker) = spawn_terminal_transition(
+                transition,
+                Arc::clone(&terminal_gate),
+                Arc::clone(&cancelled),
+                Arc::clone(&api_returned),
+            );
+            started_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("terminal transition worker did not start");
+            complete_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("terminal transition wrapper did not complete");
+            transition_worker.join().unwrap();
+
+            assert!(gate_held, "terminal state must synchronize with activation");
+            assert!(system.trace.contains(&"activate"));
+            assert_eq!(
+                system.trace.iter().filter(|event| **event == "activate").count(),
+                1,
+                "a committed activation is attempted at most once"
+            );
+            let expected_phase = match transition {
+                TerminalTransition::ApiReturned => PHASE_API_RETURNED,
+                TerminalTransition::Cancelled => PHASE_CANCELLED,
+            };
+            assert_eq!(terminal_gate.phase.load(Ordering::Acquire), expected_phase);
+            assert!(
+                observed_terminal.load(Ordering::Acquire),
+                "terminal transition is recorded during the already-claimed activation"
+            );
+            assert!(accepted.lock().unwrap().is_none());
+            assert!(cancelled.load(Ordering::Acquire) || api_returned.load(Ordering::Acquire));
+        }
+    }
+
+    #[test]
+    fn terminal_transition_is_serialized_with_accepted_publication() {
+        let (mut system, baseline, owner, broker) = handoff_fixture();
+        system.foreground = broker.hwnd;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let api_returned = Arc::new(AtomicBool::new(false));
+        let observed_terminal = Arc::new(AtomicBool::new(false));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        system.publish_pause = Some(GatePause {
+            entered: entered_tx,
+            release: release_rx,
+            terminal_flag: Arc::clone(&api_returned),
+            observed_terminal: Arc::clone(&observed_terminal),
+        });
+        let terminal_gate = Arc::new(MonitorTerminal::default());
+        let accepted = Arc::new(Mutex::new(None));
+        let worker_gate = Arc::clone(&terminal_gate);
+        let worker_cancelled = Arc::clone(&cancelled);
+        let worker_returned = Arc::clone(&api_returned);
+        let worker_accepted = Arc::clone(&accepted);
+        let worker = thread::spawn(move || {
+            let mut policy = MonitorPolicy::default();
+            policy.observe_with_api_return(
+                &mut system,
+                owner.hwnd,
+                baseline,
+                &worker_cancelled,
+                &worker_returned,
+                &worker_gate,
+                &worker_accepted,
+            );
+            system
+        });
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("monitor did not reach accepted-result publication");
+        let (started_rx, complete_rx, transition_worker) = spawn_terminal_transition(
+            TerminalTransition::ApiReturned,
+            Arc::clone(&terminal_gate),
+            Arc::clone(&cancelled),
+            Arc::clone(&api_returned),
+        );
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("API-return transition worker did not start");
+        // `started` is signalled before the wrapper stores its marker. Wait for
+        // the wrapper's nonblocking marker store (it precedes the gate lock) so
+        // the paused publication samples a deterministic terminal state.
+        let marker_deadline = Instant::now() + Duration::from_secs(5);
+        while !api_returned.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < marker_deadline,
+                "API-return wrapper did not publish its marker"
+            );
+            thread::yield_now();
+        }
+
+        let gate_held = match terminal_gate.try_lock() {
+            Err(std::sync::TryLockError::WouldBlock) => true,
+            Ok(guard) => {
+                drop(guard);
+                false
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                panic!("terminal gate unexpectedly poisoned")
+            }
+        };
+        if !gate_held {
+            complete_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("unsynchronized API-return transition did not complete");
+        }
+        release_tx.send(()).unwrap();
+        let system = worker.join().unwrap();
+        transition_worker.join().unwrap();
+
+        assert!(
+            gate_held,
+            "terminal state must synchronize with publication"
+        );
+        assert!(
+            observed_terminal.load(Ordering::Acquire),
+            "API return is visible before the publication claim"
+        );
+        assert!(accepted.lock().unwrap().is_none());
+        assert!(api_returned.load(Ordering::Acquire));
+        assert_eq!(system.foreground, broker.hwnd);
     }
 
     #[test]
@@ -2573,10 +3482,135 @@ mod tests {
         assert_eq!(system.time_ms, 20);
     }
 
+    fn session_unavailable_dwm_window(system: &mut TestSystem) -> (isize, u32, u32) {
+        let identity = WindowIdentity {
+            hwnd: 4,
+            process_id: 40,
+            thread_id: 41,
+            session: 1,
+        };
+        system.windows.push(TestWindow {
+            identity,
+            visible: false,
+            minimized: false,
+            maximized: false,
+            session: 1,
+            path: r"C:\Windows\System32\dwm.exe".into(),
+            title: String::new(),
+            class: "Dwm".into(),
+        });
+        system.session_unavailable_hwnd = Some(identity.hwnd);
+        (identity.hwnd, identity.process_id, identity.thread_id)
+    }
+
     #[test]
-    fn handoff_review_worker_branches_and_permanent_disqualification() {
-        for fault in 0..7 {
-            let (mut system, baseline, owner, broker) = handoff_fixture();
+    fn baseline_records_session_unattributed_window_without_failing() {
+        let (mut system, _, owner, broker) = handoff_fixture();
+        let dwm = session_unavailable_dwm_window(&mut system);
+
+        let baseline = baseline_window_identities(&mut system)
+            .expect("a window with readable owner ids but no session must not fail the baseline");
+        assert_eq!(baseline.attempts, 1);
+        assert_eq!(baseline.identities, HashSet::from([owner, broker]));
+        assert_eq!(baseline.unattributed, HashSet::from([dwm]));
+        assert!(!system.trace.contains(&"wait"));
+    }
+
+    #[test]
+    fn monitor_activates_new_broker_with_session_unattributed_baseline_window() {
+        let (mut system, _, owner, broker) = handoff_fixture();
+        let broker_window = system.windows.remove(1);
+        session_unavailable_dwm_window(&mut system);
+        let snapshot = baseline_window_identities(&mut system)
+            .expect("baseline with a session-unattributed window should be prepared");
+        let baseline = Arc::new(BrokerBaseline {
+            system_directory: r"C:\Windows\System32".into(),
+            session: 2,
+            local_console: true,
+            windows: snapshot.identities,
+            unattributed_windows: snapshot.unattributed,
+        });
+        system.windows.push(broker_window);
+        system.foreground = owner.hwnd;
+        let cancelled = AtomicBool::new(false);
+        let accepted = Mutex::new(None);
+        let mut policy = MonitorPolicy::default();
+
+        assert!(policy.observe(&mut system, owner.hwnd, baseline, &cancelled, &accepted));
+
+        assert_eq!(policy.reason, Some(MonitorStop::CandidateForeground));
+        assert_eq!(
+            accepted
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|proof| proof.identity),
+            Some(broker)
+        );
+        assert_eq!(
+            system
+                .trace
+                .iter()
+                .filter(|event| **event == "activate")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn session_unattributed_baseline_window_is_never_a_new_broker() {
+        let (mut system, mut baseline, owner, broker) = handoff_fixture();
+        Arc::get_mut(&mut baseline)
+            .unwrap()
+            .unattributed_windows
+            .insert((broker.hwnd, broker.process_id, broker.thread_id));
+        assert!(!is_new_window_identity(
+            broker,
+            &baseline.windows,
+            &baseline.unattributed_windows
+        ));
+        assert!(is_new_window_identity(
+            WindowIdentity {
+                thread_id: 99,
+                ..broker
+            },
+            &baseline.windows,
+            &baseline.unattributed_windows
+        ));
+        assert!(capture_broker(&mut system, Arc::clone(&baseline), broker).is_none());
+
+        system.trace.clear();
+        system.foreground = owner.hwnd;
+        let cancelled = AtomicBool::new(false);
+        let accepted = Mutex::new(None);
+        let mut policy = MonitorPolicy::default();
+        policy.observe(&mut system, owner.hwnd, baseline, &cancelled, &accepted);
+        assert!(accepted.lock().unwrap().is_none());
+        assert!(!system.trace.contains(&"activate"));
+        assert_eq!(system.foreground, owner.hwnd);
+    }
+
+    #[test]
+    fn baseline_owner_ids_failure_stays_bounded_with_unattributed_window_present() {
+        let (mut system, _, _, broker) = handoff_fixture();
+        session_unavailable_dwm_window(&mut system);
+        system.inaccessible_hwnd = Some(broker.hwnd);
+
+        let error = baseline_window_identities(&mut system)
+            .err()
+            .expect("a window without owner ids must still fail the baseline");
+        assert_eq!(error.stage, BaselineCaptureStage::WindowIdentity);
+        assert_eq!(error.attempts, BASELINE_CAPTURE_MAX_ATTEMPTS);
+        assert_eq!(
+            system.trace.iter().filter(|step| **step == "wait").count(),
+            2
+        );
+    }
+
+    #[test]
+    fn handoff_review_worker_branches_fail_closed_on_incomplete_or_ambiguous_metadata() {
+        for fault in [0, 1, 2, 3, 5, 6] {
+            let (mut system, baseline, owner, _) = handoff_fixture();
             let mut other = system.windows[1].clone();
             other.identity = WindowIdentity {
                 hwnd: 3,
@@ -2590,12 +3624,9 @@ mod tests {
                 1 => system.inaccessible_hwnd = Some(3),
                 2 => system.inaccessible_pid = Some(30),
                 3 => system.unknown_metadata = true,
-                4 => system.windows[2].session = 3,
+                5 => (),
                 6 => system.inaccessible_session = Some(30),
-                _ => (),
-            }
-            if fault == 4 {
-                system.windows[2].class = "ordinary".into();
+                _ => unreachable!(),
             }
             let cancelled = AtomicBool::new(false);
             let accepted = Mutex::new(None);
@@ -2608,13 +3639,11 @@ mod tests {
                 &accepted,
             );
             assert!(terminal);
-            if fault != 4 {
-                assert!(accepted.lock().unwrap().is_none());
-            } else {
-                assert_eq!(accepted.lock().unwrap().as_ref().unwrap().identity, broker);
-            }
-            // The production worker returns on terminal; disappearing B cannot
-            // trigger another observation/publication in this monitor.
+            assert!(accepted.lock().unwrap().is_none());
+            assert!(!system.trace.contains(&"activate"));
+
+            // A failed, incomplete or ambiguous observation is terminal; a later
+            // clean sample cannot revive the same monitor instance.
             system.windows.pop();
             system.enumeration_failed = false;
             system.inaccessible_hwnd = None;
@@ -2622,27 +3651,74 @@ mod tests {
             system.inaccessible_session = None;
             system.unknown_metadata = false;
             assert!(policy.observe(&mut system, owner.hwnd, baseline, &cancelled, &accepted));
-            if fault != 4 {
-                assert!(accepted.lock().unwrap().is_none());
-            }
+            assert!(accepted.lock().unwrap().is_none());
             assert!(!system.trace.contains(&"activate"));
         }
-        for already_foreground in [true, false] {
-            let (mut system, baseline, owner, broker) = handoff_fixture();
-            if !already_foreground {
-                system.foreground = owner.hwnd;
-            }
-            let accepted = Mutex::new(None);
-            assert!(monitor_observe(
-                &mut system,
-                owner.hwnd,
-                baseline,
-                &AtomicBool::new(false),
-                &accepted
-            ));
-            assert_eq!(accepted.lock().unwrap().as_ref().unwrap().identity, broker);
-            assert_eq!(system.trace.contains(&"activate"), !already_foreground);
-        }
+    }
+
+    #[test]
+    fn monitor_activates_unique_candidate_despite_unrelated_cross_session_window() {
+        let (mut system, baseline, owner, broker) = handoff_fixture();
+        let mut other = system.windows[1].clone();
+        other.identity = WindowIdentity {
+            hwnd: 3,
+            process_id: 30,
+            thread_id: 31,
+            session: 3,
+        };
+        other.session = 3;
+        other.class = "ordinary".into();
+        system.windows.push(other);
+        system.foreground = owner.hwnd;
+        let cancelled = AtomicBool::new(false);
+        let accepted = Mutex::new(None);
+        let mut policy = MonitorPolicy::default();
+
+        assert!(policy.observe(&mut system, owner.hwnd, baseline, &cancelled, &accepted));
+
+        assert_eq!(policy.reason, Some(MonitorStop::CandidateForeground));
+        assert_eq!(
+            accepted
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|proof| proof.identity),
+            Some(broker)
+        );
+        assert_eq!(
+            system
+                .trace
+                .iter()
+                .filter(|event| **event == "activate")
+                .count(),
+            1
+        );
+        assert!(!policy.passive_safe);
+    }
+
+    #[test]
+    fn monitor_accepts_unique_candidate_already_foreground_without_activation() {
+        let (mut system, baseline, owner, broker) = handoff_fixture();
+        system.foreground = broker.hwnd;
+        let accepted = Mutex::new(None);
+
+        assert!(monitor_observe(
+            &mut system,
+            owner.hwnd,
+            baseline,
+            &AtomicBool::new(false),
+            &accepted,
+        ));
+
+        assert_eq!(
+            accepted
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|proof| proof.identity),
+            Some(broker)
+        );
+        assert!(!system.trace.contains(&"activate"));
     }
 
     #[test]
@@ -3049,9 +4125,592 @@ mod tests {
                 protocol == 2
             );
         }
+        assert!(is_local_console_session(session_evidence(
+            Ok(0),
+            Err(QueryStatus::NotQueried)
+        )));
+        assert!(!is_local_console_session(session_evidence(
+            Ok(2),
+            Ok(WTSActive)
+        )));
+        assert!(!is_local_console_session(session_evidence(
+            Err(QueryStatus::NativeFailure),
+            Err(QueryStatus::NotQueried)
+        )));
         for state in [-1, 0, 1, 4, 9, 10, i32::MAX] {
             assert_eq!(session_evidence(Ok(2), Ok(state)).active_rdp(), state == 0);
         }
+    }
+
+    #[test]
+    fn monitor_raises_unique_new_dialog_in_existing_broker_process_once() {
+        let (mut system, mut baseline, owner, broker) = handoff_fixture();
+        let existing_broker_window = WindowIdentity {
+            hwnd: 3,
+            process_id: broker.process_id,
+            thread_id: broker.thread_id + 1,
+            session: broker.session,
+        };
+        Arc::get_mut(&mut baseline)
+            .unwrap()
+            .windows
+            .insert(existing_broker_window);
+        system.windows.push(TestWindow {
+            identity: existing_broker_window,
+            visible: false,
+            minimized: false,
+            maximized: false,
+            session: broker.session,
+            path: r"C:\Windows\System32\CredentialUIBroker.exe".into(),
+            title: String::new(),
+            class: "IME".into(),
+        });
+        system.foreground = owner.hwnd;
+        let accepted = Mutex::new(None);
+        let mut policy = MonitorPolicy::default();
+
+        assert!(policy.observe(
+            &mut system,
+            owner.hwnd,
+            baseline,
+            &AtomicBool::new(false),
+            &accepted,
+        ));
+
+        assert_eq!(
+            system
+                .trace
+                .iter()
+                .filter(|event| **event == "activate")
+                .count(),
+            1,
+            "a unique new dialog should receive exactly one activation attempt"
+        );
+        let activation = system
+            .trace
+            .iter()
+            .position(|event| *event == "activate")
+            .unwrap();
+        assert_eq!(system.trace[activation - 1], "foreground");
+        assert_eq!(system.trace[activation - 2], "visible");
+        assert_eq!(system.foreground, broker.hwnd);
+        assert_eq!(
+            accepted
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|proof| proof.identity),
+            Some(broker),
+            "a newly created dialog remains detectable in an already-running broker process"
+        );
+        assert!(!policy.passive_safe);
+    }
+
+    #[test]
+    fn monitor_does_not_raise_candidate_after_user_focus_changes() {
+        let (mut system, baseline, owner, _) = handoff_fixture();
+        system.foreground = owner.hwnd;
+        system.foreground_sequence = [owner.hwnd, 3].into();
+        let cancelled = AtomicBool::new(false);
+        let mut passive_safe = true;
+        let accepted = Mutex::new(None);
+
+        let reason = monitor_observe_reason(
+            &mut system,
+            owner.hwnd,
+            baseline,
+            &cancelled,
+            &AtomicBool::new(false),
+            &MonitorTerminal::default(),
+            &mut passive_safe,
+            &accepted,
+        );
+
+        assert_eq!(reason, Some(MonitorStop::ForegroundLost));
+        assert!(
+            !system.trace.contains(&"activate"),
+            "the monitor must not override focus after the user leaves FidoVault"
+        );
+        assert!(accepted.lock().unwrap().is_none());
+        assert!(!passive_safe);
+    }
+
+    #[test]
+    fn monitor_stops_when_initial_ambiguity_disappears_before_revalidation() {
+        let (mut system, baseline, owner, _) = handoff_fixture();
+        let mut competing = system.windows[1].clone();
+        competing.identity.hwnd = 3;
+        competing.identity.process_id = 30;
+        competing.identity.thread_id = 31;
+        system.windows.push(competing);
+        system.remove_window_after_broker_scan = Some(3);
+        system.foreground = owner.hwnd;
+        let accepted = Mutex::new(None);
+        let mut passive_safe = false;
+
+        let reason = monitor_observe_reason(
+            &mut system,
+            owner.hwnd,
+            baseline,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+            &MonitorTerminal::default(),
+            &mut passive_safe,
+            &accepted,
+        );
+
+        assert_eq!(reason, Some(MonitorStop::Ambiguous));
+        assert_eq!(system.broker_candidate_scans, 1);
+        assert!(!system.trace.contains(&"activate"));
+        assert!(accepted.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn monitor_refuses_activation_if_focus_changes_at_activation_boundary() {
+        let (mut system, baseline, owner, _) = handoff_fixture();
+        system.foreground = owner.hwnd;
+        system.focus_change_before_activation = Some(3);
+        let accepted = Mutex::new(None);
+        let mut passive_safe = false;
+
+        let reason = monitor_observe_reason(
+            &mut system,
+            owner.hwnd,
+            baseline,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+            &MonitorTerminal::default(),
+            &mut passive_safe,
+            &accepted,
+        );
+
+        assert_eq!(reason, Some(MonitorStop::ForegroundLost));
+        assert_eq!(system.foreground, 3);
+        assert!(!system.trace.contains(&"activate"));
+        assert!(accepted.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn monitor_refuses_recycled_candidate_at_activation_boundary() {
+        let (mut system, baseline, owner, broker) = handoff_fixture();
+        system.foreground = owner.hwnd;
+        system.candidate_reuse_before_activation = Some(WindowIdentity {
+            process_id: broker.process_id + 100,
+            thread_id: broker.thread_id + 100,
+            ..broker
+        });
+        let accepted = Mutex::new(None);
+        let mut passive_safe = false;
+
+        let reason = monitor_observe_reason(
+            &mut system,
+            owner.hwnd,
+            baseline,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+            &MonitorTerminal::default(),
+            &mut passive_safe,
+            &accepted,
+        );
+
+        assert_eq!(reason, Some(MonitorStop::CandidateChanged));
+        assert_eq!(system.foreground, owner.hwnd);
+        assert!(!system.trace.contains(&"activate"));
+        assert!(accepted.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn monitor_does_not_publish_after_focus_changes_before_acceptance() {
+        let (mut system, baseline, _, broker) = handoff_fixture();
+        system.foreground = broker.hwnd;
+        system.focus_change_before_publish = Some(3);
+        let accepted = Mutex::new(None);
+        let mut passive_safe = false;
+
+        let reason = monitor_observe_reason(
+            &mut system,
+            1,
+            baseline,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+            &MonitorTerminal::default(),
+            &mut passive_safe,
+            &accepted,
+        );
+
+        assert_eq!(reason, Some(MonitorStop::ForegroundLost));
+        assert_eq!(system.foreground, 3);
+        assert!(!system.trace.contains(&"activate"));
+        assert!(accepted.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn monitor_api_return_or_cancellation_before_native_activation_prevents_attempt() {
+        for terminal in [
+            TerminalTransition::ApiReturned,
+            TerminalTransition::Cancelled,
+        ] {
+            for after_claim in [false, true] {
+                let (mut system, baseline, owner, _) = handoff_fixture();
+                system.foreground = owner.hwnd;
+                let cancelled = Arc::new(AtomicBool::new(false));
+                let api_returned = Arc::new(AtomicBool::new(false));
+                match (terminal, after_claim) {
+                    (TerminalTransition::ApiReturned, false) => {
+                        system.api_returned_before_activation = Some(Arc::clone(&api_returned));
+                    }
+                    (TerminalTransition::Cancelled, false) => {
+                        system.cancelled_before_activation = Some(Arc::clone(&cancelled));
+                    }
+                    (TerminalTransition::ApiReturned, true) => {
+                        system.api_returned_after_activation_claim =
+                            Some(Arc::clone(&api_returned));
+                    }
+                    (TerminalTransition::Cancelled, true) => {
+                        system.cancelled_after_activation_claim = Some(Arc::clone(&cancelled));
+                    }
+                }
+                let accepted = Mutex::new(None);
+                let mut passive_safe = false;
+                let reason = monitor_observe_reason(
+                    &mut system,
+                    owner.hwnd,
+                    baseline,
+                    &cancelled,
+                    &api_returned,
+                    &MonitorTerminal::default(),
+                    &mut passive_safe,
+                    &accepted,
+                );
+                let expected = match terminal {
+                    TerminalTransition::ApiReturned => MonitorStop::ApiReturned,
+                    TerminalTransition::Cancelled => MonitorStop::Cancelled,
+                };
+                assert_eq!(reason, Some(expected));
+                assert!(!system.trace.contains(&"activate"));
+                assert!(accepted.lock().unwrap().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_transition_wins_at_final_activation_commit_boundary() {
+        for transition in [
+            TerminalTransition::ApiReturned,
+            TerminalTransition::Cancelled,
+        ] {
+            let (mut system, baseline, owner, _) = handoff_fixture();
+            system.foreground = owner.hwnd;
+            system.final_activation_transition = Some(transition);
+            let cancelled = AtomicBool::new(false);
+            let api_returned = AtomicBool::new(false);
+            let terminal_flag = match transition {
+                TerminalTransition::ApiReturned => &api_returned,
+                TerminalTransition::Cancelled => &cancelled,
+            };
+            let terminal_gate = MonitorTerminal::default();
+            let accepted = Mutex::new(None);
+            let mut passive_safe = false;
+            let reason = monitor_observe_reason(
+                &mut system,
+                owner.hwnd,
+                baseline,
+                &cancelled,
+                &api_returned,
+                &terminal_gate,
+                &mut passive_safe,
+                &accepted,
+            );
+            let expected = match transition {
+                TerminalTransition::ApiReturned => MonitorStop::ApiReturned,
+                TerminalTransition::Cancelled => MonitorStop::Cancelled,
+            };
+            assert!(terminal_flag.load(Ordering::Acquire));
+            assert_eq!(reason, Some(expected));
+            assert!(accepted.lock().unwrap().is_none());
+            assert_eq!(
+                system.trace.iter().filter(|event| **event == "activate").count(),
+                0,
+                "terminal transition at the final activation boundary must prevent activation"
+            );
+        }
+    }
+
+    #[test]
+    fn monitor_rechecks_focus_after_activation_claim_before_native_call() {
+        let (mut system, baseline, owner, _) = handoff_fixture();
+        system.foreground = owner.hwnd;
+        system.focus_change_after_activation_claim = Some(3);
+        let accepted = Mutex::new(None);
+        let mut passive_safe = false;
+
+        let reason = monitor_observe_reason(
+            &mut system,
+            owner.hwnd,
+            baseline,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+            &MonitorTerminal::default(),
+            &mut passive_safe,
+            &accepted,
+        );
+
+        assert_eq!(reason, Some(MonitorStop::ForegroundLost));
+        assert_eq!(system.foreground, 3);
+        assert!(!system.trace.contains(&"activate"));
+        assert!(accepted.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn monitor_refuses_candidate_when_activation_claim_revalidation_is_ambiguous() {
+        let (mut system, baseline, owner, _) = handoff_fixture();
+        system.foreground = owner.hwnd;
+        system.competing_window_after_activation_claim = Some(TestWindow {
+            identity: WindowIdentity {
+                hwnd: 3,
+                process_id: 21,
+                thread_id: 31,
+                session: 2,
+            },
+            visible: true,
+            minimized: false,
+            maximized: false,
+            session: 2,
+            path: r"C:\Windows\System32\CredentialUIBroker.exe".into(),
+            title: "Windows Security".into(),
+            class: "Credential Dialog Xaml Host".into(),
+        });
+        let accepted = Mutex::new(None);
+        let mut passive_safe = false;
+
+        let reason = monitor_observe_reason(
+            &mut system,
+            owner.hwnd,
+            baseline,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+            &MonitorTerminal::default(),
+            &mut passive_safe,
+            &accepted,
+        );
+
+        assert_eq!(reason, Some(MonitorStop::Ambiguous));
+        assert_eq!(system.foreground, owner.hwnd);
+        assert!(!system.trace.contains(&"activate"));
+        assert!(accepted.lock().unwrap().is_none());
+    }
+
+    fn untitled_broker_host(hwnd: isize) -> TestWindow {
+        TestWindow {
+            identity: WindowIdentity {
+                hwnd,
+                process_id: 30,
+                thread_id: 31,
+                session: 2,
+            },
+            visible: true,
+            minimized: false,
+            maximized: false,
+            session: 2,
+            path: r"C:\Windows\System32\CredentialUIBroker.exe".into(),
+            title: String::new(),
+            class: "Credential Dialog Xaml Host".into(),
+        }
+    }
+
+    fn activation_count(system: &TestSystem) -> usize {
+        system
+            .trace
+            .iter()
+            .filter(|event| **event == "activate")
+            .count()
+    }
+
+    #[test]
+    fn monitor_waits_for_untitled_broker_host_then_activates_once() {
+        let (mut system, baseline, owner, broker) = handoff_fixture();
+        system.windows[1].title = "Windows \u{5b89}\u{5168}\u{6027}".into();
+        system.foreground = owner.hwnd;
+        system.empty_title_reads = Some((broker.hwnd, 2));
+        let cancelled = AtomicBool::new(false);
+        let accepted = Mutex::new(None);
+        let mut policy = MonitorPolicy::default();
+
+        for _ in 0..2 {
+            assert!(!policy.observe(
+                &mut system,
+                owner.hwnd,
+                Arc::clone(&baseline),
+                &cancelled,
+                &accepted
+            ));
+            assert_eq!(policy.reason, None);
+            assert!(
+                !policy.passive_safe,
+                "an untitled broker host is not evidence of broker absence"
+            );
+            assert_eq!(activation_count(&system), 0);
+            assert!(accepted.lock().unwrap().is_none());
+        }
+
+        assert!(policy.observe(
+            &mut system,
+            owner.hwnd,
+            Arc::clone(&baseline),
+            &cancelled,
+            &accepted
+        ));
+        assert_eq!(policy.reason, Some(MonitorStop::CandidateForeground));
+        assert_eq!(
+            accepted
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|proof| proof.identity),
+            Some(broker)
+        );
+        assert_eq!(activation_count(&system), 1);
+
+        // One-shot: the stopped monitor never activates again.
+        system.foreground = owner.hwnd;
+        assert!(policy.observe(&mut system, owner.hwnd, baseline, &cancelled, &accepted));
+        assert_eq!(activation_count(&system), 1);
+    }
+
+    #[test]
+    fn monitor_broker_host_title_query_failure_stays_incomplete() {
+        let (mut system, baseline, owner, broker) = handoff_fixture();
+        system.foreground = owner.hwnd;
+        system.title_unavailable_hwnd = Some(broker.hwnd);
+        let cancelled = AtomicBool::new(false);
+        let accepted = Mutex::new(None);
+        let mut policy = MonitorPolicy::default();
+
+        assert!(policy.observe(&mut system, owner.hwnd, baseline, &cancelled, &accepted));
+
+        assert_eq!(policy.reason, Some(MonitorStop::Incomplete));
+        assert!(!policy.passive_safe);
+        assert_eq!(activation_count(&system), 0);
+        assert!(accepted.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn monitor_treats_untitled_broker_host_during_rescan_as_ambiguous() {
+        // Scan 2 is the revalidation, scans 3 and 4 run inside activation (before
+        // and after the claim), scan 5 is the final publication check.
+        for (after_scan, activations, phase) in [
+            (1, 0, PHASE_WATCHING),
+            (2, 0, PHASE_WATCHING),
+            (3, 0, PHASE_FAILED),
+            (4, 1, PHASE_ACTIVATED),
+        ] {
+            let (mut system, baseline, owner, _) = handoff_fixture();
+            system.foreground = owner.hwnd;
+            system.window_after_broker_scan = Some((after_scan, untitled_broker_host(3)));
+            let terminal = MonitorTerminal::default();
+            let accepted = Mutex::new(None);
+            let mut passive_safe = false;
+
+            let reason = monitor_observe_reason(
+                &mut system,
+                owner.hwnd,
+                baseline,
+                &AtomicBool::new(false),
+                &AtomicBool::new(false),
+                &terminal,
+                &mut passive_safe,
+                &accepted,
+            );
+
+            assert_eq!(reason, Some(MonitorStop::Ambiguous), "after scan {after_scan}");
+            assert_eq!(activation_count(&system), activations, "after scan {after_scan}");
+            assert_eq!(terminal.phase.load(Ordering::Acquire), phase, "after scan {after_scan}");
+            assert!(!passive_safe);
+            assert!(accepted.lock().unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn untitled_broker_host_is_never_a_candidate() {
+        let (mut system, baseline, owner, broker) = handoff_fixture();
+        system.windows[1].title = String::new();
+        system.foreground = owner.hwnd;
+
+        assert!(broker_candidates(&mut system, &baseline).is_err());
+        assert!(capture_broker(&mut system, Arc::clone(&baseline), broker).is_none());
+
+        let cancelled = AtomicBool::new(false);
+        let accepted = Mutex::new(None);
+        let mut policy = MonitorPolicy::default();
+        for _ in 0..5 {
+            assert!(!policy.observe(
+                &mut system,
+                owner.hwnd,
+                Arc::clone(&baseline),
+                &cancelled,
+                &accepted
+            ));
+            assert!(!policy.passive_safe);
+        }
+        assert_eq!(policy.reason, None);
+        assert_eq!(activation_count(&system), 0);
+        assert!(accepted.lock().unwrap().is_none());
+        assert_eq!(system.foreground, owner.hwnd);
+
+        // A hidden untitled host is not broker-like evidence at all.
+        system.windows[1].visible = false;
+        assert_eq!(broker_candidates(&mut system, &baseline), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn scan_failure_outranks_untitled_broker_host() {
+        for failing_first in [false, true] {
+            let (mut system, baseline, owner, _) = handoff_fixture();
+            system.windows[1].title = String::new();
+            let mut failing = untitled_broker_host(3);
+            failing.title = "Windows Security".into();
+            if failing_first {
+                system.windows.insert(1, failing);
+            } else {
+                system.windows.push(failing);
+            }
+            system.title_unavailable_hwnd = Some(3);
+            system.foreground = owner.hwnd;
+            let cancelled = AtomicBool::new(false);
+            let accepted = Mutex::new(None);
+            let mut policy = MonitorPolicy::default();
+
+            assert!(policy.observe(&mut system, owner.hwnd, baseline, &cancelled, &accepted));
+
+            assert_eq!(policy.reason, Some(MonitorStop::Incomplete));
+            assert_eq!(activation_count(&system), 0);
+            assert!(accepted.lock().unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn monitor_never_activates_candidate_from_rdp_session() {
+        let (mut system, mut baseline, owner, _) = handoff_fixture();
+        Arc::get_mut(&mut baseline).unwrap().local_console = false;
+        system.foreground = owner.hwnd;
+        let accepted = Mutex::new(None);
+        let mut passive_safe = false;
+
+        let reason = monitor_observe_reason(
+            &mut system,
+            owner.hwnd,
+            baseline,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+            &MonitorTerminal::default(),
+            &mut passive_safe,
+            &accepted,
+        );
+
+        assert_eq!(reason, Some(MonitorStop::NonConsoleSession));
+        assert_eq!(system.foreground, owner.hwnd);
+        assert!(!system.trace.contains(&"activate"));
+        assert!(accepted.lock().unwrap().is_none());
     }
 
     #[test]
@@ -3061,8 +4720,8 @@ mod tests {
             (1, MonitorStop::Ambiguous),
             (2, MonitorStop::ForegroundLost),
             (3, MonitorStop::Cancelled),
-            (4, MonitorStop::Accepted),
-            (5, MonitorStop::ActivationFailed),
+            (4, MonitorStop::CandidateForeground),
+            (5, MonitorStop::CandidateForeground),
         ] {
             let (mut system, baseline, owner, _) = handoff_fixture();
             let cancelled = AtomicBool::new(fault == 3);
@@ -3080,10 +4739,7 @@ mod tests {
                     system.windows.pop();
                     system.foreground = 0;
                 }
-                5 => {
-                    system.foreground = 1;
-                    system.activation_succeeds = false;
-                }
+                5 => system.foreground = 1,
                 _ => (),
             }
             assert!(policy.observe(&mut system, 1, Arc::clone(&baseline), &cancelled, &accepted));
@@ -3100,6 +4756,157 @@ mod tests {
             assert!(other.reason.is_none());
             assert!(!other.passive_safe);
         }
+    }
+
+    #[test]
+    fn monitor_activation_failure_is_terminal_and_not_retried() {
+        let (mut system, baseline, owner, _) = handoff_fixture();
+        system.foreground = owner.hwnd;
+        system.activation_succeeds = false;
+        let accepted = Mutex::new(None);
+        let cancelled = AtomicBool::new(false);
+        let mut policy = MonitorPolicy::default();
+
+        assert!(policy.observe(
+            &mut system,
+            owner.hwnd,
+            Arc::clone(&baseline),
+            &cancelled,
+            &accepted,
+        ));
+        assert_eq!(policy.reason, Some(MonitorStop::ActivationFailed));
+        assert_eq!(
+            system
+                .trace
+                .iter()
+                .filter(|event| **event == "activate")
+                .count(),
+            1
+        );
+        assert!(accepted.lock().unwrap().is_none());
+
+        assert!(policy.observe(&mut system, owner.hwnd, baseline, &cancelled, &accepted,));
+        assert_eq!(
+            system
+                .trace
+                .iter()
+                .filter(|event| **event == "activate")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn monitor_worker_activates_and_publishes_unique_dialog() {
+        let (mut system, baseline, owner, broker) = handoff_fixture();
+        system.foreground = owner.hwnd;
+        let cancelled = AtomicBool::new(false);
+        let api_returned = AtomicBool::new(false);
+        let armed = AtomicBool::new(true);
+        let accepted = Mutex::new(None);
+        let passive_safe = AtomicBool::new(false);
+        let reason = Mutex::new(None);
+
+        run_monitor_worker(
+            &mut system,
+            owner.hwnd,
+            baseline,
+            MonitorWorkerChannels {
+                cancelled: &cancelled,
+                api_returned: &api_returned,
+                terminal_gate: &MonitorTerminal::default(),
+                armed: &armed,
+                accepted: &accepted,
+                passive_safe: &passive_safe,
+                reason: &reason,
+            },
+        );
+
+        assert_eq!(
+            *reason.lock().unwrap(),
+            Some(MonitorStop::CandidateForeground)
+        );
+        assert_eq!(
+            accepted
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|proof| proof.identity),
+            Some(broker)
+        );
+        assert_eq!(system.foreground, broker.hwnd);
+        assert_eq!(
+            system
+                .trace
+                .iter()
+                .filter(|event| **event == "activate")
+                .count(),
+            1
+        );
+        assert!(!passive_safe.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn monitor_does_not_activate_candidate_after_api_return_marker() {
+        let (mut system, baseline, owner, _) = handoff_fixture();
+        system.foreground = owner.hwnd;
+        let cancelled = AtomicBool::new(false);
+        let api_returned = AtomicBool::new(true);
+        let armed = AtomicBool::new(true);
+        let accepted = Mutex::new(None);
+        let passive_safe = AtomicBool::new(false);
+        let reason = Mutex::new(None);
+
+        run_monitor_worker(
+            &mut system,
+            owner.hwnd,
+            baseline,
+            MonitorWorkerChannels {
+                cancelled: &cancelled,
+                api_returned: &api_returned,
+                terminal_gate: &MonitorTerminal::default(),
+                armed: &armed,
+                accepted: &accepted,
+                passive_safe: &passive_safe,
+                reason: &reason,
+            },
+        );
+
+        assert_eq!(*reason.lock().unwrap(), Some(MonitorStop::ApiReturned));
+        assert!(!system.trace.contains(&"activate"));
+        assert!(accepted.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn monitor_stops_if_api_returns_during_final_focus_sample() {
+        let (mut system, baseline, owner, _) = handoff_fixture();
+        system.foreground = owner.hwnd;
+        let cancelled = AtomicBool::new(false);
+        let api_returned = Arc::new(AtomicBool::new(false));
+        system.api_returned_on_foreground = Some((2, Arc::clone(&api_returned)));
+        let armed = AtomicBool::new(true);
+        let accepted = Mutex::new(None);
+        let passive_safe = AtomicBool::new(false);
+        let reason = Mutex::new(None);
+
+        run_monitor_worker(
+            &mut system,
+            owner.hwnd,
+            baseline,
+            MonitorWorkerChannels {
+                cancelled: &cancelled,
+                api_returned: &api_returned,
+                terminal_gate: &MonitorTerminal::default(),
+                armed: &armed,
+                accepted: &accepted,
+                passive_safe: &passive_safe,
+                reason: &reason,
+            },
+        );
+
+        assert_eq!(*reason.lock().unwrap(), Some(MonitorStop::ApiReturned));
+        assert!(!system.trace.contains(&"activate"));
+        assert!(accepted.lock().unwrap().is_none());
     }
 
     fn test_registration() -> RegisteredCredential {
@@ -3148,6 +4955,7 @@ mod tests {
         let (mut system, baseline, owner, broker) = handoff_fixture();
         assert!(validate_owner_foreground(owner.hwnd as HWND, owner.hwnd as HWND).is_ok());
         let mut pending = test_pending(&mut system, baseline, owner, broker);
+        system.foreground_sequence = [broker.hwnd, owner.hwnd].into();
         system.trace.clear();
         assert_eq!(
             prepare_continuation(&mut pending, owner.hwnd, &[vec![7, 8]], &mut system),
@@ -3155,26 +4963,12 @@ mod tests {
         );
         assert!(pending.is_none());
         assert!(validate_owner_foreground(owner.hwnd as HWND, system.foreground as HWND).is_ok());
-        assert_eq!(
-            system
-                .trace
-                .iter()
-                .filter(|event| **event == "activate")
-                .count(),
-            1
-        );
+        assert!(!system.trace.contains(&"activate"));
         assert!(
             !system.trace.contains(&"restore"),
-            "visible maximized/nonminimized state is preserved"
+            "continuation must not restore or foreground any HWND"
         );
         assert!(system.windows[0].maximized);
-        let activation = system
-            .trace
-            .iter()
-            .position(|event| *event == "activate")
-            .unwrap();
-        assert_eq!(system.trace[activation - 1], "foreground");
-        assert!(system.trace[activation + 1..].contains(&"foreground"));
     }
 
     #[test]
@@ -3209,24 +5003,18 @@ mod tests {
     }
 
     #[test]
-    fn handoff_restores_only_a_minimized_valid_associated_owner() {
+    fn handoff_minimized_owner_is_refused_without_restore() {
         let (mut system, baseline, owner, broker) = handoff_fixture();
         let mut pending = test_pending(&mut system, baseline, owner, broker);
         system.windows[0].minimized = true;
         system.trace.clear();
         assert_eq!(
             prepare_continuation(&mut pending, owner.hwnd, &[vec![7, 8]], &mut system),
-            Ok(HandoffOutcome::Recovered)
+            Err(HandoffRefusal::Owner)
         );
-        assert_eq!(
-            system
-                .trace
-                .iter()
-                .filter(|event| **event == "restore")
-                .count(),
-            1
-        );
-        assert!(!system.windows[0].minimized);
+        assert!(!system.trace.contains(&"activate"));
+        assert!(!system.trace.contains(&"restore"));
+        assert!(system.windows[0].minimized);
     }
 
     #[test]
@@ -3388,35 +5176,24 @@ mod tests {
     }
 
     #[test]
-    fn handoff_activation_failure_or_wrong_native_snapshot_aborts_and_cannot_replay() {
-        for false_return in [false, true] {
-            let (mut system, baseline, owner, broker) = handoff_fixture();
-            let mut pending = test_pending(&mut system, baseline, owner, broker);
-            system.activation_succeeds = !false_return;
-            if !false_return {
-                system.foreground_sequence = vec![2, 2, 3].into();
-            }
-            system.trace.clear();
-            assert_eq!(
-                prepare_continuation(&mut pending, owner.hwnd, &[vec![7, 8]], &mut system),
-                Err(HandoffRefusal::Activation)
-            );
-            assert!(pending.is_none());
-            assert_eq!(
-                system
-                    .trace
-                    .iter()
-                    .filter(|event| **event == "activate")
-                    .count(),
-                1
-            );
-            system.trace.clear();
-            assert_eq!(
-                prepare_continuation(&mut pending, owner.hwnd, &[vec![7, 8]], &mut system),
-                Ok(HandoffOutcome::Ordinary)
-            );
-            assert!(!system.trace.contains(&"activate"));
-        }
+    fn handoff_broker_still_foreground_refuses_and_cannot_replay() {
+        let (mut system, baseline, owner, broker) = handoff_fixture();
+        let mut pending = test_pending(&mut system, baseline, owner, broker);
+        system.trace.clear();
+        assert_eq!(
+            prepare_continuation(&mut pending, owner.hwnd, &[vec![7, 8]], &mut system),
+            Err(HandoffRefusal::Foreground)
+        );
+        assert!(pending.is_none());
+        assert!(!system.trace.contains(&"activate"));
+        assert!(!system.trace.contains(&"restore"));
+        system.trace.clear();
+        assert_eq!(
+            prepare_continuation(&mut pending, owner.hwnd, &[vec![7, 8]], &mut system),
+            Ok(HandoffOutcome::Ordinary)
+        );
+        assert!(!system.trace.contains(&"activate"));
+        assert!(!system.trace.contains(&"restore"));
     }
 
     #[test]
@@ -3463,6 +5240,7 @@ mod tests {
         let monitor = WebAuthnForegroundMonitor {
             cancelled: Arc::new(AtomicBool::new(false)),
             api_returned: Arc::new(AtomicBool::new(false)),
+            terminal_gate: Arc::new(MonitorTerminal::default()),
             armed: Arc::new(AtomicBool::new(true)),
             accepted: Arc::clone(&accepted),
             worker: Some(thread::spawn(move || {
@@ -3484,6 +5262,7 @@ mod tests {
         let monitor = WebAuthnForegroundMonitor {
             cancelled: Arc::new(AtomicBool::new(false)),
             api_returned: Arc::new(AtomicBool::new(false)),
+            terminal_gate: Arc::new(MonitorTerminal::default()),
             armed: Arc::new(AtomicBool::new(true)),
             accepted: Arc::new(Mutex::new(Some(proof))),
             worker: Some(thread::spawn(|| panic!("synthetic monitor failure"))),
@@ -3519,72 +5298,89 @@ mod tests {
     }
 
     #[test]
-    fn handoff_capture_refuses_preexisting_hidden_or_changed_candidates_and_cancel() {
-        for change in 0..5 {
+    fn handoff_capture_refuses_preexisting_hidden_or_changed_candidates() {
+        for change in 0..4 {
             let (mut system, mut baseline, _, broker) = handoff_fixture();
             match change {
                 0 => {
                     Arc::get_mut(&mut baseline).unwrap().windows.insert(broker);
                 }
-                1 => {
-                    Arc::get_mut(&mut baseline)
-                        .unwrap()
-                        .processes
-                        .insert(broker.process_id);
-                }
-                2 => system.windows[1].visible = false,
-                3 => system.windows[1].identity.thread_id = 99,
+                1 => system.windows[1].visible = false,
+                2 => system.windows[1].identity.thread_id = 99,
                 _ => system.foreground = 3,
             }
             assert!(capture_broker(&mut system, baseline, broker).is_none());
         }
-        let (mut system, baseline, _, broker) = handoff_fixture();
-        let cancelled = AtomicBool::new(true);
-        let channel = Mutex::new(None);
-        record_broker(
-            &mut system,
-            Arc::clone(&baseline),
-            broker,
-            &cancelled,
-            &channel,
-        );
-        assert!(channel.lock().unwrap().is_none());
-        cancelled.store(false, Ordering::Release);
-        record_broker(&mut system, baseline, broker, &cancelled, &channel);
-        assert_eq!(channel.lock().unwrap().as_ref().unwrap().identity, broker);
     }
 
     #[test]
-    fn handoff_restore_failure_and_focus_change_after_restore_abort() {
-        for restore_fails in [false, true] {
-            let (mut system, baseline, owner, broker) = handoff_fixture();
-            let mut pending = test_pending(&mut system, baseline, owner, broker);
-            system.windows[0].minimized = true;
-            system.restore_succeeds = !restore_fails;
-            if !restore_fails {
-                system.foreground_sequence = vec![2, 2, 3, 3].into();
-            }
-            system.trace.clear();
-            let expected = if restore_fails {
-                HandoffRefusal::Owner
-            } else {
-                HandoffRefusal::Foreground
-            };
-            assert_eq!(
-                prepare_continuation(&mut pending, owner.hwnd, &[vec![7, 8]], &mut system),
-                Err(expected)
-            );
-            assert!(pending.is_none());
-            assert!(!system.trace.contains(&"activate"));
-            assert_eq!(
-                system
-                    .trace
-                    .iter()
-                    .filter(|event| **event == "restore")
-                    .count(),
-                1
-            );
-        }
+    fn baseline_known_window_is_not_accepted_as_a_new_dialog() {
+        let (mut system, mut baseline, owner, broker) = handoff_fixture();
+        Arc::get_mut(&mut baseline).unwrap().windows.insert(broker);
+
+        assert!(!is_new_window_identity(
+            broker,
+            &baseline.windows,
+            &baseline.unattributed_windows
+        ));
+        let initial_foreground = system.foreground;
+        let cancelled = AtomicBool::new(false);
+        let mut passive_safe = true;
+        let accepted = Mutex::new(None);
+        let reason = monitor_observe_reason(
+            &mut system,
+            owner.hwnd,
+            baseline,
+            &cancelled,
+            &AtomicBool::new(false),
+            &MonitorTerminal::default(),
+            &mut passive_safe,
+            &accepted,
+        );
+
+        assert_eq!(
+            reason,
+            Some(MonitorStop::ForegroundLost),
+            "a window already present in the complete baseline is not a new candidate"
+        );
+        assert_eq!(
+            system.foreground, initial_foreground,
+            "the monitor must leave focus unchanged"
+        );
+        assert!(!system.trace.contains(&"activate"));
+        assert!(!passive_safe);
+
+        let observation = BrokerObservation {
+            broker: None,
+            passive_safe,
+        };
+        let mut pending = None;
+        complete_registration(&mut pending, Ok((test_registration(), owner, observation))).unwrap();
+        assert_eq!(
+            prepare_continuation(&mut pending, owner.hwnd, &[vec![7, 8]], &mut system),
+            Err(HandoffRefusal::UnobservedBroker)
+        );
+        assert_eq!(
+            system.foreground, initial_foreground,
+            "unbound prompt must not trigger owner activation"
+        );
+        assert!(!system.trace.contains(&"activate"));
+    }
+
+    #[test]
+    fn handoff_minimized_owner_never_restores_or_activates() {
+        let (mut system, baseline, owner, broker) = handoff_fixture();
+        let mut pending = test_pending(&mut system, baseline, owner, broker);
+        system.windows[0].minimized = true;
+        system.trace.clear();
+        assert_eq!(
+            prepare_continuation(&mut pending, owner.hwnd, &[vec![7, 8]], &mut system),
+            Err(HandoffRefusal::Owner)
+        );
+        assert!(pending.is_none());
+        assert!(!system.trace.contains(&"activate"));
+        assert!(!system.trace.contains(&"restore"));
+        assert!(system.windows[0].minimized);
     }
 
     #[test]
@@ -3850,11 +5646,21 @@ mod tests {
                     },
                 ))
             } else {
-                // Synthetic native success/focus loss, followed by real capture policy.
-                self.system.foreground = self.broker.hwnd;
-                let observation =
-                    capture_broker(&mut self.system, Arc::clone(&self.baseline), self.broker);
-                Ok((test_registration(), self.owner, (observation).into()))
+                let accepted = Mutex::new(None);
+                let mut policy = MonitorPolicy::default();
+                assert!(policy.observe(
+                    &mut self.system,
+                    self.owner.hwnd,
+                    Arc::clone(&self.baseline),
+                    &AtomicBool::new(false),
+                    &accepted
+                ));
+                let observation = BrokerObservation {
+                    broker: accepted.lock().unwrap().take(),
+                    passive_safe: policy.passive_safe,
+                };
+                self.system.foreground_sequence = [self.broker.hwnd, self.owner.hwnd].into();
+                Ok((test_registration(), self.owner, observation))
             };
             complete_registration(&mut self.pending, result)
         }
@@ -3927,6 +5733,7 @@ mod tests {
                 MonitorWorkerChannels {
                     cancelled: &cancelled,
                     api_returned: &AtomicBool::new(false),
+                    terminal_gate: &MonitorTerminal::default(),
                     armed: &armed,
                     accepted: &accepted,
                     passive_safe: &safe,
@@ -3938,34 +5745,32 @@ mod tests {
             assert!(!safe.load(Ordering::Acquire));
             assert!(!system.trace.contains(&"activate"));
         }
-        let (mut system, baseline, owner, broker) = handoff_fixture();
-        let proof = capture_broker(&mut system, Arc::clone(&baseline), broker).unwrap();
-        let accepted_a = Arc::new(Mutex::new(None));
-        let accepted_b = Arc::new(Mutex::new(None));
+        let accepted_a: Arc<Mutex<Option<AcceptedBroker>>> = Arc::new(Mutex::new(None));
+        let accepted_b: Arc<Mutex<Option<AcceptedBroker>>> = Arc::new(Mutex::new(None));
         let reason_a = Arc::new(Mutex::new(None));
         let reason_b = Arc::new(Mutex::new(None));
         assert!(!Arc::ptr_eq(&accepted_a, &accepted_b));
         assert!(!Arc::ptr_eq(&reason_a, &reason_b));
-        let output = Arc::clone(&accepted_a);
         let reason = Arc::clone(&reason_a);
         let a = WebAuthnForegroundMonitor {
             cancelled: Arc::new(AtomicBool::new(false)),
             api_returned: Arc::new(AtomicBool::new(false)),
+            terminal_gate: Arc::new(MonitorTerminal::default()),
             armed: Arc::new(AtomicBool::new(true)),
             accepted: Arc::clone(&accepted_a),
             passive_safe: Arc::new(AtomicBool::new(false)),
             reason: Arc::clone(&reason_a),
             operation: Operation::MakeCredential,
-            pid: owner.process_id,
+            pid: 10,
             worker: Some(thread::spawn(move || {
-                *output.lock().unwrap() = Some(proof);
-                *reason.lock().unwrap() = Some(MonitorStop::Accepted);
+                *reason.lock().unwrap() = Some(MonitorStop::ActivationFailed);
             })),
         };
         let reason = Arc::clone(&reason_b);
         let b = WebAuthnForegroundMonitor {
             cancelled: Arc::new(AtomicBool::new(false)),
             api_returned: Arc::new(AtomicBool::new(false)),
+            terminal_gate: Arc::new(MonitorTerminal::default()),
             armed: Arc::new(AtomicBool::new(true)),
             accepted: Arc::clone(&accepted_b),
             passive_safe: Arc::new(AtomicBool::new(false)),
@@ -3976,13 +5781,18 @@ mod tests {
                 *reason.lock().unwrap() = Some(MonitorStop::Incomplete);
             })),
         };
-        assert_eq!(a.finish_observation().broker.unwrap().identity, broker);
-        let outcome = b.finish_observation();
-        assert!(outcome.broker.is_none());
-        assert!(!outcome.passive_safe);
+        let outcome_a = a.finish_observation();
+        let outcome_b = b.finish_observation();
+        assert!(outcome_a.broker.is_none());
+        assert!(outcome_b.broker.is_none());
+        assert!(!outcome_a.passive_safe);
+        assert!(!outcome_b.passive_safe);
         assert!(accepted_a.lock().unwrap().is_none());
         assert!(accepted_b.lock().unwrap().is_none());
-        assert_eq!(*reason_a.lock().unwrap(), Some(MonitorStop::Accepted));
+        assert_eq!(
+            *reason_a.lock().unwrap(),
+            Some(MonitorStop::ActivationFailed)
+        );
         assert_eq!(*reason_b.lock().unwrap(), Some(MonitorStop::Incomplete));
     }
 
@@ -4005,6 +5815,7 @@ mod tests {
                 .register_key_with_label(&mut backend, None, "New")
                 .is_err());
             assert_eq!(backend.get_calls, 1);
+            assert_eq!(backend.ffi_calls, if refusal { 0 } else { 1 });
             assert!(backend.pending.is_none());
             assert_eq!(vault.keys_meta(), slots);
             assert_eq!(vault.audit().len(), audit);
@@ -4055,11 +5866,13 @@ mod tests {
                 let accepted = Arc::new(Mutex::new(None));
                 let safe = Arc::new(AtomicBool::new(false));
                 let reason = Arc::new(Mutex::new(None));
+                let terminal_gate = Arc::new(MonitorTerminal::default());
                 let (entered, waiting) = std::sync::mpsc::channel();
                 system.worker_wait_entered = Some(entered);
                 system.wait_until_stopped = Some(Arc::clone(&cancelled));
                 let worker_cancelled = Arc::clone(&cancelled);
                 let worker_returned = Arc::clone(&returned);
+                let worker_terminal_gate = Arc::clone(&terminal_gate);
                 let worker_armed = Arc::clone(&armed);
                 let worker_accepted = Arc::clone(&accepted);
                 let worker_safe = Arc::clone(&safe);
@@ -4072,6 +5885,7 @@ mod tests {
                         MonitorWorkerChannels {
                             cancelled: &worker_cancelled,
                             api_returned: &worker_returned,
+                            terminal_gate: &worker_terminal_gate,
                             armed: &worker_armed,
                             accepted: &worker_accepted,
                             passive_safe: &worker_safe,
@@ -4082,6 +5896,7 @@ mod tests {
                 let mut monitor = WebAuthnForegroundMonitor {
                     cancelled,
                     api_returned: Arc::clone(&returned),
+                    terminal_gate,
                     armed,
                     accepted,
                     passive_safe: safe,
@@ -4143,8 +5958,10 @@ mod tests {
             let accepted = Arc::new(Mutex::new(None));
             let safe = Arc::new(AtomicBool::new(false));
             let reason = Arc::new(Mutex::new(None));
+            let terminal_gate = Arc::new(MonitorTerminal::default());
             let worker_cancelled = Arc::clone(&cancelled);
             let worker_returned = Arc::clone(&returned);
+            let worker_terminal_gate = Arc::clone(&terminal_gate);
             let worker_armed = Arc::clone(&armed);
             let worker_accepted = Arc::clone(&accepted);
             let worker_safe = Arc::clone(&safe);
@@ -4162,6 +5979,7 @@ mod tests {
                     MonitorWorkerChannels {
                         cancelled: &worker_cancelled,
                         api_returned: &worker_returned,
+                        terminal_gate: &worker_terminal_gate,
                         armed: &worker_armed,
                         accepted: &worker_accepted,
                         passive_safe: &worker_safe,
@@ -4174,6 +5992,7 @@ mod tests {
             let monitor = WebAuthnForegroundMonitor {
                 cancelled,
                 api_returned: returned,
+                terminal_gate,
                 armed,
                 accepted,
                 passive_safe: safe,
@@ -4211,6 +6030,7 @@ mod tests {
                 MonitorWorkerChannels {
                     cancelled: &cancelled,
                     api_returned: &returned,
+                    terminal_gate: &MonitorTerminal::default(),
                     armed: &AtomicBool::new(true),
                     accepted: &accepted,
                     passive_safe: &safe,
@@ -4282,6 +6102,7 @@ mod tests {
         let monitor = WebAuthnForegroundMonitor {
             cancelled: Arc::new(AtomicBool::new(false)),
             api_returned: Arc::new(AtomicBool::new(false)),
+            terminal_gate: Arc::new(MonitorTerminal::default()),
             armed: Arc::new(AtomicBool::new(true)),
             accepted,
             passive_safe: Arc::new(AtomicBool::new(true)),
@@ -4626,6 +6447,7 @@ mod tests {
                 .register_key_with_label(&mut backend, None, "New")
                 .is_err());
             assert_eq!(backend.get_calls, 1);
+            assert_eq!(backend.ffi_calls, if activation_fails { 0 } else { 1 });
             assert!(backend.pending.is_none());
             assert_eq!(vault.keys_meta(), slots);
             assert_eq!(vault.audit().len(), audit_length);
@@ -4643,6 +6465,7 @@ mod tests {
             .register_key_with_label(&mut backend, None, "New")
             .unwrap();
         assert_eq!(backend.get_calls, 1);
+        assert_eq!(backend.ffi_calls, 1);
         assert!(backend.pending.is_none());
         assert_eq!(vault.keys_meta().len(), 1);
         assert_eq!(
@@ -4688,7 +6511,6 @@ mod tests {
                 current_session: 2,
                 window_session: 2,
                 is_new_window: true,
-                is_new_process: true,
             }
         ));
 
@@ -4761,14 +6583,45 @@ mod tests {
                     current_session,
                     window_session,
                     is_new_window: is_new,
-                    is_new_process: true,
                 }
             ));
         }
     }
 
     #[test]
-    fn broker_dialog_requires_new_process_and_new_window_identity() {
+    fn new_security_dialog_window_in_existing_trusted_broker_process_is_detected() {
+        let candidate = WindowsSecurityDialogCandidate {
+            title: "Windows 安全性",
+            class_name: "Credential Dialog Xaml Host",
+            process_path: r"C:\Windows\System32\CredentialUIBroker.exe",
+            system_directory: r"C:\Windows\System32",
+            visible: true,
+            current_session: 2,
+            window_session: 2,
+            is_new_window: true,
+        };
+        let existing_broker_window = WindowIdentity {
+            hwnd: 0x1203ce,
+            process_id: 1492,
+            thread_id: 2844,
+            session: 2,
+        };
+        let newly_created_dialog = WindowIdentity {
+            hwnd: 0xf03fc,
+            process_id: existing_broker_window.process_id,
+            thread_id: 9552,
+            session: 2,
+        };
+        assert!(is_new_window_identity(
+            newly_created_dialog,
+            &HashSet::from([existing_broker_window]),
+            &HashSet::new()
+        ));
+        assert!(is_new_windows_security_dialog(candidate));
+    }
+
+    #[test]
+    fn broker_dialog_requires_new_window_identity() {
         let trusted = WindowsSecurityDialogCandidate {
             title: "Windows 安全性",
             class_name: "Credential Dialog Xaml Host",
@@ -4778,15 +6631,8 @@ mod tests {
             current_session: 2,
             window_session: 2,
             is_new_window: true,
-            is_new_process: true,
         };
         assert!(is_new_windows_security_dialog(trusted));
-        assert!(!is_new_windows_security_dialog(
-            WindowsSecurityDialogCandidate {
-                is_new_process: false,
-                ..trusted
-            }
-        ));
         assert!(!is_new_windows_security_dialog(
             WindowsSecurityDialogCandidate {
                 is_new_window: false,
@@ -4804,7 +6650,7 @@ mod tests {
             session: 2,
         };
         let baseline = HashSet::from([existing]);
-        assert!(!is_new_window_identity(existing, &baseline));
+        assert!(!is_new_window_identity(existing, &baseline, &HashSet::new()));
         assert!(is_new_window_identity(
             WindowIdentity {
                 hwnd: existing.hwnd,
@@ -4813,6 +6659,7 @@ mod tests {
                 session: 2,
             },
             &baseline,
+            &HashSet::new(),
         ));
     }
 
@@ -4833,24 +6680,6 @@ mod tests {
         assert_eq!(select_unique_candidate(&[first]), Some(first));
         assert_eq!(select_unique_candidate(&[first, second]), None);
         assert_eq!(select_unique_candidate(&[]), None);
-    }
-
-    #[test]
-    fn activation_is_skipped_after_focus_changes_or_monitor_cancels() {
-        let owner = 0x1d056c;
-        let dialog = 0x1203ce;
-        assert!(should_attempt_dialog_activation(
-            owner, dialog, owner, false
-        ));
-        assert!(!should_attempt_dialog_activation(
-            owner, dialog, 0xabc, false
-        ));
-        assert!(!should_attempt_dialog_activation(
-            owner, dialog, dialog, false
-        ));
-        assert!(!should_attempt_dialog_activation(
-            owner, dialog, owner, true
-        ));
     }
 
     #[test]

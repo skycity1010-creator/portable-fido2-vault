@@ -45,7 +45,6 @@ impl NativeSessionEvidence {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MonitorStop {
-    Accepted,
     CancelledBeforeArm,
     Cancelled,
     ApiReturned,
@@ -54,8 +53,10 @@ pub(crate) enum MonitorStop {
     Incomplete,
     Ambiguous,
     ForegroundLost,
+    CandidateForeground,
     CandidateChanged,
     ActivationFailed,
+    NonConsoleSession,
     WorkerFailed,
     ChannelFailed,
 }
@@ -63,7 +64,6 @@ pub(crate) enum MonitorStop {
 impl MonitorStop {
     fn label(self) -> &'static str {
         match self {
-            Self::Accepted => "accepted",
             Self::CancelledBeforeArm => "cancelled-before-arm",
             Self::Cancelled => "cancelled",
             Self::ApiReturned => "api-returned",
@@ -72,8 +72,10 @@ impl MonitorStop {
             Self::Incomplete => "incomplete",
             Self::Ambiguous => "ambiguous",
             Self::ForegroundLost => "foreground-lost",
+            Self::CandidateForeground => "candidate-foreground",
             Self::CandidateChanged => "candidate-changed",
             Self::ActivationFailed => "activation-failed",
+            Self::NonConsoleSession => "non-console-session",
             Self::WorkerFailed => "worker-failed",
             Self::ChannelFailed => "channel-failed",
         }
@@ -110,7 +112,6 @@ pub(crate) enum ContinuationStatus {
     UnobservedBroker,
     Foreground,
     Broker,
-    Activation,
     Session,
     Deadline,
 }
@@ -127,7 +128,6 @@ impl ContinuationStatus {
             Self::UnobservedBroker => "unobserved-broker",
             Self::Foreground => "foreground-refused",
             Self::Broker => "broker-refused",
-            Self::Activation => "activation-refused",
             Self::Session => "session-refused",
             Self::Deadline => "deadline",
         }
@@ -397,7 +397,6 @@ mod tests {
     #[test]
     fn monitor_serializer_exact_operation_pid_and_closed_reason() {
         for (reason, label) in [
-            (MonitorStop::Accepted, "accepted"),
             (MonitorStop::CancelledBeforeArm, "cancelled-before-arm"),
             (MonitorStop::Cancelled, "cancelled"),
             (MonitorStop::ApiReturned, "api-returned"),
@@ -406,8 +405,10 @@ mod tests {
             (MonitorStop::Incomplete, "incomplete"),
             (MonitorStop::Ambiguous, "ambiguous"),
             (MonitorStop::ForegroundLost, "foreground-lost"),
+            (MonitorStop::CandidateForeground, "candidate-foreground"),
             (MonitorStop::CandidateChanged, "candidate-changed"),
             (MonitorStop::ActivationFailed, "activation-failed"),
+            (MonitorStop::NonConsoleSession, "non-console-session"),
             (MonitorStop::WorkerFailed, "worker-failed"),
             (MonitorStop::ChannelFailed, "channel-failed"),
         ] {
