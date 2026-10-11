@@ -1,6 +1,6 @@
 # 雙群組金鑰控管版（Dual-Control Edition）設計文件
 
-> 狀態：**D1–D9 已實作；D10–D13 未開始，實機驗收待 D13**。PR #29 維持 draft，未合併／未部署。
+> 狀態：**D1–D10 已實作；D11–D13 未開始，實機驗收待 D13**。PR #29 維持 draft，未合併／未部署。
 > 分支：`feature/dual-control-20261011`（base `main` `656ac95`）。
 > 需求來源：使用者 2026-10-11 Hermes desktop 對話（Q1–Q6 已裁決，見 §1）。
 
@@ -227,7 +227,8 @@ KEK（隨機 256-bit，加解密 payload；與 v1 相同）
 - [x] D7 兩步驟登入狀態機（begin / complete / cancel / 逾時，見 §11）
 - [x] D8 群組最後一支金鑰不可刪除 + 金鑰清單群組資料（見 §11）
 - [x] D9 時限設定：payload 權威值、header 鏡像、clamp 與竄改修復（見 §11）
-- [ ] D10–D13
+- [x] D10 前端：edition 切換、兩步驟登入與倒數、群組註冊、金鑰清單群組／刪除限制、時限設定、break-glass 提示（見 §11）
+- [ ] D11–D13
 
 ## 11. 驗證紀錄
 
@@ -431,3 +432,26 @@ KEK（隨機 256-bit，加解密 payload；與 v1 相同）
 - GNU Release 單人版 `--features real-ctap --bin portable-fido-vault` 與雙人版 `--features real-ctap,dual-control --bin portable-fido-vault-dual` 均建置成功，x86_64 PE 與 SHA256 已核對；產物僅留在獨立 scratch target，未執行 GUI／未部署。隔離的 `TEMP/TMP/TMPDIR` synthetic fixture 目錄下另重跑 single／dual 各 324/324，production source 仍與審查 snapshot 一致。
 - 最終 reviewer 剩餘建議屬非阻擋性，留待 D11：鏡像不一致＋payload tag 破壞的組合；兩支金鑰成功但權威設定缺失／超界且有 sidecar；修復登入的 rename 階段故障。既有共用驗證／寫入順序已覆核，未發現 production 缺陷。
 - 全部原始 log、失敗嘗試、唯讀 verdict、snapshot／manifest 留存 `D:/scratch/dual-control-20261011/d9/`，收尾另存 durable archive。PR #29 保持 draft、整體 Kanban blocked；未合併／未部署／未接觸正式 vault／未開始 D10，實機驗收仍待 D13。新的 exact-head CI 結果由 archive receipt 與 Kanban 讀回紀錄，不以舊 D8 run 替代。
+
+### D10（2026-10-11）
+
+- 範圍只有靜態前端：`src/app.js`、`src/index.html`、`src/styles.css`，新增 `tests/dual-control-ui.test.cjs`。Rust／Tauri IPC 未變更（沿用 D1–D9 的 `get_edition`、`login_dual_begin/complete/cancel`、`register_key(group)`、`KeyInfo.group/last_in_group`、`set_dual_step_timeout`、`Settings.dual_step_timeout_secs`）。
+- **edition 切換**：`boot` 先呼叫 `get_edition`；回 `"dual"` 才顯示雙人版 UI（頁面標題、`edition-badge`）。呼叫失敗時維持單人版 UI，雙人版金庫仍由 Rust 版本互斥 fail closed。所有雙人版元素在 HTML 預設 `hidden`；單人版既有 65 個 Node 測試不變且全過。
+- **兩步驟登入**：
+  - A、B 群組各至少一支才顯示「以金鑰登入（第一步）」；否則隱藏並提示「需 A、B 群組各至少一支金鑰；目前請以主密碼登入」。
+  - 第一步呼叫 `login_dual_begin`，顯示「<群組>（<名稱>）已驗證，請 <另一群組>成員於 N 秒內完成驗證」與倒數（以 Rust 回傳的 `remaining_ms` 計算，僅供顯示）。名稱一律用 `textContent`。
+  - 第二步 `login_dual_complete`：進行中停止前端倒數（截止由 Rust 前後檢查）；失敗一律回第一步並提示「請從第一步重新開始」（Rust 暫存不論成敗都已取走）。
+  - 取消呼叫 `login_dual_cancel`；倒數歸零只回第一步，不呼叫取消（Rust 計時執行緒自行清除並記錄逾時）。
+  - 第一步進行中重複點擊只送一次；以 generation 忽略已失效的回應。
+  - 非 broker 後端（debug mock／raw CTAP）每步各自讀取選填 PIN，讀後清空欄位。
+- **break-glass**：雙人版主密碼登入成功後顯示醒目提示「本次以主密碼緊急登入」；若有進行中的兩步驟，先 `login_dual_cancel` 再送密碼。單人版不顯示。
+- **註冊**：命名對話框加 A/B 單選（無預設、每次開啟重設），未選群組留在對話框且不偵測金鑰；雙人版 `register_key` 帶 `group`，單人版參數形狀不變（不含 `group` 鍵）。
+- **金鑰管理**：雙人版依 A、B 分組列出並顯示各群組支數與是否已啟用金鑰登入；`last_in_group` 的移除鈕停用並說明原因（刪除限制仍以 Rust `LastKeyInGroup` 為準）。清單全以 DOM 節點 + `textContent` 建立。
+- **設定**：雙人版顯示「第二步等待時限（30–600 秒）」，載入加密 payload 的權威值；前端驗證整數 30–600 後呼叫 `set_dual_step_timeout`。
+- TDD：先加 HTML 與空殼函式（stub），19 個新測試中 **15 個 assertion RED**（`02-red-stub.log`，皆 `ERR_ASSERTION`）；其餘 4 個在 stub 階段即通過，屬既有／靜態行為（HTML 元素與預設 hidden、單人版 key login、單人版註冊不帶 group、單人版隱藏時限設定），不計 RED。第一次 RED 因測試 fake DOM 缺 `querySelectorAll` 產生非斷言錯誤訊息，保留為 `01-SUPERSEDED-harness-*.log`，只補 fixture，未改斷言。GREEN 一次通過。
+- 驗證：Node **84/84**（65 + 19）、`node --check src/app.js`、`git diff --check` 通過；跑測試前後四個檔案 SHA-256 一致；新增程式行未使用 `innerHTML`／`eval`／`insertAdjacentHTML`。Rust 未變更，本機未重跑 Rust 套件，以 exact-head CI 為準。
+- 證據：`D:/scratch/dual-control-20261011/d10/`。
+- 未涵蓋／留待後續：
+  - 原生視窗標題仍為 `tauri.conf.json` 的「可攜式 FIDO2 密碼金庫」；D10 只改頁面標題與畫面內標示。§5「視窗標題顯示雙群組控管版」需 Rust 端 `set_title` 或設定調整，留待 D11 決定。
+  - 「關於」畫面目前不存在，本期未新增。
+  - 計時執行緒實際觸發、IPC 整合與 GUI 實際操作留待 D11 mock E2E 與 D13 實機。

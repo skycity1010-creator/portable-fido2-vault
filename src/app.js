@@ -17,6 +17,22 @@ let activeCsvImportToken = null;
 let csvImportInFlight = false;
 let entrySearchQuery = "";
 
+// 雙群組控管版（dual-control）狀態；單人版維持 "single"，不改既有行為。
+// 兩步驟登入的 share 只存在 Rust 端；前端只保存顯示用的截止時間（倒數僅供顯示，以 Rust 為準）。
+let edition = "single";
+let dualLoginReady = false;
+let dualLogin = null; // { deadline, timer }
+let dualBusy = false;
+let dualGeneration = 0;
+const GROUP_NAMES = { A: "A 群組", B: "B 群組" };
+function isDual() { return edition === "dual"; }
+function groupName(group) { return GROUP_NAMES[group] || "未知群組"; }
+function groupCounts(keys) {
+  const counts = { A: 0, B: 0 };
+  for (const key of keys || []) if (key.group === "A" || key.group === "B") counts[key.group] += 1;
+  return counts;
+}
+
 // ─────────────── 工具 ───────────────
 function show(id) { $(id).classList.remove("hidden"); }
 function hide(id) { $(id).classList.add("hidden"); }
@@ -39,14 +55,29 @@ function esc(s) {
 function errBox(msg) { $("login-error").textContent = msg || ""; }
 
 // ─────────────── 啟動 ───────────────
+async function loadEdition() {
+  // 取不到 edition 時維持單人版 UI；雙人版金庫仍由 Rust 端版本互斥 fail closed。
+  try {
+    edition = (await invoke("get_edition")) === "dual" ? "dual" : "single";
+  } catch {
+    edition = "single";
+  }
+  if (!isDual()) return;
+  document.title = "可攜式 FIDO2 密碼金庫（雙群組控管版）";
+  show("edition-badge");
+}
+
 async function boot() {
   try {
+    await loadEdition();
     const info = await invoke("boot_info");
     if (info.has_vault) {
       show("screen-login");
       hide("setup-panel");
       show("login-panel");
-      $("login-sub").textContent = "可使用主密碼或任一支已註冊金鑰登入";
+      $("login-sub").textContent = isDual()
+        ? "以 A、B 群組金鑰各一支依序驗證登入；主密碼僅供緊急登入"
+        : "可使用主密碼或任一支已註冊金鑰登入";
       renderLoginKeys(info.keys, info.brokered_key_login);
     } else {
       show("screen-login");
@@ -67,6 +98,7 @@ function renderLoginKeys(keys, useBrokeredKeyLogin) {
   box.innerHTML = "";
   hide("btn-login-key");
   hide("pin-box");
+  if (isDual()) return renderDualLoginKeys(keys);
   if (!keys.length) {
     box.textContent = "（尚無已註冊金鑰 — 登入後可於「金鑰管理」註冊）";
     return;
@@ -85,6 +117,21 @@ function renderLoginKeys(keys, useBrokeredKeyLogin) {
     item.onclick = () => selectLoginKey(key, item);
     box.appendChild(item);
   }
+}
+
+function renderDualLoginKeys(keys) {
+  const counts = groupCounts(keys);
+  const hint = $("dual-login-hint");
+  show("dual-login-hint");
+  dualLoginReady = counts.A > 0 && counts.B > 0;
+  if (!dualLoginReady) {
+    hint.textContent = "需 A、B 群組各至少一支金鑰；目前請以主密碼登入";
+    return;
+  }
+  hint.textContent = `雙群組控管：需 A 群組與 B 群組成員各以一支金鑰依序驗證（先 A 或先 B 皆可）。目前 A 群組 ${counts.A} 支、B 群組 ${counts.B} 支。`;
+  $("btn-login-key").textContent = "以金鑰登入（第一步）";
+  show("btn-login-key");
+  if (!brokeredKeyLogin) show("pin-box");
 }
 
 function selectLoginKey(key, item) {
@@ -110,12 +157,15 @@ async function doCreate() {
 async function doLoginPw() {
   errBox("");
   try {
+    // 改用主密碼登入：先放棄進行中的兩步驟登入（Rust 端清零 share 並記錄取消）。
+    if (isDual() && (dualLogin || dualBusy)) await abandonDualLogin();
     const entries = await invoke("login_password", { password: $("login-pw").value });
-    await enterMain(entries);
+    await enterMain(entries, { breakGlass: isDual() });
   } catch (e) { errBox(String(e)); }
 }
 
 async function doLoginKey() {
+  if (isDual()) return doDualBegin();
   errBox("");
   if (!brokeredKeyLogin && !selectedKey) return errBox("請先選擇一支金鑰");
   const button = $("btn-login-key");
@@ -139,15 +189,20 @@ async function doLoginKey() {
   }
 }
 
-async function enterMain(entries) {
+async function enterMain(entries, options = {}) {
   const session = ++entryDeleteSession;
   hide("screen-login");
   show("screen-main");
+  if (options.breakGlass) show("breakglass-banner"); else hide("breakglass-banner");
   if (!entries) entries = await invoke("list_entries");
   const settings = await invoke("get_vault_settings");
   idleMinutes = Math.min(60, Math.max(1, Number(settings.idle_lock_minutes) || 5));
   $("idle-minutes").value = idleMinutes;
   $("password-history-limit").value = Math.min(20, Math.max(1, Number(settings.password_history_limit) || 3));
+  if (isDual()) {
+    show("dual-settings");
+    $("dual-step-timeout").value = Math.min(600, Math.max(30, Number(settings.dual_step_timeout_secs) || 120));
+  }
   const audit = await invoke("list_audit");
   if (session !== entryDeleteSession) return;
   entryDeleteLocking = false;
@@ -532,6 +587,7 @@ async function renderKeys() {
   // 需解鎖後 header；用 list_entries 無法取 → 另加 command。此處以 register/remove 後重新 boot_info 近似。
   const info = await invoke("boot_info").catch(() => null);
   const box = $("keys-list");
+  if (isDual()) return renderDualKeys(box, info ? info.keys : null);
   box.innerHTML = "";
   if (!info || !info.keys.length) { box.innerHTML = '<div class="muted">（尚無已註冊金鑰）</div>'; return; }
   info.keys.forEach((k, i) => {
@@ -551,6 +607,75 @@ async function renderKeys() {
   });
 }
 
+function renderDualKeys(box, keys) {
+  box.replaceChildren();
+  $("keys-hint").textContent = "金鑰登入需 A 群組與 B 群組各一支金鑰依序驗證。群組註冊後不可修改；每個群組至少須保留一支金鑰。移除後該金鑰無法再解鎖（不可逆）。";
+  const status = $("dual-key-status");
+  show("dual-key-status");
+  if (!keys) {
+    status.textContent = "無法讀取金鑰清單";
+    return;
+  }
+  const counts = groupCounts(keys);
+  status.textContent = `A 群組 ${counts.A} 支、B 群組 ${counts.B} 支` + (counts.A && counts.B
+    ? "：雙群組金鑰登入已啟用"
+    : "：需 A、B 群組各至少一支金鑰才能以金鑰登入（目前僅能以主密碼登入）");
+  for (const group of ["A", "B"]) {
+    const section = document.createElement("div");
+    section.className = "key-group";
+    const heading = document.createElement("h4");
+    heading.textContent = `${groupName(group)}（${counts[group]} 支）`;
+    section.appendChild(heading);
+    const members = keys.filter((key) => key.group === group);
+    if (!members.length) {
+      const empty = document.createElement("div");
+      empty.className = "muted";
+      empty.textContent = "（尚無金鑰）";
+      section.appendChild(empty);
+    }
+    for (const key of members) section.appendChild(dualKeyItem(key));
+    box.appendChild(section);
+  }
+}
+
+function dualKeyItem(key) {
+  // 名稱是金庫標頭的明文資料：一律以 textContent 呈現，不經 innerHTML。
+  const item = document.createElement("div");
+  item.className = "key-item";
+  item.style.cursor = "default";
+  const label = document.createElement("span");
+  label.className = "klabel";
+  label.textContent = `🔑 ${key.label}`;
+  const type = document.createElement("span");
+  type.className = "ktype";
+  type.textContent = `${groupName(key.group)} · ${key.key_type} · ${key.prompt_zh}`;
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.textContent = "移除";
+  remove.style.marginLeft = "auto";
+  remove.dataset.credentialId = key.credential_id;
+  if (key.last_in_group) {
+    // 只是輔助；刪除限制由 Rust 端強制（LastKeyInGroup）。
+    remove.disabled = true;
+    remove.title = `不可刪除 ${groupName(key.group)}的最後一支金鑰（A、B 群組各須保留至少一支）`;
+    remove.setAttribute("aria-disabled", "true");
+  }
+  remove.onclick = async () => {
+    if (remove.disabled) return;
+    if (!confirm(`確定移除${groupName(key.group)}金鑰「${key.label}」？\n移除後該金鑰無法再解鎖（不可逆）。`)) return;
+    await invoke("remove_key", { credentialId: key.credential_id }).then(() => renderKeys()).catch((e) => alert(String(e)));
+  };
+  item.appendChild(label);
+  item.appendChild(type);
+  item.appendChild(remove);
+  return item;
+}
+
+function selectedKeyGroup() {
+  if ($("key-group-a").checked) return "A";
+  if ($("key-group-b").checked) return "B";
+  return null;
+}
 
 function validateKeyLabel(value) {
   const raw = String(value ?? "");
@@ -575,6 +700,9 @@ async function requestKeyLabel() {
   input.value = suggestedLabel;
   input.removeAttribute?.("aria-invalid");
   status.textContent = "";
+  $("key-group-a").checked = false;
+  $("key-group-b").checked = false;
+  if (isDual()) show("key-group-fieldset"); else hide("key-group-fieldset");
   dialog.returnValue = "";
   return new Promise((resolve) => {
     dialog.addEventListener("close", () => {
@@ -597,6 +725,10 @@ function bindKeyNameDialog() {
       status.textContent = issue;
       input.setAttribute("aria-invalid", "true");
       input.focus?.();
+      return;
+    }
+    if (isDual() && !selectedKeyGroup()) {
+      status.textContent = "請選擇金鑰所屬群組（A 群組或 B 群組）";
       return;
     }
     const generation = keyNameDialogGeneration;
@@ -636,6 +768,11 @@ async function registerKey() {
       $("register-status").textContent = "已取消註冊";
       return;
     }
+    const group = isDual() ? selectedKeyGroup() : null;
+    if (isDual() && !group) {
+      $("register-status").textContent = "未選擇群組，已取消註冊";
+      return;
+    }
     $("register-status").textContent = "偵測中…請插入金鑰";
     const det = await invoke("detect_key");
     let pin = null;
@@ -646,14 +783,146 @@ async function registerKey() {
       pin = prompt(`「${det.label}」為 PIN 型金鑰 — 請輸入 PIN：`);
       if (pin === null) return; // 取消
     }
-    const reg = await invoke("register_key", { pin, label });
-    $("register-status").textContent = `已註冊：${reg.label}（${reg.key_type}）`;
+    const args = { pin, label };
+    if (isDual()) args.group = group;
+    const reg = await invoke("register_key", args);
+    $("register-status").textContent = isDual()
+      ? `已註冊：${reg.label}（${reg.key_type}）— ${groupName(group)}`
+      : `已註冊：${reg.label}（${reg.key_type}）`;
     renderKeys();
   } catch (e) { $("register-status").textContent = "失敗：" + String(e); }
   finally {
     registerButton.disabled = false;
     registerButton.removeAttribute?.("aria-busy");
   }
+}
+
+// ─────────────── 雙群組控管：兩步驟金鑰登入 ───────────────
+function dualPin() {
+  // Broker 由 Windows 處理 PIN；非 broker 後端每一步各自讀取並清除，避免第一位成員的 PIN 留在欄位。
+  if (brokeredKeyLogin) return null;
+  const value = $("login-pin").value;
+  $("login-pin").value = "";
+  return value ? value : null;
+}
+
+async function doDualBegin() {
+  errBox("");
+  if (dualBusy || dualLogin || !dualLoginReady) return;
+  dualBusy = true;
+  const generation = ++dualGeneration;
+  const button = $("btn-login-key");
+  button.disabled = true;
+  $("key-login-status").textContent = brokeredKeyLogin
+    ? "第一步：請依 Windows 安全性視窗提示操作金鑰"
+    : "第一步：請操作金鑰";
+  try {
+    const info = await invoke("login_dual_begin", { pin: dualPin() });
+    if (generation === dualGeneration) startDualStep(info);
+  } catch (e) {
+    if (generation === dualGeneration) errBox(String(e));
+  } finally {
+    dualBusy = false;
+    button.disabled = false;
+    $("key-login-status").textContent = "";
+  }
+}
+
+function startDualStep(info) {
+  const remainingMs = Math.max(0, Number(info.remaining_ms) || 0);
+  const second = groupName(info.second_group);
+  dualLogin = { deadline: Date.now() + remainingMs, timer: null };
+  $("dual-step-text").textContent = `${groupName(info.first_group)}（${info.first_label}）已驗證，請 ${second}成員於 ${Number(info.timeout_secs) || 0} 秒內完成驗證`;
+  $("btn-dual-complete").textContent = `以 ${second}金鑰完成第二步`;
+  hide("btn-login-key");
+  show("dual-step-panel");
+  dualLogin.timer = setInterval(updateDualCountdown, 250);
+  updateDualCountdown();
+}
+
+function updateDualCountdown() {
+  if (!dualLogin) return;
+  const remaining = dualLogin.deadline - Date.now();
+  if (remaining <= 0) {
+    // Rust 端計時執行緒會自行清除並記錄逾時；前端只回到第一步，不呼叫取消。
+    dualGeneration += 1;
+    returnToDualStepOne();
+    errBox("第二步等待逾時，第一步驗證已失效；請從第一步重新開始");
+    return;
+  }
+  $("dual-countdown").textContent = `剩餘 ${Math.ceil(remaining / 1000)} 秒`;
+}
+
+function returnToDualStepOne() {
+  if (dualLogin && dualLogin.timer !== null) clearInterval(dualLogin.timer);
+  dualLogin = null;
+  $("dual-step-text").textContent = "";
+  $("dual-countdown").textContent = "";
+  hide("dual-step-panel");
+  if (dualLoginReady) show("btn-login-key");
+}
+
+async function doDualComplete() {
+  if (!dualLogin || dualBusy) return;
+  dualBusy = true;
+  const generation = dualGeneration;
+  // 第二步進行中停止前端倒數；截止時間由 Rust 在金鑰操作前後各檢查一次。
+  if (dualLogin.timer !== null) clearInterval(dualLogin.timer);
+  dualLogin.timer = null;
+  $("btn-dual-complete").disabled = true;
+  $("btn-dual-cancel").disabled = true;
+  $("dual-countdown").textContent = brokeredKeyLogin
+    ? "第二步：請依 Windows 安全性視窗提示操作金鑰"
+    : "第二步：請操作金鑰";
+  errBox("");
+  try {
+    const entries = await invoke("login_dual_complete", { pin: dualPin() });
+    if (generation !== dualGeneration) return;
+    returnToDualStepOne();
+    await enterMain(entries);
+  } catch (e) {
+    if (generation !== dualGeneration) return;
+    // Rust 端暫存不論成敗都已取走：一律回到第一步。
+    returnToDualStepOne();
+    errBox(`${String(e)}\n請從第一步重新開始`);
+  } finally {
+    dualBusy = false;
+    $("btn-dual-complete").disabled = false;
+    $("btn-dual-cancel").disabled = false;
+  }
+}
+
+async function doDualCancel() {
+  if (!dualLogin || dualBusy) return;
+  errBox("");
+  dualGeneration += 1;
+  returnToDualStepOne();
+  try {
+    await invoke("login_dual_cancel");
+    $("key-login-status").textContent = "已取消兩步驟登入；請從第一步重新開始";
+  } catch (e) {
+    errBox(String(e));
+  }
+}
+
+async function abandonDualLogin() {
+  dualGeneration += 1;
+  returnToDualStepOne();
+  // 取消失敗不阻擋主密碼登入；成功登入時 Rust 也會清除暫存。
+  try { await invoke("login_dual_cancel"); } catch {}
+}
+
+async function setDualStepTimeout() {
+  const raw = String($("dual-step-timeout").value ?? "").trim();
+  const secs = /^\d+$/.test(raw) ? Number(raw) : Number.NaN;
+  if (!Number.isInteger(secs) || secs < 30 || secs > 600) {
+    return alert("請輸入 30–600 秒的第二步等待時限");
+  }
+  try {
+    await invoke("set_dual_step_timeout", { secs });
+    $("dual-step-timeout").value = secs;
+    alert(`已套用：第二步等待時限 ${secs} 秒（自下次金鑰登入起生效）`);
+  } catch (e) { alert(String(e)); }
 }
 
 // ─────────────── 軌跡 ───────────────
@@ -765,6 +1034,9 @@ document.addEventListener("DOMContentLoaded", () => {
   bindKeyNameDialog();
   $("btn-set-idle").onclick = setIdle;
   $("btn-set-password-history-limit").onclick = setPasswordHistoryLimit;
+  $("btn-dual-complete").onclick = doDualComplete;
+  $("btn-dual-cancel").onclick = doDualCancel;
+  $("btn-set-dual-step-timeout").onclick = setDualStepTimeout;
   $("btn-lock").onclick = doLock;
 
   ["mousemove", "keydown", "click"].forEach((ev) => window.addEventListener(ev, resetIdle));
