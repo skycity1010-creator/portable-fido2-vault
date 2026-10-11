@@ -23,6 +23,7 @@ Windows 桌面、**完全離線**、**portable 免安裝**的 FIDO2 密碼金庫
 - `main` 已包含 PR #2–#26；目前 Win11-NB 正式部署 GUI 來自 PR #25（commit `5b943c7`，`main` `5073642` 起），SHA-256 `3b3f7367be81baab1a37c5249788f815c397b9e5241289880a3e6f7618996322`，2026-10-11 部署至 `C:\FidoVault`。
 - 自動化驗證（GitHub Actions，Windows）：UI 65/65、Rust `--features real-ctap` 200/200、mock Gate E2E 20/20。
 - 部署、驗收與殘餘未測項目見 `docs/PROJECT.md` §17、`docs/user-verification-steps.md` 末節與 `docs/rdp-webauthn-verification.md` R6。
+- **雙群組控管版（開發中）**：分支 `feature/dual-control-20261011`、draft PR #29。D1–D11（程式與全套自動化驗證）已完成，Win11-NB 實機驗收（D13）尚未執行；**未合併、未部署，不是可發佈產物**。見下方「雙群組控管版」與 `docs/plans/dual-control.md`。
 
 ## 目錄結構
 
@@ -35,7 +36,10 @@ portable-fido2-vault/
    ├─ src/vault.rs      金庫格式 / 加密落盤
    ├─ src/crypto.rs     Argon2id / AES-GCM / HKDF
    ├─ src/fido2.rs      FIDO2 後端 trait + Mock/Real
-   └─ examples/vault_cli.rs  E2E 測試 CLI（Gate 驗證用）
+   ├─ src/edition.rs    版本判斷（single / dual，依 Cargo feature `dual-control`）
+   ├─ src/bin/portable-fido-vault-dual.rs  雙群組控管版 GUI 入口（需 `dual-control`）
+   ├─ examples/vault_cli.rs       E2E 測試 CLI（單人版 Gate 驗證用）
+   └─ examples/dual_vault_cli.rs  雙群組控管版 mock E2E CLI（僅供測試，不可發佈）
 ```
 
 ## 建置（WS2 建置機）
@@ -177,6 +181,33 @@ $P audit        --path $V --pw Test1234!
 - **payload（機密區）**：整個 vault JSON（entries/audit/settings）以 KEK 做 AES-256-GCM；每次寫入重新抽 12B nonce，tmp + rename 原子落盤。
 - **全有或全無的存取模型**：主密碼或任一支已註冊 FIDO2 金鑰登入後，可取得所有條目的明文密碼（payload 是單一大塊 blob，無欄位級別名）。因此任何一支金鑰洩露 = 整個金庫失守；金鑰丟失或轉讓前務必先「移除金鑰」（不可逆）。
 - **錯誤判別與失敗軌跡**：GCM tag 驗證失敗即視為密碼／金鑰錯誤（不洩漏 timing）；未解鎖狀態的登入失敗寫入 sidecar `vault.db.failures`（僅時間戳＋method，上限 10 筆），成功解鎖後合併進加密 audit 並刪除 sidecar。
+
+## 雙群組控管版（dual-control，開發中）
+
+> 狀態：程式與自動化驗證完成（D1–D11），Win11-NB 本機 Console 實機驗收（D13）**尚未執行**；PR #29 為 draft，未合併、未部署。設計與決策紀錄見 `docs/plans/dual-control.md`，格式見 `docs/spec.md` §3.1。
+
+同一份程式碼以 Cargo feature `dual-control` 另外編出 `portable-fido-vault-dual.exe`。單人版 `portable-fido-vault.exe` 的行為、檔案格式與 UI 不變。
+
+- **金鑰登入需兩人**：註冊金鑰時必須指定 **A 群組**或 **B 群組**（必選、註冊後不可修改）。金鑰登入必須 A 群組一支 + B 群組一支依序驗證；先 A 或先 B 皆可，第二步只接受另一群組的金鑰。
+- **在密碼學層強制**：A 群組金鑰只能解出 `share_A`，B 群組只能解出 `share_B`，兩者經 HKDF 合併後才能解開 KEK。只持有 `vault.db` 與單一群組的金鑰（不論幾支），改用 CLI 或修改程式也無法解鎖。
+- **第二步時限**：第一步通過後，另一群組須在時限內完成（預設 120 秒，設定頁可調 30–600 秒）。逾時、取消、第二步失敗、改用主密碼都會清除第一步結果，需從第一步重新開始；第一步取得的 share 只存在 Rust 端記憶體，不經 IPC 交給前端。
+- **主密碼是緊急用（break-glass）**：主密碼單獨即可完整解鎖（刻意接受的繞道，主密碼由組織人工分持保管）。以主密碼登入後主畫面顯示醒目提示，軌跡紀錄 method=`password-breakglass`。
+- **同一支實體金鑰只能註冊一次**：註冊時把金庫內全部 credential 放入 excludeCredentials，同一支金鑰再註冊（不論選 A 或 B）會被金鑰本身拒絕，顯示「此安全性金鑰已註冊於本金庫…」。此限制依賴金鑰遵守 CTAP2 excludeList（見設計 §7 R6）。
+- **群組最後一支金鑰不可刪除**（Rust 層強制，UI 也停用按鈕）。A、B 群組各至少一支金鑰之前，只能以主密碼登入。
+- **版本互斥**：雙群組控管版只開 v2 金庫，單人版只開 v1 金庫；開錯版本會顯示應改用哪個程式，且不解密、不寫檔。**不提供 v1↔v2 轉換**，要使用雙群組控管版請建立新金庫。`vault_cli` 不支援 v2。
+
+### 建置與打包（雙群組控管版）
+
+```bash
+cd src-tauri
+cargo +stable-x86_64-pc-windows-gnu build --release --locked --features real-ctap,dual-control --bin portable-fido-vault-dual
+# 打包取 target/release/portable-fido-vault-dual.exe 與同目錄 WebView2Loader.dll
+```
+
+- 啟用 `dual-control` 時一定要加 `--bin portable-fido-vault-dual`：單人版 bin 在此 feature 下會以 `compile_error!` 拒絕編譯，避免單人版檔名的 EXE 混入雙人版邏輯；反之 dual bin 沒有 feature 時 Cargo 會拒絕建置。
+- 發行資料夾只放 `portable-fido-vault-dual.exe`、同次建置的 x64 `WebView2Loader.dll`，以及第一次啟動後產生的 `vault.db`。**`target/*/examples/` 下的 `vault_cli.exe`、`dual_vault_cli.exe` 都不得隨雙群組控管版發佈**：`dual_vault_cli` 是以 mock 金鑰模擬的測試工具；`vault_cli` 不支援 v2。
+- 雙人版與單人版請放在**不同資料夾**（各自旁邊的 `vault.db` 版本不同）。不要把雙人版 EXE 放進既有 `C:\FidoVault` 對著正式單人版金庫啟動；版本互斥會拒絕開啟，但仍不應以正式金庫測試。
+- 測試：`cargo test --lib --locked --features real-ctap,dual-control`；mock E2E：`cargo build --release --locked --features dual-control --example dual_vault_cli` 後執行 `python ../scripts/gate_e2e_dual.py <全新資料夾> --dual-cli <dual_vault_cli.exe> --single-cli <vault_cli.exe>`（腳本拒絕既有資料夾、不刪檔）。
 
 ## 安全聲明
 

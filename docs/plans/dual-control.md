@@ -1,6 +1,6 @@
 # 雙群組金鑰控管版（Dual-Control Edition）設計文件
 
-> 狀態：**D1–D11 已完成；D12–D13 未開始，實機驗收待 D13**。PR #29 維持 draft，未合併／未部署。
+> 狀態：**D1–D12 已完成；D13 未開始，實機驗收待 D13**。PR #29 維持 draft，未合併／未部署。
 > 分支：`feature/dual-control-20261011`（base `main` `656ac95`）。
 > 需求來源：使用者 2026-10-11 Hermes desktop 對話（Q1–Q6 已裁決，見 §1）。
 
@@ -229,7 +229,8 @@ KEK（隨機 256-bit，加解密 payload；與 v1 相同）
 - [x] D9 時限設定：payload 權威值、header 鏡像、clamp 與竄改修復（見 §11）
 - [x] D10 前端：edition 切換、兩步驟登入與倒數、群組註冊、金鑰清單群組／刪除限制、時限設定、break-glass 提示（見 §11）
 - [x] D11 全套驗證：Rust single/dual、Node、單人版與雙人版 mock Gate E2E、GNU Release 雙執行檔、Clippy／rustfmt、靜態掃描、兩位獨立審查（見 §11）
-- [ ] D12–D13
+- [x] D12 文件：README、spec.md（v2 格式）、PROJECT.md、user-verification-steps.md（§6.2 實機清單，見 §11）
+- [ ] D13 Win11-NB 獨立資料夾 staging → 使用者本機 Console 實機驗收
 
 ## 11. 驗證紀錄
 
@@ -485,3 +486,14 @@ KEK（隨機 256-bit，加解密 payload；與 v1 相同）
   3. 打包規則：`target/*/examples/*`（`vault_cli`、`dual_vault_cli`）不得隨產品發佈 → D12 文件。
   4. 雙人版 E2E 是 vault 層跨行程驗證，不涵蓋 Tauri IPC、Rust 計時執行緒實際觸發、Windows broker 與實體金鑰 → D13 實機。
   5. 審查的其他非阻擋建議（begin 前置提示改 `safely`、更多種 DOM 故障注入、`--advance-secs` 溢位時先取消暫存等）未處理，視需要併入後續維護。
+
+### D12（2026-10-11）
+
+- 只改文件，程式碼未變更：
+  - `README.md`：「目前狀態」加開發中說明；目錄結構補 `edition.rs`、dual bin、`dual_vault_cli`；新增「雙群組控管版（dual-control，開發中）」一節（行為、break-glass、excludeCredentials、版本互斥、建置指令、打包規則、測試指令）。
+  - `docs/spec.md`：新增 §3.1 v2 格式（金鑰階層、header／payload 新欄位、版本判斷表）、§5.5 註冊與兩步驟登入、時限設定與修復、§6.1 audit／失敗 method、§8.1 安全性質表、Gate 表「D 雙群組控管版」列。
+  - `docs/PROJECT.md`：檔頭指向 §18；目錄結構補新檔；新增 §18（決策、密碼學、D1–D11 驗證數據、CI run `38140680764`、範圍邊界、殘餘風險、D13 待辦）。
+  - `docs/user-verification-steps.md`：彙整表加「雙群組控管版（未執行）」；新增實機驗收清單 V1–V13（由 §6.2 展開：測試前準備、測試資料安全規則、停止規則、逐項預期結果、回報格式）。V13 版本互斥為選測，需 D13 另提供單人版候選。
+- D11 殘餘事項 3（`target/*/examples/*` 不得隨產品發佈）已寫入 README 打包規則。
+- 驗證：文件中引用的 5 個新檔案路徑皆存在；UI 文字、錯誤訊息、audit method 與常數（30／120／600、`f2vlt-v2|dual-slot`）逐一對照 `src/app.js`、`src/index.html`、`src-tauri/src/{vault,crypto,fido2}.rs`；`git diff --check` 通過。純文件變更，未重跑 Rust／Node 套件，以 exact-head CI 為準。
+- 編輯腳本：`D:/scratch/dual-control-20261011/d12/d12-edit.py`（每個取代錨點都斷言只出現一次）。

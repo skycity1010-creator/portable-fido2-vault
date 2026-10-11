@@ -4,6 +4,7 @@
 > 本檔彙整 README.md、docs/spec.md、docs/user-verification-steps.md 與近期修復紀錄（§9），
 > 作為單一入口文件；細節以各原始文件為準。
 > 本檔保留各次工程驗證、部署與使用者回報的歷史快照；最新狀態（Console 前景、RDP 支援、WebAuthn 不可用時保留主密碼登入與 2026-10-11 正式部署）見 §17；§16 以前為歷史快照。歷史雜湊／槽位數不代表驗收後目標金庫的即時狀態。
+> 雙群組控管版（開發中，PR #29 draft，未合併／未部署）見 §18。
 
 ## 1. 專案概況
 
@@ -40,11 +41,15 @@ portable-fido2-vault/
 │  ├─ src/fido2.rs            FidoBackend trait + MockBackend / RealBackend（CLI raw CTAP）
 │  ├─ src/windows_webauthn.rs  Windows GUI broker backend + raw-salt hmac-secret
 │  ├─ src/diag_log.rs         診斷 log（real-ctap feature）
-│  └─ examples/vault_cli.rs   E2E 測試 CLI（Gate 驗證用）
+│  ├─ src/edition.rs          版本判斷 single / dual（feature `dual-control`）
+│  ├─ src/bin/portable-fido-vault-dual.rs  雙群組控管版 GUI 入口
+│  ├─ examples/vault_cli.rs   E2E 測試 CLI（Gate 驗證用）
+│  └─ examples/dual_vault_cli.rs  雙群組控管版 mock E2E CLI（僅測試，不發佈）
 ├─ scripts/
 │  ├─ nb_push.py              WinRM base64-chunk 推檔到 Win11-NB + SHA256 驗證
 │  ├─ nb_gate.py              Gate 1 NB 遠端驗證（啟動存活 + WebView2 子程序 + 截圖 + CLI E2E）
-│  └─ gate_e2e.py             本機 CLI E2E
+│  ├─ gate_e2e.py             本機 CLI E2E
+│  └─ gate_e2e_dual.py        雙群組控管版 mock 跨行程 E2E（25 項）
 └─ vendor/authenticator-rs/   vendored mozilla authenticator-rs v0.6.1（ctap2 + crypto_rust）
 ```
 
@@ -280,3 +285,13 @@ cargo +stable-x86_64-pc-windows-gnu build --release --features real-ctap --bin p
 - **WebAuthn 不可用時保留主密碼登入（PR #25）**：同 process WebAuthn API < v4（例如 RDP 關閉重新導向時 v0）時，GUI 以 key-unavailable backend 啟動，主密碼與非金鑰功能可用，金鑰偵測／註冊／登入以繁中說明 fail closed、不寫入；不 fallback mock，API v4+ 與 HMAC/PRF/credential-match/32-byte 檢查不變，其他後端建構錯誤仍致命。TDD 7 新測試、兩路獨立審查 passed、WS2 RDP W1–W6 PASS。見 `docs/reports/webauthn-unavailable-password-login-acceptance.md`。
 - **正式部署（2026-10-11 00:13，使用者授權）**：Win11-NB `C:\FidoVault\portable-fido-vault.exe` 由 `be089077…`（§16 版本）更新為 SHA-256 `3b3f7367be81baab1a37c5249788f815c397b9e5241289880a3e6f7618996322`（7,206,912 bytes，GNU Release `--locked --features real-ctap`，來源 PR #25 commit `5b943c7`；`main` 非文件檔與審查凍結版逐檔一致）。舊 EXE 與 `vault.db` 非覆寫備份於 `C:\FidoVault\backups\webauthn-unavailable-20261011-5073642`（hash 相符）；`vault.db` SHA-256 `b8423f97626309e0…`、1 個 key slot，部署前後不變；`WebView2Loader.dll`、`vault_cli.exe` 未替換。流程為唯讀 preflight → 備份 → 唯一 staging 讀回 → 全條件重驗後原子替換 → 獨立讀回；未經 WinRM 啟動 GUI 或操作金鑰。部署後使用者於 Win11-NB 本機 Console 首次開啟並以金鑰登入，回報驗證成功（log：2026-10-11 00:48，API v9，credential_match、32 bytes；`vault.db` 仍 1 個 key slot）。
 - **Kanban**：board `portable-fido-vault` 的 RDP-R2～R6、PR #23 與 PR #25 卡均已結案或依使用者決定手動封存；新卡一律 `--completion-contract local-only`（私有 repo 讀取 branch rules 需 GitHub Pro）。
+
+## 18. 2026-10-11：雙群組控管版（dual-control，PR #29，開發中）
+
+- **需求與決策**：使用者 2026-10-11 提出，Q1–Q6 已裁決。註冊金鑰時標記 A／B 群組；金鑰登入須 A、B 各一支依序驗證（順序不限）；主密碼保留為 break-glass；同一支實體金鑰只能註冊一次；群組最後一支不可刪、群組不可改；以 Cargo feature `dual-control` 另編 `portable-fido-vault-dual.exe`；第二步時限預設 120 秒、可調 30–600。完整設計見 `docs/plans/dual-control.md`，格式見 `docs/spec.md` §3.1／§5.5／§6.1／§8.1。
+- **密碼學**：KEK 不變；新增 `share_A`／`share_B`（payload 內），各群組金鑰槽只包裝自己群組的 share（AES-GCM AAD 綁定群組與 credential ID），`dual_slot` 以 `HKDF(share_A‖share_B)` 包裝 KEK。單一群組的金鑰在數學上無法解鎖。
+- **開發進度**：D1–D11 完成，逐項 vertical TDD（assertion RED → GREEN）。FFI／密碼學相關項目各經兩位獨立唯讀審查與追加修正。D12（本次文件同步）完成；**D13 Win11-NB 實機驗收尚未執行**。
+- **最終自動化驗證（D11，commit `bb72bea`）**：Rust MSVC lib 單人版 327/327、雙人版 327/327；Node 98/98；mock Gate E2E 單人版 20/20、雙人版 25/25；Clippy（僅豁免既有 3 項 baseline lint）、scoped rustfmt、新增行靜態掃描通過。Exact-head CI run `38140680764` completed/success。GNU Release 單人版與雙人版 EXE 只建置於 scratch，未執行、未部署。
+- **範圍邊界**：不提供 v1↔v2 轉換；`vault_cli` 不支援 v2；`dual_vault_cli` 只供 mock E2E，不隨產品發佈；原生視窗標題不改（使用者決定，以畫面內「雙群組控管版」標示為準）。
+- **殘餘風險／後續**：(1) 既有、兩版共用：`enterMain` 在 Rust 已解鎖後若 DOM 切換或設定／audit 讀取失敗，畫面可能停在登入頁或閒置上鎖不啟動（使用者決定另開維護項目）；(2) 既有：`write_data` rename 失敗會留下 `vault.db.tmp`；(3) excludeList 依賴 authenticator 行為（設計 §7 R6），Windows 實際錯誤碼與 UI 待實機確認（R1）；(4) mock E2E 不涵蓋 Tauri IPC、計時執行緒實際觸發、Windows broker 與實體金鑰。
+- **待辦**：D13 — 在 Win11-NB 以獨立資料夾 staging（不碰 `C:\FidoVault\vault.db`），由使用者在本機 Console 依 `docs/user-verification-steps.md` 末節逐項驗收。實機 PASS 前 PR #29 維持 draft、Kanban `t_21ae2fd3` 維持 blocked，不合併、不部署。
