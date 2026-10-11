@@ -1,6 +1,6 @@
 # 雙群組金鑰控管版（Dual-Control Edition）設計文件
 
-> 狀態：**設計確認，未開始實作**（production code 未修改）。
+> 狀態：**D1–D8 已實作；D9–D13 未開始，實機驗收待 D13**。PR #29 維持 draft，未合併／未部署。
 > 分支：`feature/dual-control-20261011`（base `main` `656ac95`）。
 > 需求來源：使用者 2026-10-11 Hermes desktop 對話（Q1–Q6 已裁決，見 §1）。
 
@@ -400,3 +400,19 @@ KEK（隨機 256-bit，加解密 payload；與 v1 相同）
   - 實際的刪除限制以 Rust 端為準，UI 只是輔助。
 - TDD：6 個 assertion RED → GREEN；另有 2 個既有行為的回歸測試（GREEN→GREEN，不算 RED）：單人版 KeyInfo JSON 形狀、單人版可刪唯一金鑰。新增測試共 8 個。
 - Rust MSVC lib：單人版 300/300、雙人版 300/300，無 warning；跑測試前後原始碼 SHA-256 不變；rustfmt 通過；Node 65/65（前端未改）。
+
+#### D8 接續核對、審查與測試補強（2026-10-11）
+
+- 上一對話已推送 D8 commit `e7052f0`，中斷在 CI 觀察；本輪讀回 exact-head run `38120790725` / job `114414912355` 為 completed/success，必要步驟全部 success，完整 log 為 Node 65/65、Rust single/dual 各 300/300、既有單人版 mock Gate E2E 20/20（不是雙人版完整 E2E 或實體驗收）。
+- 原始 10 檔 source manifest 與本輪重跑前後一致；MSVC single/dual 各 300/300、Node 65/65、syntax/scoped rustfmt/diff check 通過。第一次 Node 在非 repo cwd 執行，collector 路徑解析失敗；保留失敗 log，以正確 cwd 重跑 PASS，未更動 production code。
+- 審查路由阻礙如實保留：Claude Code CLI API 429 usage_limit_reached 未讀取候選；SubAgent 的 Claude model 與 openai-codex 不相容（HTTP 400），不算有效審查。改用現有 Reviewer profile（實際名稱 `reviwer`）與獨立 default CLI session，僅對該次執行指定 model/provider，不修改任何持久設定。兩份完整唯讀 verdict 皆 passed=true、security_concerns/logic_errors 空，並覆蓋全部 touched regions；manifest 由 parent 獨立驗證，reviewer 不假稱已計算 SHA256。
+- 依兩份審查建議新增 5 個 test-only 回歸測試（production code 不變）：
+  1. A/B 各自非最後成員刪除，在另一群組存在／尚未建立兩種情境，於 lock/drop 或重新解鎖前立即讀回 credential／group／順序，並驗證 persisted group audit。
+  2. A-only、B-only、雙群組最後成員及未知 credential 拒絕後，完整 header、payload（含 audit）、磁碟 bytes 不變；布林比較避免輸出合成 share。
+  3. 已通過結構驗證的同／跨群組重複 credential，首次匹配、每次只刪一槽、剩餘單例仍受保護；不放寬 header 驗證。重複 credential 的清單提示描述的是同 ID 實際刪除目標，不是授權依據。
+  4. 清單欄位值／順序、空清單、A-only/B-only、重複 credential 提示，以及 Header conversion 一致性。
+  5. 實際 `read_keys_from_file` 與 public lock 回傳 Header conversion 一致性；全部使用專屬 synthetic fixture + MockBackend，不讀正式 vault。
+- 新增 5 項 targeted tests 直接通過，屬既有行為 GREEN→GREEN 覆蓋，不計為新的 RED。首輪因測試跨模組存取 private header 編譯失敗（NOT_EXECUTED，不算 assertion RED），改用既有 public lock 回傳 header 後通過，未改既有斷言與 production code。
+- 最終 MSVC single/dual 各 **305/305**、Node **65/65**、node syntax、scoped rustfmt、git diff check 全通過；測試前後兩檔 source SHA256 與 final frozen manifest 一致。
+- test-only follow-up 再由兩位獨立 CLI reviewer 檢查完整 diff/context，皆 passed=true、blocking 與 suggestions 空。final manifest SHA256 `0b27c308cb00718fa3cf258740f4151698d47219d0c18757b813a3e57d967552`。
+- 完整原始 log／失敗嘗試／verdict／snapshot 留存 `D:/scratch/dual-control-20261011/d8/`；收尾另存 durable evidence archive。實機刪除／前端停用鈕留待 D10/D13，未宣稱 PASS；PR 維持 draft、整體 Kanban blocked，不合併、不部署、不開始 D9。

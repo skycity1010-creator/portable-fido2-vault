@@ -3192,6 +3192,124 @@ mod tests {
     }
 
     #[test]
+    fn d8_non_last_removal_persists_immediately_in_both_groups() {
+        for (case, group, other) in [
+            ("a-with-b", KeyGroup::A, true),
+            ("b-with-a", KeyGroup::B, true),
+            ("a-only", KeyGroup::A, false),
+            ("b-only", KeyGroup::B, false),
+        ] {
+            let mut keys = vec![("first", group), ("remaining", group)];
+            if other {
+                keys.push(("other", group.other()));
+            }
+            let (p, _) = dual_vault_with(&format!("d8-persist-{case}"), &keys);
+            let mut v = reopen_dual(&p);
+            let removed = slot_id(&v, "first");
+            let expected: Vec<_> = v
+                .header
+                .key_slots
+                .iter()
+                .filter(|s| s.credential_id != removed)
+                .map(|s| (s.credential_id.clone(), s.group))
+                .collect();
+            assert!(v.remove_key(&removed).is_ok());
+            // Read before lock/drop can independently save again.
+            let persisted = Vault::read_header(&p, Edition::Dual).unwrap();
+            let actual: Vec<_> = persisted
+                .key_slots
+                .iter()
+                .map(|s| (s.credential_id.clone(), s.group))
+                .collect();
+            assert_eq!(actual, expected);
+            let disk = reopen_dual(&p);
+            assert!(disk.audit().iter().any(|a| a.event == "key_removed"
+                && a.detail.ends_with(&format!(" group={}", group.as_str()))));
+            let remaining = slot_id(&v, "remaining");
+            assert!(matches!(v.remove_key(&remaining),
+                Err(VaultError::LastKeyInGroup(g)) if g == group));
+        }
+    }
+
+    #[test]
+    fn d8_refusal_preserves_full_state_for_both_groups_and_unknown_ids() {
+        for (case, keys) in [
+            ("a-only", vec![("a1", KeyGroup::A)]),
+            ("b-only", vec![("b1", KeyGroup::B)]),
+            ("both", vec![("a1", KeyGroup::A), ("b1", KeyGroup::B)]),
+        ] {
+            let (p, _) = dual_vault_with(&format!("d8-state-{case}"), &keys);
+            let mut v = reopen_dual(&p);
+            let header = serde_json::to_value(&v.header).unwrap();
+            let data = serde_json::to_value(&v.data).unwrap();
+            let bytes = fs::read(&p).unwrap();
+            let targets: Vec<_> = v
+                .header
+                .key_slots
+                .iter()
+                .map(|s| (s.credential_id.clone(), s.group))
+                .collect();
+            for (id, group) in targets {
+                assert!(matches!(v.remove_key(&id),
+                    Err(VaultError::LastKeyInGroup(g)) if Some(g) == group));
+                // Boolean comparisons avoid dumping synthetic shares on assertion failure.
+                assert!(serde_json::to_value(&v.header).unwrap() == header);
+                assert!(serde_json::to_value(&v.data).unwrap() == data);
+                assert!(fs::read(&p).unwrap() == bytes);
+            }
+            assert!(matches!(
+                v.remove_key("d8-unknown-credential"),
+                Err(VaultError::Fido(FidoError::NoDevice))
+            ));
+            assert!(serde_json::to_value(&v.header).unwrap() == header);
+            assert!(serde_json::to_value(&v.data).unwrap() == data);
+            assert!(fs::read(&p).unwrap() == bytes);
+        }
+    }
+
+    #[test]
+    fn d8_duplicate_ids_remove_one_first_match_without_emptying_a_group() {
+        for cross_group in [false, true] {
+            let (p, _) = dual_vault_with(
+                &format!("d8-duplicate-{cross_group}"),
+                &[("a1", KeyGroup::A), ("a2", KeyGroup::A)],
+            );
+            let mut v = reopen_dual(&p);
+            let id = slot_id(&v, "a1");
+            v.header.key_slots[1].credential_id = id.clone();
+            if cross_group {
+                v.header.key_slots[1].group = Some(KeyGroup::B);
+            }
+            // Existing structural validation accepts duplicate IDs. Do not relax it.
+            assert!(check_header_edition(&v.header, Edition::Dual).is_ok());
+            let before = serde_json::to_value(&v.header).unwrap();
+            if cross_group {
+                assert!(matches!(
+                    v.remove_key(&id),
+                    Err(VaultError::LastKeyInGroup(KeyGroup::A))
+                ));
+                assert!(serde_json::to_value(&v.header).unwrap() == before);
+                assert_eq!(v.header.key_slots.len(), 2);
+            } else {
+                assert!(v.remove_key(&id).is_ok());
+                assert_eq!(v.header.key_slots.len(), 1);
+                assert_eq!(v.header.key_slots[0].label, "a2");
+                assert!(matches!(
+                    v.remove_key(&id),
+                    Err(VaultError::LastKeyInGroup(KeyGroup::A))
+                ));
+                assert_eq!(
+                    Vault::read_header(&p, Edition::Dual)
+                        .unwrap()
+                        .key_slots
+                        .len(),
+                    1
+                );
+            }
+        }
+    }
+
+    #[test]
     fn dual_step_timeout_mirror_is_clamped() {
         let mut h = valid_v2_header();
         h.dual_step_timeout_secs = None;

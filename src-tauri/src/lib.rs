@@ -1016,7 +1016,7 @@ pub fn run() {
 mod key_info_tests {
     use super::*;
 
-    fn header_json(v: u8, slots: serde_json::Value) -> vault::Header {
+    pub(super) fn header_json(v: u8, slots: serde_json::Value) -> vault::Header {
         let mut h = serde_json::json!({
             "v": v,
             "argon2": {"salt": "c2FsdA=="},
@@ -1032,7 +1032,7 @@ mod key_info_tests {
         serde_json::from_value(h).unwrap()
     }
 
-    fn slot(id: &str, group: Option<&str>) -> serde_json::Value {
+    pub(super) fn slot(id: &str, group: Option<&str>) -> serde_json::Value {
         let mut s = serde_json::json!({
             "credential_id": id, "aaguid": "00", "label": id,
             "key_type": "touch_only", "nonce": "bm9uY2U=", "ct": "Y3Q="
@@ -1085,6 +1085,94 @@ mod key_info_tests {
             keys,
             vec!["credential_id", "key_type", "label", "prompt_zh"]
         );
+    }
+}
+
+#[cfg(test)]
+mod d8_list_review_tests {
+    use super::*;
+
+    #[test]
+    fn d8_key_list_values_order_and_duplicate_hint_match_actual_target() {
+        let mut h = key_info_tests::header_json(2, serde_json::json!([]));
+        assert!(key_infos(&h).is_empty());
+        for slots in [
+            serde_json::json!([key_info_tests::slot("a1", Some("A"))]),
+            serde_json::json!([key_info_tests::slot("b1", Some("B"))]),
+            serde_json::json!([
+                key_info_tests::slot("dup", Some("A")),
+                key_info_tests::slot("dup", Some("B")),
+                key_info_tests::slot("b2", Some("B"))
+            ]),
+            serde_json::json!([
+                key_info_tests::slot("dup", Some("A")),
+                key_info_tests::slot("dup", Some("A"))
+            ]),
+        ] {
+            h = key_info_tests::header_json(2, slots);
+            assert!(vault::check_header_edition(&h, edition::Edition::Dual).is_ok());
+            let infos = key_infos(&h);
+            assert_eq!(infos.len(), h.key_slots.len());
+            for (info, slot) in infos.iter().zip(&h.key_slots) {
+                assert_eq!(info.credential_id, slot.credential_id);
+                assert_eq!(info.label, slot.label);
+                assert_eq!(info.key_type, slot.key_type);
+                assert_eq!(info.prompt_zh, slot.key_type.prompt_zh());
+                assert_eq!(info.group, slot.group);
+                // A hint describes the actual first-match credential removal, not this row's group.
+                assert_eq!(
+                    info.last_in_group,
+                    vault::last_key_in_group(&h, &slot.credential_id).is_some()
+                );
+            }
+            if h.key_slots.len() == 3 {
+                assert!(infos[0].last_in_group && infos[1].last_in_group);
+                assert!(!infos[2].last_in_group);
+            }
+            let converted: Vec<KeyInfo> = (&h).into();
+            assert_eq!(
+                serde_json::to_value(converted).unwrap(),
+                serde_json::to_value(infos).unwrap()
+            );
+        }
+        let single = key_info_tests::header_json(
+            1,
+            serde_json::json!([
+                key_info_tests::slot("s1", None),
+                key_info_tests::slot("s2", None)
+            ]),
+        );
+        let infos = key_infos(&single);
+        for (info, slot) in infos.iter().zip(&single.key_slots) {
+            assert_eq!(info.credential_id, slot.credential_id);
+            assert_eq!(info.label, slot.label);
+            assert_eq!(info.key_type, slot.key_type);
+            assert_eq!(info.prompt_zh, slot.key_type.prompt_zh());
+            assert!(info.group.is_none() && !info.last_in_group);
+        }
+    }
+
+    #[test]
+    fn d8_file_reader_and_unlocked_header_conversion_agree() {
+        let d = std::env::temp_dir().join(format!("f2v-d8-list-review-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("vault.db");
+        // Synthetic fixture only; never target an existing file.
+        assert!(!p.exists());
+        let ed = edition::current();
+        let mut v = vault::Vault::create_for(&p, "D8-Synthetic-Pw", ed).unwrap();
+        for (label, group) in [("a", crypto::KeyGroup::A), ("b", crypto::KeyGroup::B)] {
+            let mut backend = MockBackend::new();
+            let group = (ed == edition::Edition::Dual).then_some(group);
+            assert!(v.register_key_for(&mut backend, None, label, group).is_ok());
+        }
+        let h = v.lock();
+        let expected: Vec<KeyInfo> = (&h).into();
+        assert_eq!(
+            serde_json::to_value(read_keys_from_file(&p).unwrap()).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+        std::fs::remove_file(&p).unwrap();
     }
 }
 
