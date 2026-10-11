@@ -945,13 +945,7 @@ mod real {
                     alg: COSEAlgorithm::ES256,
                 }],
                 // excludeCredentials：金鑰已持有其中任一筆 → CTAP2_ERR_CREDENTIAL_EXCLUDED。
-                exclude_list: exclude
-                    .iter()
-                    .map(|id| PublicKeyCredentialDescriptor {
-                        id: id.clone(),
-                        transports: vec![],
-                    })
-                    .collect(),
+                exclude_list: exclude_descriptors(exclude),
                 user_verification_req: UserVerificationRequirement::Preferred,
                 resident_key_req: ResidentKeyRequirement::Preferred,
                 extensions: AuthenticationExtensionsClientInputs {
@@ -1254,6 +1248,18 @@ mod real {
         }
     }
 
+    /// excludeCredentials → CTAP2 descriptors（transports 不限定）。清單過長時由 authenticator-rs
+    /// preflight 分批；仍無法送出則註冊失敗（fail closed，不會在未排除下建立 credential）。
+    fn exclude_descriptors(exclude: &[Vec<u8>]) -> Vec<PublicKeyCredentialDescriptor> {
+        exclude
+            .iter()
+            .map(|id| PublicKeyCredentialDescriptor {
+                id: id.clone(),
+                transports: vec![],
+            })
+            .collect()
+    }
+
     fn map_auth_error(e: authenticator::errors::AuthenticatorError) -> FidoError {
         use authenticator::errors::AuthenticatorError as AE;
         match e {
@@ -1285,6 +1291,17 @@ mod real {
                 options: opts,
                 ..Default::default()
             }
+        }
+
+        #[test]
+        fn exclude_descriptors_keep_every_id() {
+            let ids = vec![vec![1u8, 2], vec![3u8; 40]];
+            let d = exclude_descriptors(&ids);
+            assert_eq!(d.len(), 2);
+            assert_eq!(d[0].id, ids[0]);
+            assert_eq!(d[1].id, ids[1]);
+            assert!(d.iter().all(|x| x.transports.is_empty()));
+            assert!(exclude_descriptors(&[]).is_empty());
         }
 
         #[test]
@@ -1646,6 +1663,29 @@ mod tests {
         assert!(other
             .register_credential_excluding(&d, None, &[first.credential_id.clone()])
             .is_ok());
+    }
+
+    #[test]
+    fn mock_ignores_malformed_short_exclude_entries() {
+        let mut b = MockBackend::new();
+        let d = b.detect().unwrap();
+        assert!(b
+            .register_credential_excluding(&d, None, &[vec![], vec![1u8; 8]])
+            .is_ok());
+    }
+
+    #[test]
+    fn unavailable_backend_excluding_keeps_its_own_message() {
+        let mut b = UnavailableBackend::new(1);
+        let d = DetectedKey {
+            kind: KeyKind::WindowsManaged,
+            label: "x".into(),
+            aaguid: [0; 16],
+        };
+        let e = b
+            .register_credential_excluding(&d, None, &[vec![1u8; 16]])
+            .unwrap_err();
+        assert!(e.to_string().contains("WebAuthn API v1"), "{e}");
     }
 
     #[test]

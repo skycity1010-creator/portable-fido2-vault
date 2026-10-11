@@ -159,7 +159,7 @@ KEK（隨機 256-bit，加解密 payload；與 v1 相同）
 
 1. 建立 v2 金庫，以主密碼登入。
 2. 註冊金鑰 K1 → A 群組；K2 → B 群組。
-3. 以 K1 嘗試再註冊一次（選 B）→ 顯示「已註冊」，slot 數不變（Q3）。
+3. 以 K1 嘗試再註冊一次（選 B），再試一次選 A → 兩次都顯示「已註冊」，slot 數不變（Q3）。手邊若有不同類型的金鑰（觸碰型、PIN/指紋型），各測一次（R6）。
 4. 上鎖 → K1 → K2 解鎖成功；上鎖 → K2 → K1 解鎖成功。
 5. 第一步 K1 後，第二步再刷 K1 → 無法完成；第一步後等候逾時 → 回到第一步。
 6. 刪除 K1（A 群組最後一支）→ 被拒。
@@ -177,6 +177,7 @@ KEK（隨機 256-bit，加解密 payload；與 v1 相同）
 | R3 | 主密碼 break-glass 可繞過雙重控管 | Q1 刻意接受；以醒目 UI 提示和 audit 紀錄補強，文件明載 |
 | R4 | header 明文鏡像可被竄改以縮短/延長時限 | clamp 30–600 秒；解鎖後修復並記 audit |
 | R5 | 兩步驟之間 share 暫存於記憶體 | 只存 Rust 端、`Zeroizing`，設時限，任何中斷都清零；不經 IPC 回傳 |
+| R6 | Q3「同一實體金鑰只註冊一筆」完全依賴 authenticator 遵守 CTAP2 excludeList 語意；應用端無法由 credential_id/AAGUID 判斷是否為同一支實體金鑰（設計限制）。若 credential 帶 credProtect=3 且該次註冊未完成 UV，authenticator 可能看不到既有 credential | D13 實機分別以觸碰型與 PIN/指紋型金鑰驗證重複註冊被拒（§6.2 第 3 步）；不符合時記錄型號並回報，不在應用端以弱指紋自行判斷 |
 
 ## 8. 範圍外
 
@@ -326,3 +327,18 @@ KEK（隨機 256-bit，加解密 payload；與 v1 相同）
   - 第一次 GREEN 有 1 項失敗，原因是測試寫法錯誤：比較了 `w!("public-key")` 常數的指標，但每次使用位址可能不同。改為比較字串內容，production code 沒有改，log 保留為 `FAIL-test-pointer-compare`。
 - 新增 11 個測試（另外在既有的分類測試加入 1 個案例）。Rust MSVC lib：單人版 253/253、雙人版 253/253，無 warning；跑測試前後原始碼 SHA-256 不變。
 - rustfmt：`fido2.rs`/`vault.rs`/`webauthn_diagnostics.rs` 通過；`windows_webauthn.rs` 的 baseline 本來就有 7 處格式差異，本次沒有新增。
+
+#### D6 審查與追加修正（2026-10-11）
+
+- 兩位獨立唯讀審查員都審查 patch `e6b812ab…5bab93`（commit `5b5a31f`），結果都是 **passed=true，沒有 blocking**。證據在 `D:/scratch/dual-control-20261011/d6/review/`：
+  - Claude Code CLI：`claude-cli.raw.json` / `claude-cli-verdict.json`。
+  - Hermes SubAgent：`subagent-verdict.json`。
+- 依審查的 minor 意見與測試缺口追加修正：
+  - `make_credential_error(hr, exclude_requested)`：只有在有送排除清單時，`NTE_EXISTS` 才對應 `CredentialExcluded`；單人版（清單為空）維持通用錯誤，不顯示雙人版專用訊息。這是唯一的行為變更，TDD 1 個 assertion RED → GREEN。
+  - 抽出 `exclude_credential_list`（空清單 → null 指標 + count 0）與 raw CTAP `exclude_descriptors`，各補單元測試。
+  - 新增原始碼 contract 測試：makeCredential options 一定帶入 `CredentialList: exclude_list`，且不使用 v3 `pExcludeCredentialList`。
+  - 補上其他測試：`validate_exclude_credential_ids` 的拒絕分支；mock 忽略長度不足 9 的排除項；`UnavailableBackend` 保留自己的訊息；槽位 credential_id 損壞時在呼叫 authenticator 前 fail closed（detect/register 計數為 0）；移除槽位後，同一支金鑰可以重新註冊（排除清單只含目前存在的槽位）。
+  - 設計文件新增殘餘風險 R6（Q3 依賴 authenticator 遵守 excludeList、credProtect/UV 前提），§6.2 第 3 步加上 A/B 兩群組、不同金鑰類型各測一次。
+  - raw CTAP 的排除清單過長時，authenticator-rs preflight 會分批送出；仍無法送出就 fail closed。`vault_cli` 本期不支援 v2（§5），所以雙人版產品不會走到這條路徑。
+- 過程中的失敗（沒有改 production code，log 都保留）：第一版 contract 測試用字面量寫了 `fn make_credential_with_diagnostics(` 和 `fn get_hmac_secret(`，違反既有 source-wiring oracle 的「標記在檔案中唯一」規則，造成 10 個既有測試失敗（`LOCATOR:section-start`），log 為 `d6r1/02/03-FAIL-contract-test-duplicates-locator-*.log`。改成以 `format!` 組出定位字串，既有 oracle 一行都沒改。
+- Rust MSVC lib：單人版 262/262、雙人版 262/262（253 + 9），無 warning；跑測試前後原始碼 SHA-256 不變；rustfmt：`windows_webauthn.rs` 維持 baseline 的 7 處、沒有新增，其餘檔案通過。

@@ -2083,6 +2083,49 @@ mod tests {
     }
 
     #[test]
+    fn dual_corrupt_slot_credential_fails_before_authenticator() {
+        let p = fresh_path("d6-corrupt-cred");
+        let mut v = Vault::create_dual(&p, "Pw-12345").unwrap();
+        let mut b1 = MockBackend::new();
+        v.register_key_in_group(&mut b1, None, "a1", KeyGroup::A)
+            .unwrap();
+        v.header.key_slots[0].credential_id = "%%not-base64%%".into();
+        let mut counting = CountingBackend::new();
+        let r = v.register_key_in_group(&mut counting, None, "b1", KeyGroup::B);
+        assert!(
+            matches!(&r, Err(VaultError::Format(m)) if m.contains("credential_id")),
+            "got {:?}",
+            r.as_ref().map(|_| ())
+        );
+        assert_eq!(counting.detects, 0);
+        assert_eq!(counting.registers, 0);
+        assert_eq!(v.header.key_slots.len(), 1);
+    }
+
+    #[test]
+    fn removed_key_can_register_again() {
+        let p = fresh_path("d6-remove-reregister");
+        let mut v = Vault::create_dual(&p, "Pw-12345").unwrap();
+        let mut x = MockBackend::new();
+        let first = v
+            .register_key_in_group(&mut x, None, "x-a", KeyGroup::A)
+            .unwrap();
+        let mut y = MockBackend::new();
+        v.register_key_in_group(&mut y, None, "y-a", KeyGroup::A)
+            .unwrap();
+        v.remove_key(&base64_encode(&first.credential_id)).unwrap();
+        x.reuse_device();
+        // mock detect 會循環類型（這次是 PIN 型），提供測試 PIN。
+        let again = v.register_key_in_group(&mut x, Some("1234"), "x-b", KeyGroup::B);
+        assert!(
+            again.is_ok(),
+            "exclude list must only contain current slots, got {:?}",
+            again.err()
+        );
+        assert_eq!(v.header.key_slots.len(), 2);
+    }
+
+    #[test]
     fn single_registration_keeps_legacy_call_without_exclusion() {
         let p = fresh_path("d6-single-legacy");
         let mut v = Vault::create(&p, "Pw-12345").unwrap();

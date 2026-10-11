@@ -2106,14 +2106,7 @@ impl WindowsWebAuthnBackend {
         };
         // excludeCredentials（v1 CredentialList 欄位）：`exclude` 與 entries 須存活到 API 返回。
         let mut exclude_entries = exclude_credential_entries(exclude);
-        let exclude_list = WEBAUTHN_CREDENTIALS {
-            cCredentials: exclude_entries.len() as u32,
-            pCredentials: if exclude_entries.is_empty() {
-                ptr::null_mut()
-            } else {
-                exclude_entries.as_mut_ptr()
-            },
-        };
+        let exclude_list = exclude_credential_list(&mut exclude_entries);
         let options = WEBAUTHN_AUTHENTICATOR_MAKE_CREDENTIAL_OPTIONS {
             dwVersion: WEBAUTHN_AUTHENTICATOR_MAKE_CREDENTIAL_OPTIONS_VERSION_5,
             dwTimeoutMilliseconds: OP_TIMEOUT_MS,
@@ -2161,7 +2154,7 @@ impl WindowsWebAuthnBackend {
             if !attestation.is_null() {
                 unsafe { WebAuthNFreeCredentialAttestation(attestation) };
             }
-            return Err(make_credential_error(hr));
+            return Err(make_credential_error(hr, !exclude.is_empty()));
         }
         diagnostic.failure_stage = Some(FailureStage::Response);
         if attestation.is_null() {
@@ -2572,10 +2565,11 @@ fn hmac_secret_enabled(extensions: &WEBAUTHN_EXTENSIONS) -> bool {
     false
 }
 
-/// makeCredential 失敗 HRESULT → FidoError。`NTE_EXISTS`（WebAuthNGetErrorName = "InvalidStateError"）
-/// 為 excludeCredentials 命中：此金鑰已持有本金庫的 credential。
-fn make_credential_error(hr: windows_sys::core::HRESULT) -> FidoError {
-    if hr == windows_sys::Win32::Foundation::NTE_EXISTS {
+/// makeCredential 失敗 HRESULT → FidoError。有送 excludeCredentials 時，`NTE_EXISTS`
+/// （WebAuthNGetErrorName = "InvalidStateError"）代表命中：此金鑰已持有本金庫的 credential。
+/// 未送排除清單（單人版）時維持通用錯誤，不顯示雙人版專用訊息。
+fn make_credential_error(hr: windows_sys::core::HRESULT, exclude_requested: bool) -> FidoError {
+    if exclude_requested && hr == windows_sys::Win32::Foundation::NTE_EXISTS {
         return FidoError::CredentialExcluded;
     }
     api_error("makeCredential", hr)
@@ -2594,7 +2588,19 @@ fn exclude_credential_entries(credential_ids: &[Vec<u8>]) -> Vec<WEBAUTHN_CREDEN
         .collect()
 }
 
-/// 排除清單驗證：可為空；每筆不可空白或超過 API buffer 上限。
+/// v1 `CredentialList`（makeCredential 的 exclude 欄位）：空清單 → null 指標、count 0（與未設定相同）。
+fn exclude_credential_list(entries: &mut [WEBAUTHN_CREDENTIAL]) -> WEBAUTHN_CREDENTIALS {
+    WEBAUTHN_CREDENTIALS {
+        cCredentials: entries.len() as u32,
+        pCredentials: if entries.is_empty() {
+            ptr::null_mut()
+        } else {
+            entries.as_mut_ptr()
+        },
+    }
+}
+
+/// 排除清單驗證：可為空；每筆不可空白或超過 API buffer 上限（與 allow-list 驗證同一組防禦式檢查）。
 fn validate_exclude_credential_ids(credential_ids: &[Vec<u8>]) -> Result<(), FidoError> {
     if credential_ids.len() > u32::MAX as usize
         || credential_ids
@@ -2626,14 +2632,67 @@ mod tests {
     #[test]
     fn make_credential_nte_exists_is_credential_excluded() {
         assert!(matches!(
-            make_credential_error(windows_sys::Win32::Foundation::NTE_EXISTS),
+            make_credential_error(windows_sys::Win32::Foundation::NTE_EXISTS, true),
             FidoError::CredentialExcluded
         ));
-        let other = make_credential_error(0x8009_0030_u32 as i32);
+        let other = make_credential_error(0x8009_0030_u32 as i32, true);
         assert!(
             matches!(&other, FidoError::Internal(m) if m.contains("0x80090030")),
             "{other:?}"
         );
+    }
+
+    /// 未要求排除（單人版）時 NTE_EXISTS 不可顯示雙人版專用「已註冊」訊息。
+    #[test]
+    fn make_credential_nte_exists_without_exclude_keeps_generic_error() {
+        let e = make_credential_error(windows_sys::Win32::Foundation::NTE_EXISTS, false);
+        assert!(
+            matches!(&e, FidoError::Internal(m) if m.contains("0x8009000F")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn exclude_list_points_at_entries_and_is_null_when_empty() {
+        let ids = vec![vec![1u8, 2, 3], vec![4u8; 8]];
+        let mut entries = exclude_credential_entries(&ids);
+        let list = exclude_credential_list(&mut entries);
+        assert_eq!(list.cCredentials, 2);
+        assert_eq!(list.pCredentials, entries.as_mut_ptr());
+        let mut none: Vec<WEBAUTHN_CREDENTIAL> = Vec::new();
+        let empty = exclude_credential_list(&mut none);
+        assert_eq!(empty.cCredentials, 0);
+        assert!(empty.pCredentials.is_null());
+    }
+
+    #[test]
+    fn exclude_ids_are_validated() {
+        assert!(validate_exclude_credential_ids(&[]).is_ok());
+        assert!(validate_exclude_credential_ids(&[vec![1u8; 16]]).is_ok());
+        assert!(validate_exclude_credential_ids(&[vec![1u8; 16], Vec::new()]).is_err());
+        assert!(validate_exclude_credential_ids(&[vec![0u8; MAX_API_BUFFER + 1]]).is_err());
+    }
+
+    /// 原始碼 contract：makeCredential options 確實帶入排除清單，且不使用 v3 pExcludeCredentialList。
+    #[test]
+    fn make_credential_options_wire_exclude_list() {
+        // 定位字串以 format! 組出：既有 source-wiring oracle 要求原始 `fn …(` 標記在檔案中唯一，
+        // 測試本身不得再以字面量重複這些標記。
+        let source = include_str!("windows_webauthn.rs").replace("\r\n", "\n");
+        let start_marker = format!("    fn {}(", "make_credential_with_diagnostics");
+        let end_marker = format!("    fn {}(", "get_hmac_secret");
+        assert_eq!(source.matches(&start_marker).count(), 1);
+        let start = source.find(&start_marker).unwrap();
+        let end = start
+            + source[start..]
+                .find(&end_marker)
+                .expect("get_hmac_secret follows");
+        let body = &source[start..end];
+        assert!(body.contains("validate_exclude_credential_ids(exclude)?;"));
+        assert!(body.contains("let exclude_list = exclude_credential_list(&mut exclude_entries);"));
+        assert!(body.contains("CredentialList: exclude_list,"));
+        assert!(body.contains("make_credential_error(hr, !exclude.is_empty())"));
+        assert!(!body.contains("pExcludeCredentialList"));
     }
 
     #[test]
