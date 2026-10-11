@@ -108,7 +108,7 @@ KEK（隨機 256-bit，加解密 payload；與 v1 相同）
    - 解鎖後若兩值不一致，以 payload 值覆寫 header，並記 audit `settings_tamper_detected`。
    - 只有已解鎖的 session 才能修改（設定頁新增欄位），改動記 audit `settings_changed`。
 5. 稽核：
-   - 成功：`login_success` method=`fido2-dual:A:<label>+B:<label>`（依實際順序）。
+   - 成功：`login_success` method=`fido2-dual:<群組>:<label>#<fp>+<群組>:<label>#<fp>`（依實際順序；`fp` 為 SHA-256(credential_id) 前 4 bytes hex，label 中的 `% + : #` 會跳脫；見 §11 D7 追加修正）。
    - 失敗：第一步、第二步分別寫 sidecar，method=`fido2-dual-step1:<label>` / `fido2-dual-step2:<label>`；逾時與取消寫 `fido2-dual-timeout` / `fido2-dual-cancel`。sidecar 仍為上限 10 筆、只記時間戳和 method。
 
 ### 4.4 主密碼登入（break-glass）
@@ -371,3 +371,19 @@ KEK（隨機 256-bit，加解密 payload；與 v1 相同）
   - 正式 RED 為 14 個 assertion 失敗 → GREEN，新增 14 個測試。
   - 涵蓋：A→B、B→A、第一步資訊與允許清單、第二步只提供另一群組、惡意後端回同群組被拒、兩群組不齊、逾時、恰好在截止時間仍可完成、取消、第一步/第二步群組標記被竄改、兩步之間金庫被替換、單人版檔案、時限 clamp。
 - Rust MSVC lib：單人版 276/276、雙人版 276/276，無 warning；跑測試前後原始碼 SHA-256 不變；rustfmt 通過。
+
+#### D7 審查與追加修正（2026-10-11）
+
+- 兩位獨立唯讀審查員都審查 patch `11f7fdd7…26e4ae`（commit `c56d859`），結果都是 **passed=true，沒有 blocking**。兩人都確認核心安全性質成立：任一群組的金鑰（任意支數），不論 header 被竄改或後端不遵守允許清單，都解不開 KEK。證據在 `d7/review/`（`claude-cli.raw.json`、`claude-cli-verdict.json`、`subagent-verdict.json`）。
+- 依 minor 意見修正（commit 見 PR）：
+  1. **倒數起點**：改為「第一支金鑰完成並解出 share 之後」才取時間（`clock` 參數改成 `&mut dyn FnMut() -> Instant`），`remaining_ms` 在第一步回來後重新取樣。原本從第一步開始前計時，會吃掉第一步的互動時間。
+  2. **截止時間是硬上限**：第二支金鑰互動結束後再檢查一次；逾時 → 記 `fido2-dual-timeout`，回 `DualStepExpired`，不寫檔。
+  3. **Rust 端主動清除**：`login_dual_begin` 成功後啟動計時執行緒，截止後呼叫 `sweep_expired_dual`；只清同一代（`dual_generation`）的暫存，記 `fido2-dual-timeout`，share 清零，不依賴前端呼叫。
+  4. **稽核可追責**：成員識別改為 `<群組>:<跳脫名稱>#<credential 指紋>`。指紋來自已通過 AAD 驗證的 credential_id，竄改 header 的名稱無法冒名；名稱中的 `% + : #` 一律跳脫，step1/step2 失敗紀錄也套用。群組文字改用 `KeyGroup::as_str()`，不依賴 Debug 輸出；D5 註冊 audit 也改用它，輸出不變。
+  5. **補記失敗紀錄**：第二步後端回傳群組外 credential → `fido2-dual-step2-rejected`；兩步之間金庫被替換 → `fido2-dual-binding-mismatch`。broker 錯誤或使用者取消 Windows 對話框，仍與 `login_any_key` 一致，不記錄。
+  6. **不改（文件化）**：第二步遇到 `PinRequired` 時，暫存仍會被取用，必須從第一步重來（符合 §4.3）。這只會發生在非 broker 的後端（mock / raw CTAP）；雙人版 Release GUI 走 Windows broker，PIN 由系統 UI 處理，不會遇到。`login_dual_complete` 分兩段取鎖再寫入 `g.vault`，與既有的 `login_any_key` 相同，不在本次範圍。
+- 新增 16 個測試：
+  - vault 13 個：時鐘在金鑰互動後取樣、刷完才逾時被拒且不寫檔、剛過截止時間即逾時、第二步刷同一支金鑰被拒、群組外 credential 被記錄、第一步回傳不在金庫的 credential 不會建立暫存、綁定不符被記錄且不寫檔、header 時限被竄改時登入端仍 clamp、同群組的 share 解不開 dual_slot（直接密碼學驗證）、Debug 不含 share 位元組、`expire` 記錄、稽核跳脫與指紋、失敗紀錄跳脫。
+  - lib 3 個：`sweep_expired_dual` 會清除同一代且已逾時的暫存；未逾時或已是新一代的暫存保留。
+- TDD：10 個 assertion RED → GREEN。Rust MSVC lib：單人版 292/292、雙人版 292/292（276 + 16），無 warning；跑測試前後原始碼 SHA-256 不變；rustfmt：`lib.rs`/`vault.rs`/`crypto.rs`/`fido2.rs` 通過。
+- 仍未涵蓋（需 GUI 或 IPC 整合）：`lock`/`login_password`/`create_vault`/新的 begin 會清除暫存（都是一行指定，已人工檢查），以及計時執行緒實際觸發。留到 D10/D11 的 UI 與 E2E 驗證。

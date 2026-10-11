@@ -154,6 +154,14 @@ impl KeyGroup {
         }
     }
 
+    /// 穩定的文字表示（稽核紀錄用；不依賴 Debug 輸出）。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::A => "A",
+            Self::B => "B",
+        }
+    }
+
     /// 另一個群組（兩步驟登入第二步要求的群組）。
     pub const fn other(self) -> Self {
         match self {
@@ -361,6 +369,8 @@ mod tests {
     fn key_group_tags_other_and_serde() {
         assert_eq!(KeyGroup::A.aad_tag(), b'A');
         assert_eq!(KeyGroup::B.aad_tag(), b'B');
+        assert_eq!(KeyGroup::A.as_str(), "A");
+        assert_eq!(KeyGroup::B.as_str(), "B");
         assert_eq!(KeyGroup::A.other(), KeyGroup::B);
         assert_eq!(KeyGroup::B.other(), KeyGroup::A);
         assert_eq!(serde_json::to_value(KeyGroup::A).unwrap(), "A");

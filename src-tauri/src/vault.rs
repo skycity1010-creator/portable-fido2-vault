@@ -319,6 +319,34 @@ pub fn effective_dual_step_timeout_secs(header: &Header) -> u32 {
         .unwrap_or(DEFAULT_DUAL_STEP_TIMEOUT_SECS)
 }
 
+/// 稽核用的成員識別：`<群組>:<跳脫後名稱>#<credential 指紋>`。名稱是 header 明文（未驗證），
+/// 指紋取自已通過 AAD 驗證的 credential_id，讓竄改名稱無法冒名。
+fn dual_audit_party(group: KeyGroup, label: &str, credential_id: &[u8]) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(credential_id);
+    let fingerprint: String = digest[..4].iter().map(|b| format!("{b:02x}")).collect();
+    format!(
+        "{}:{}#{fingerprint}",
+        group.as_str(),
+        escape_audit_label(label)
+    )
+}
+
+/// 稽核 method 內的名稱跳脫（`%` `+` `:` `#`），避免分隔字元造成歧義。
+fn escape_audit_label(label: &str) -> String {
+    let mut out = String::with_capacity(label.len());
+    for ch in label.chars() {
+        match ch {
+            '%' => out.push_str("%25"),
+            '+' => out.push_str("%2B"),
+            ':' => out.push_str("%3A"),
+            '#' => out.push_str("%23"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// 綁定值：created_at + dual_slot 密文（不含機密）。
 fn dual_binding(header: &Header) -> Result<(String, String), VaultError> {
     let slot = header
@@ -369,6 +397,8 @@ pub struct DualPending {
     path: PathBuf,
     first_group: KeyGroup,
     first_label: String,
+    /// 稽核用的第一位成員識別（含 credential 指紋）。
+    first_party: String,
     share: Zeroizing<[u8; 32]>,
     deadline: Instant,
     timeout_secs: u32,
@@ -407,6 +437,25 @@ impl DualPending {
 
     pub fn is_expired(&self, now: Instant) -> bool {
         now > self.deadline
+    }
+
+    /// 逾時清除（app 層計時器呼叫）：記 sidecar `fido2-dual-timeout`，share 隨 drop 清零。
+    pub fn expire(self) -> Result<(), VaultError> {
+        record_login_failure(&self.path, "fido2-dual-timeout")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(path: PathBuf, deadline: Instant) -> Self {
+        Self {
+            path,
+            first_group: KeyGroup::A,
+            first_label: "test".into(),
+            first_party: "A:test#00000000".into(),
+            share: Zeroizing::new([7u8; 32]),
+            deadline,
+            timeout_secs: DEFAULT_DUAL_STEP_TIMEOUT_SECS,
+            binding: (String::new(), String::new()),
+        }
     }
 
     /// 使用者取消：記 sidecar（僅時間戳 + method），share 隨 drop 清零。
@@ -627,7 +676,7 @@ impl Vault {
         path: &Path,
         pin: Option<&str>,
         backend: &mut (dyn FidoBackend + 'static),
-        now: Instant,
+        clock: &mut dyn FnMut() -> Instant,
     ) -> Result<DualPending, VaultError> {
         let (header, _payload) = Self::read_file(path, Edition::Dual)?;
         let has_group = |group: KeyGroup| header.key_slots.iter().any(|s| s.group == Some(group));
@@ -657,14 +706,22 @@ impl Vault {
         let share = match unwrap_group_share(slot, &secret) {
             Ok(share) => share,
             Err(_) => {
-                record_login_failure(path, &format!("fido2-dual-step1:{}", slot.label))?;
+                record_login_failure(
+                    path,
+                    &format!("fido2-dual-step1:{}", escape_audit_label(&slot.label)),
+                )?;
                 return Err(VaultError::Crypto(CryptoError::DecryptFailed));
             }
         };
+        let first_cred = base64_decode(&slot.credential_id)
+            .map_err(|_| VaultError::Format("credential_id 解碼失敗".into()))?;
+        // 倒數從「第一支金鑰完成」開始（§4.3），不吃掉第一步的互動時間。
+        let now = clock();
         Ok(DualPending {
             path: path.to_path_buf(),
             first_group,
             first_label: slot.label.clone(),
+            first_party: dual_audit_party(first_group, &slot.label, &first_cred),
             share,
             deadline: now + Duration::from_secs(u64::from(timeout_secs)),
             timeout_secs,
@@ -677,8 +734,9 @@ impl Vault {
         pending: DualPending,
         pin: Option<&str>,
         backend: &mut (dyn FidoBackend + 'static),
-        now: Instant,
+        clock: &mut dyn FnMut() -> Instant,
     ) -> Result<Self, VaultError> {
+        let now = clock();
         // 逾時：不再提示第二支金鑰；pending（含 share）隨 drop 清零。
         if pending.is_expired(now) {
             record_login_failure(&pending.path, "fido2-dual-timeout")?;
@@ -687,6 +745,7 @@ impl Vault {
         let path = pending.path.clone();
         let (header, payload) = Self::read_file(&path, Edition::Dual)?;
         if dual_binding(&header)? != pending.binding {
+            record_login_failure(&path, "fido2-dual-binding-mismatch")?;
             return Err(VaultError::Format(
                 "金庫在兩步驟之間已變更，請從第一步重新開始".into(),
             ));
@@ -704,19 +763,31 @@ impl Vault {
         let credential_ids = decode_credential_ids(&second_slots)?;
         let (selected_id, secret) = backend.get_prf_secret_for_any(&credential_ids, pin)?;
         let secret = Zeroizing::new(secret);
+        // 截止時間是硬上限：第二支金鑰互動結束後再檢查一次。
+        if pending.is_expired(clock()) {
+            record_login_failure(&path, "fido2-dual-timeout")?;
+            return Err(VaultError::DualStepExpired);
+        }
         let selected_b64 = base64_encode(&selected_id);
         // 不信任後端：所選 credential 必須屬於另一群組。
-        let slot = second_slots
+        let slot = match second_slots
             .iter()
             .find(|slot| slot.credential_id == selected_b64)
             .copied()
-            .ok_or_else(|| {
-                VaultError::Fido(FidoError::Internal(
+        {
+            Some(slot) => slot,
+            None => {
+                record_login_failure(&path, "fido2-dual-step2-rejected")?;
+                return Err(VaultError::Fido(FidoError::Internal(
                     "backend selected a credential outside the required group".into(),
-                ))
-            })?;
+                )));
+            }
+        };
         let step2_failure = |label: &str| -> VaultError {
-            match record_login_failure(&path, &format!("fido2-dual-step2:{label}")) {
+            match record_login_failure(
+                &path,
+                &format!("fido2-dual-step2:{}", escape_audit_label(label)),
+            ) {
                 Ok(()) => VaultError::Crypto(CryptoError::DecryptFailed),
                 Err(e) => e,
             }
@@ -743,9 +814,12 @@ impl Vault {
         };
         let mut kek = Zeroizing::new([0u8; 32]);
         kek.copy_from_slice(&kek_bytes);
+        let second_cred = base64_decode(&slot.credential_id)
+            .map_err(|_| VaultError::Format("credential_id 解碼失敗".into()))?;
         let method = format!(
-            "fido2-dual:{:?}:{}+{:?}:{}",
-            pending.first_group, pending.first_label, second_group, slot.label
+            "fido2-dual:{}+{}",
+            pending.first_party,
+            dual_audit_party(second_group, &slot.label, &second_cred)
         );
         Self::unlock(&path, header, payload, kek, &method)
     }
@@ -1398,7 +1472,7 @@ impl Vault {
         });
         let kind_str = format!("{}", reg.kind);
         let detail = match group {
-            Some(group) => format!("type={kind_str} group={group:?}"),
+            Some(group) => format!("type={kind_str} group={}", group.as_str()),
             None => format!("type={kind_str}"),
         };
         self.record("key_registered", &format!("fido2:{}", reg.label), &detail)?;
@@ -2380,6 +2454,8 @@ mod tests {
         tap: Vec<u8>,
         rogue: bool,
         offered: Vec<Vec<Vec<u8>>>,
+        /// 設定後，金鑰互動發生時設為 true（驗證時鐘取樣時機）。
+        prompted: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     }
 
     impl TapBackend {
@@ -2388,6 +2464,7 @@ mod tests {
                 tap: cred.to_vec(),
                 rogue: false,
                 offered: Vec::new(),
+                prompted: None,
             }
         }
     }
@@ -2412,6 +2489,9 @@ mod tests {
             _: Option<&str>,
         ) -> Result<(Vec<u8>, [u8; 32]), FidoError> {
             self.offered.push(ids.to_vec());
+            if let Some(flag) = &self.prompted {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             if self.rogue || ids.contains(&self.tap) {
                 Ok((self.tap.clone(), MockBackend::prf_for_credential(&self.tap)))
             } else {
@@ -2441,9 +2521,9 @@ mod tests {
     fn two_step(p: &Path, first: &[u8], second: &[u8]) -> Result<Vault, VaultError> {
         let t0 = Instant::now();
         let mut b1 = TapBackend::tap(first);
-        let pending = Vault::dual_login_begin(p, None, &mut b1, t0)?;
+        let pending = Vault::dual_login_begin(p, None, &mut b1, &mut || t0)?;
         let mut b2 = TapBackend::tap(second);
-        Vault::dual_login_complete(pending, None, &mut b2, t0 + Duration::from_secs(5))
+        Vault::dual_login_complete(pending, None, &mut b2, &mut || t0 + Duration::from_secs(5))
     }
 
     #[test]
@@ -2454,7 +2534,14 @@ mod tests {
         let v = r.unwrap();
         let last = v.audit().last().unwrap();
         assert_eq!(last.event, "login_success");
-        assert_eq!(last.method, "fido2-dual:A:王小明+B:李大華");
+        assert_eq!(
+            last.method,
+            format!(
+                "fido2-dual:A:王小明#{}+B:李大華#{}",
+                cred_fp(&c[0]),
+                cred_fp(&c[1])
+            )
+        );
     }
 
     #[test]
@@ -2464,7 +2551,7 @@ mod tests {
         assert!(r.is_ok(), "B→A failed: {:?}", r.err());
         assert_eq!(
             r.unwrap().audit().last().unwrap().method,
-            "fido2-dual:B:b1+A:a1"
+            format!("fido2-dual:B:b1#{}+A:a1#{}", cred_fp(&c[1]), cred_fp(&c[0]))
         );
     }
 
@@ -2473,7 +2560,7 @@ mod tests {
         let (p, c) = dual_vault_with("d7-begin-info", &[("a1", KeyGroup::A), ("b1", KeyGroup::B)]);
         let t0 = Instant::now();
         let mut b = TapBackend::tap(&c[1]);
-        let pending = Vault::dual_login_begin(&p, None, &mut b, t0);
+        let pending = Vault::dual_login_begin(&p, None, &mut b, &mut || t0);
         assert!(pending.is_ok(), "begin failed: {:?}", pending.err());
         let pending = pending.unwrap();
         assert_eq!(pending.first_group(), KeyGroup::B);
@@ -2498,11 +2585,11 @@ mod tests {
         );
         let t0 = Instant::now();
         let mut b1 = TapBackend::tap(&c[0]);
-        let pending = Vault::dual_login_begin(&p, None, &mut b1, t0);
+        let pending = Vault::dual_login_begin(&p, None, &mut b1, &mut || t0);
         assert!(pending.is_ok(), "begin failed: {:?}", pending.err());
         // 第二步刷同群組的 a2：不在允許清單 → 失敗，不可解鎖。
         let mut b2 = TapBackend::tap(&c[1]);
-        let r = Vault::dual_login_complete(pending.unwrap(), None, &mut b2, t0);
+        let r = Vault::dual_login_complete(pending.unwrap(), None, &mut b2, &mut || t0);
         assert!(r.is_err(), "same-group second key must not unlock");
         assert_eq!(
             b2.offered,
@@ -2523,12 +2610,12 @@ mod tests {
         );
         let t0 = Instant::now();
         let mut b1 = TapBackend::tap(&c[0]);
-        let pending = Vault::dual_login_begin(&p, None, &mut b1, t0);
+        let pending = Vault::dual_login_begin(&p, None, &mut b1, &mut || t0);
         assert!(pending.is_ok(), "begin failed: {:?}", pending.err());
         let mut rogue = TapBackend::tap(&c[1]);
         rogue.rogue = true; // 無視允許清單，回傳 A 群組的 a2
         let before = fs::read(&p).unwrap();
-        let r = Vault::dual_login_complete(pending.unwrap(), None, &mut rogue, t0);
+        let r = Vault::dual_login_complete(pending.unwrap(), None, &mut rogue, &mut || t0);
         assert!(
             matches!(&r, Err(VaultError::Fido(FidoError::Internal(_)))),
             "credential outside the required group must be refused, got {:?}",
@@ -2541,7 +2628,7 @@ mod tests {
     fn dual_login_requires_both_groups() {
         let (p, c) = dual_vault_with("d7-not-ready", &[("a1", KeyGroup::A)]);
         let mut b = TapBackend::tap(&c[0]);
-        let r = Vault::dual_login_begin(&p, None, &mut b, Instant::now());
+        let r = Vault::dual_login_begin(&p, None, &mut b, &mut Instant::now);
         assert!(
             matches!(r, Err(VaultError::DualNotReady)),
             "got {:?}",
@@ -2556,14 +2643,14 @@ mod tests {
         let (p, c) = dual_vault_with("d7-expired", &[("a1", KeyGroup::A), ("b1", KeyGroup::B)]);
         let t0 = Instant::now();
         let mut b1 = TapBackend::tap(&c[0]);
-        let pending = Vault::dual_login_begin(&p, None, &mut b1, t0);
+        let pending = Vault::dual_login_begin(&p, None, &mut b1, &mut || t0);
         assert!(pending.is_ok(), "begin failed: {:?}", pending.err());
         let pending = pending.unwrap();
         let late = t0 + Duration::from_secs(121);
         assert!(pending.is_expired(late));
         assert_eq!(pending.remaining(late), Duration::ZERO);
         let mut b2 = TapBackend::tap(&c[1]);
-        let r = Vault::dual_login_complete(pending, None, &mut b2, late);
+        let r = Vault::dual_login_complete(pending, None, &mut b2, &mut || late);
         assert!(
             matches!(r, Err(VaultError::DualStepExpired)),
             "got {:?}",
@@ -2585,15 +2672,12 @@ mod tests {
         let (p, c) = dual_vault_with("d7-deadline", &[("a1", KeyGroup::A), ("b1", KeyGroup::B)]);
         let t0 = Instant::now();
         let mut b1 = TapBackend::tap(&c[0]);
-        let pending = Vault::dual_login_begin(&p, None, &mut b1, t0);
+        let pending = Vault::dual_login_begin(&p, None, &mut b1, &mut || t0);
         assert!(pending.is_ok(), "begin failed: {:?}", pending.err());
         let mut b2 = TapBackend::tap(&c[1]);
-        let r = Vault::dual_login_complete(
-            pending.unwrap(),
-            None,
-            &mut b2,
-            t0 + Duration::from_secs(120),
-        );
+        let r = Vault::dual_login_complete(pending.unwrap(), None, &mut b2, &mut || {
+            t0 + Duration::from_secs(120)
+        });
         assert!(
             r.is_ok(),
             "exactly at the deadline must still succeed: {:?}",
@@ -2606,7 +2690,7 @@ mod tests {
         let (p, c) = dual_vault_with("d7-cancel", &[("a1", KeyGroup::A), ("b1", KeyGroup::B)]);
         let before = fs::read(&p).unwrap();
         let mut b1 = TapBackend::tap(&c[0]);
-        let pending = Vault::dual_login_begin(&p, None, &mut b1, Instant::now());
+        let pending = Vault::dual_login_begin(&p, None, &mut b1, &mut Instant::now);
         assert!(pending.is_ok(), "begin failed: {:?}", pending.err());
         pending.unwrap().cancel().unwrap();
         assert_eq!(fs::read(&p).unwrap(), before);
@@ -2629,7 +2713,7 @@ mod tests {
         );
         rewrite_header(&p, |h| h["key_slots"][1]["group"] = serde_json::json!("B"));
         let mut b = TapBackend::tap(&c[1]);
-        let r = Vault::dual_login_begin(&p, None, &mut b, Instant::now());
+        let r = Vault::dual_login_begin(&p, None, &mut b, &mut Instant::now);
         assert!(
             matches!(r, Err(VaultError::Crypto(CryptoError::DecryptFailed))),
             "got {:?}",
@@ -2655,11 +2739,11 @@ mod tests {
         rewrite_header(&p, |h| h["key_slots"][2]["group"] = serde_json::json!("A"));
         let t0 = Instant::now();
         let mut b1 = TapBackend::tap(&c[1]); // b1（B）
-        let pending = Vault::dual_login_begin(&p, None, &mut b1, t0);
+        let pending = Vault::dual_login_begin(&p, None, &mut b1, &mut || t0);
         assert!(pending.is_ok(), "begin failed: {:?}", pending.err());
         let before = fs::read(&p).unwrap();
         let mut b2 = TapBackend::tap(&c[2]); // b2 被改標成 A，出現在 A 允許清單
-        let r = Vault::dual_login_complete(pending.unwrap(), None, &mut b2, t0);
+        let r = Vault::dual_login_complete(pending.unwrap(), None, &mut b2, &mut || t0);
         assert!(
             matches!(r, Err(VaultError::Crypto(CryptoError::DecryptFailed))),
             "got {:?}",
@@ -2678,7 +2762,7 @@ mod tests {
         let (p, c) = dual_vault_with("d7-replaced", &[("a1", KeyGroup::A), ("b1", KeyGroup::B)]);
         let t0 = Instant::now();
         let mut b1 = TapBackend::tap(&c[0]);
-        let pending = Vault::dual_login_begin(&p, None, &mut b1, t0);
+        let pending = Vault::dual_login_begin(&p, None, &mut b1, &mut || t0);
         assert!(pending.is_ok(), "begin failed: {:?}", pending.err());
         // 兩步之間檔案被換成另一個金庫（不同 dual_slot）。
         let (other, _) = dual_vault_with(
@@ -2687,7 +2771,7 @@ mod tests {
         );
         fs::copy(&other, &p).unwrap();
         let mut b2 = TapBackend::tap(&c[1]);
-        let r = Vault::dual_login_complete(pending.unwrap(), None, &mut b2, t0);
+        let r = Vault::dual_login_complete(pending.unwrap(), None, &mut b2, &mut || t0);
         assert!(
             matches!(&r, Err(VaultError::Format(m)) if m.contains("已變更")),
             "got {:?}",
@@ -2702,11 +2786,249 @@ mod tests {
         drop(Vault::create(&p, "Pw-12345").unwrap());
         let mut b = TapBackend::tap(&[1u8; 32]);
         assert!(matches!(
-            Vault::dual_login_begin(&p, None, &mut b, Instant::now()),
+            Vault::dual_login_begin(&p, None, &mut b, &mut Instant::now),
             Err(VaultError::WrongEdition {
                 vault: Edition::Single
             })
         ));
+    }
+
+    fn cred_fp(cred: &[u8]) -> String {
+        let digest = <sha2::Sha256 as sha2::Digest>::digest(cred);
+        digest[..4].iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    // ── D7 追加修正（審查）──
+
+    #[test]
+    fn dual_login_deadline_starts_after_first_key_completes() {
+        let (p, c) = dual_vault_with(
+            "d7r-begin-clock",
+            &[("a1", KeyGroup::A), ("b1", KeyGroup::B)],
+        );
+        let t0 = Instant::now();
+        let prompted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut b = TapBackend::tap(&c[0]);
+        b.prompted = Some(prompted.clone());
+        let mut sampled_after_prompt = Vec::new();
+        let mut clock = || {
+            sampled_after_prompt.push(prompted.load(std::sync::atomic::Ordering::SeqCst));
+            // 第一步耗時 40 秒：截止時間必須以「第一支金鑰完成」為起點。
+            t0 + Duration::from_secs(40)
+        };
+        let pending = Vault::dual_login_begin(&p, None, &mut b, &mut clock);
+        assert!(pending.is_ok(), "begin failed: {:?}", pending.err());
+        assert_eq!(
+            sampled_after_prompt,
+            vec![true],
+            "deadline clock must be sampled once, after the first key completes"
+        );
+        let pending = pending.unwrap();
+        assert_eq!(
+            pending.remaining(t0 + Duration::from_secs(40)),
+            Duration::from_secs(120)
+        );
+    }
+
+    #[test]
+    fn dual_login_second_key_completed_after_deadline_is_refused() {
+        let (p, c) = dual_vault_with(
+            "d7r-post-expiry",
+            &[("a1", KeyGroup::A), ("b1", KeyGroup::B)],
+        );
+        let t0 = Instant::now();
+        let mut b1 = TapBackend::tap(&c[0]);
+        let pending = Vault::dual_login_begin(&p, None, &mut b1, &mut || t0);
+        assert!(pending.is_ok(), "begin failed: {:?}", pending.err());
+        let before = fs::read(&p).unwrap();
+        // 第二步開始時尚未逾時（t0+100），刷完時已逾時（t0+121）。
+        let mut samples = vec![t0 + Duration::from_secs(121), t0 + Duration::from_secs(100)];
+        let mut clock = || samples.pop().unwrap_or(t0 + Duration::from_secs(121));
+        let mut b2 = TapBackend::tap(&c[1]);
+        let r = Vault::dual_login_complete(pending.unwrap(), None, &mut b2, &mut clock);
+        assert!(
+            matches!(r, Err(VaultError::DualStepExpired)),
+            "completion after the deadline must be refused, got {:?}",
+            r.as_ref().map(|_| ())
+        );
+        assert_eq!(
+            b2.offered.len(),
+            1,
+            "the second key was prompted before the deadline"
+        );
+        assert_eq!(fs::read(&p).unwrap(), before);
+        let stamps = read_failure_sidecar(&p);
+        assert_eq!(
+            stamps.last().map(|s| s.method.as_str()),
+            Some("fido2-dual-timeout")
+        );
+    }
+
+    #[test]
+    fn dual_login_just_past_deadline_is_expired() {
+        let (p, c) = dual_vault_with("d7r-just-past", &[("a1", KeyGroup::A), ("b1", KeyGroup::B)]);
+        let t0 = Instant::now();
+        let mut b1 = TapBackend::tap(&c[0]);
+        let pending = Vault::dual_login_begin(&p, None, &mut b1, &mut || t0).unwrap();
+        assert!(pending.is_expired(t0 + Duration::from_secs(120) + Duration::from_nanos(1)));
+        assert!(!pending.is_expired(t0 + Duration::from_secs(120)));
+    }
+
+    #[test]
+    fn dual_login_second_step_same_key_is_refused() {
+        let (p, c) = dual_vault_with("d7r-same-key", &[("a1", KeyGroup::A), ("b1", KeyGroup::B)]);
+        let t0 = Instant::now();
+        let mut b1 = TapBackend::tap(&c[0]);
+        let pending = Vault::dual_login_begin(&p, None, &mut b1, &mut || t0).unwrap();
+        let mut again = TapBackend::tap(&c[0]);
+        again.rogue = true;
+        let r = Vault::dual_login_complete(pending, None, &mut again, &mut || t0);
+        assert!(r.is_err(), "the first key must not satisfy step 2");
+    }
+
+    #[test]
+    fn dual_login_step2_rejected_credential_is_recorded() {
+        let (p, c) = dual_vault_with(
+            "d7r-rogue-recorded",
+            &[
+                ("a1", KeyGroup::A),
+                ("a2", KeyGroup::A),
+                ("b1", KeyGroup::B),
+            ],
+        );
+        let t0 = Instant::now();
+        let mut b1 = TapBackend::tap(&c[0]);
+        let pending = Vault::dual_login_begin(&p, None, &mut b1, &mut || t0).unwrap();
+        let mut rogue = TapBackend::tap(&c[1]);
+        rogue.rogue = true;
+        let _ = Vault::dual_login_complete(pending, None, &mut rogue, &mut || t0);
+        let stamps = read_failure_sidecar(&p);
+        assert_eq!(
+            stamps.last().map(|s| s.method.as_str()),
+            Some("fido2-dual-step2-rejected")
+        );
+    }
+
+    #[test]
+    fn dual_login_step1_unknown_credential_creates_no_pending() {
+        let (p, _c) = dual_vault_with(
+            "d7r-step1-unknown",
+            &[("a1", KeyGroup::A), ("b1", KeyGroup::B)],
+        );
+        let mut rogue = TapBackend::tap(&[9u8; 32]);
+        rogue.rogue = true;
+        let r = Vault::dual_login_begin(&p, None, &mut rogue, &mut Instant::now);
+        assert!(matches!(r, Err(VaultError::Fido(FidoError::Internal(_)))));
+    }
+
+    #[test]
+    fn dual_login_binding_mismatch_is_recorded_without_writing() {
+        let (p, c) = dual_vault_with("d7r-binding", &[("a1", KeyGroup::A), ("b1", KeyGroup::B)]);
+        let t0 = Instant::now();
+        let mut b1 = TapBackend::tap(&c[0]);
+        let pending = Vault::dual_login_begin(&p, None, &mut b1, &mut || t0).unwrap();
+        let (other, _) = dual_vault_with(
+            "d7r-binding-other",
+            &[("a1", KeyGroup::A), ("b1", KeyGroup::B)],
+        );
+        fs::copy(&other, &p).unwrap();
+        let before = fs::read(&p).unwrap();
+        let mut b2 = TapBackend::tap(&c[1]);
+        assert!(Vault::dual_login_complete(pending, None, &mut b2, &mut || t0).is_err());
+        assert_eq!(fs::read(&p).unwrap(), before);
+        let stamps = read_failure_sidecar(&p);
+        assert_eq!(
+            stamps.last().map(|s| s.method.as_str()),
+            Some("fido2-dual-binding-mismatch")
+        );
+    }
+
+    #[test]
+    fn dual_login_tampered_timeout_mirror_is_clamped_end_to_end() {
+        for (raw, expected) in [(5u32, 30u32), (99_999, 600)] {
+            let (p, c) = dual_vault_with(
+                &format!("d7r-timeout-{raw}"),
+                &[("a1", KeyGroup::A), ("b1", KeyGroup::B)],
+            );
+            rewrite_header(&p, |h| h["dual_step_timeout_secs"] = serde_json::json!(raw));
+            let t0 = Instant::now();
+            let mut b = TapBackend::tap(&c[0]);
+            let pending = Vault::dual_login_begin(&p, None, &mut b, &mut || t0).unwrap();
+            assert_eq!(pending.timeout_secs(), expected);
+            assert_eq!(
+                pending.remaining(t0),
+                Duration::from_secs(u64::from(expected))
+            );
+        }
+    }
+
+    #[test]
+    fn same_group_shares_cannot_open_dual_slot() {
+        let p = fresh_path("d7r-same-share");
+        let v = Vault::create_dual(&p, "Pw-12345").unwrap();
+        let shares = v.data.dual.clone().unwrap();
+        let a = decode_share(&shares.share_a);
+        let b = decode_share(&shares.share_b);
+        let slot = v.header.dual_slot.clone().unwrap();
+        let nonce = slot_nonce(&slot.nonce).unwrap();
+        let ct = base64_decode(&slot.ct).unwrap();
+        for (x, y) in [(a, a), (b, b), (b, a)] {
+            let wrap = crate::crypto::dual_wrap_key_from_shares(&x, &y);
+            assert!(aes_gcm_decrypt_aad(&wrap, &nonce, &ct, DUAL_SLOT_AAD).is_err());
+        }
+        let wrap = crate::crypto::dual_wrap_key_from_shares(&a, &b);
+        assert!(aes_gcm_decrypt_aad(&wrap, &nonce, &ct, DUAL_SLOT_AAD).is_ok());
+    }
+
+    #[test]
+    fn dual_pending_debug_never_shows_share_bytes() {
+        let pending = DualPending::for_test(PathBuf::from("x"), Instant::now());
+        let shown = format!("{pending:?}");
+        let hex: String = pending.share.iter().map(|b| format!("{b:02x}")).collect();
+        assert!(!shown.contains(&hex));
+        assert!(!shown.contains("7, 7, 7"), "{shown}");
+    }
+
+    #[test]
+    fn dual_pending_expire_records_timeout() {
+        let p = fresh_path("d7r-expire");
+        let pending = DualPending::for_test(p.clone(), Instant::now());
+        pending.expire().unwrap();
+        let stamps = read_failure_sidecar(&p);
+        assert_eq!(
+            stamps.last().map(|s| s.method.as_str()),
+            Some("fido2-dual-timeout")
+        );
+    }
+
+    #[test]
+    fn audit_party_escapes_separators_and_adds_fingerprint() {
+        let cred = [1u8, 2, 3];
+        assert_eq!(
+            dual_audit_party(KeyGroup::B, "x+B:y#%", &cred),
+            format!("B:x%2BB%3Ay%23%25#{}", cred_fp(&cred))
+        );
+        assert_eq!(escape_audit_label("王小明"), "王小明");
+    }
+
+    #[test]
+    fn dual_login_failure_methods_escape_labels() {
+        let (p, c) = dual_vault_with(
+            "d7r-escape-fail",
+            &[
+                ("a1", KeyGroup::A),
+                ("x+y", KeyGroup::A),
+                ("b1", KeyGroup::B),
+            ],
+        );
+        rewrite_header(&p, |h| h["key_slots"][1]["group"] = serde_json::json!("B"));
+        let mut b = TapBackend::tap(&c[1]);
+        let _ = Vault::dual_login_begin(&p, None, &mut b, &mut Instant::now);
+        let stamps = read_failure_sidecar(&p);
+        assert_eq!(
+            stamps.last().map(|s| s.method.as_str()),
+            Some("fido2-dual-step1:x%2By")
+        );
     }
 
     #[test]

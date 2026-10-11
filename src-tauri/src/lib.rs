@@ -262,6 +262,23 @@ struct AppInner {
     pending_csv_import: Option<PendingCsvImport>,
     /// 雙人版兩步驟登入：第一步完成後的暫存（share 只在 Rust 端，drop 時清零）。
     dual_pending: Option<vault::DualPending>,
+    /// 每次第一步遞增；逾時計時器只清除自己那一代的暫存。
+    dual_generation: u64,
+}
+
+/// 逾時計時器：同一代且已逾時 → 取走暫存、記 `fido2-dual-timeout`（share 清零）。
+fn sweep_expired_dual(g: &mut AppInner, generation: u64, now: std::time::Instant) -> bool {
+    if g.dual_generation != generation {
+        return false;
+    }
+    match g.dual_pending.as_ref() {
+        Some(pending) if pending.is_expired(now) => {}
+        _ => return false,
+    }
+    if let Some(pending) = g.dual_pending.take() {
+        let _ = pending.expire();
+    }
+    true
 }
 
 fn entries_fingerprint(entries: &[vault::Entry]) -> Result<[u8; 32]> {
@@ -284,6 +301,7 @@ impl AppInner {
             backend: make_backend(window_handle)?,
             pending_csv_import: None,
             dual_pending: None,
+            dual_generation: 0,
         })
     }
 }
@@ -550,18 +568,34 @@ fn login_dual_begin(
         // 新的第一步一律先丟棄舊的暫存（清零），避免殘留 share。
         g.dual_pending = None;
         g.backend.set_webauthn_parent_hwnd(owner_hwnd);
-        let now = std::time::Instant::now();
-        let pending =
-            vault::Vault::dual_login_begin(&path, pin.as_deref(), g.backend.as_mut(), now)
-                .map_err(|e| e.to_string())?;
+        let pending = vault::Vault::dual_login_begin(
+            &path,
+            pin.as_deref(),
+            g.backend.as_mut(),
+            &mut std::time::Instant::now,
+        )
+        .map_err(|e| e.to_string())?;
+        let remaining = pending.remaining(std::time::Instant::now());
         let info = DualBeginInfo {
             first_group: pending.first_group(),
             first_label: pending.first_label().to_owned(),
             second_group: pending.first_group().other(),
             timeout_secs: pending.timeout_secs(),
-            remaining_ms: pending.remaining(now).as_millis() as u64,
+            remaining_ms: remaining.as_millis() as u64,
         };
+        g.dual_generation = g.dual_generation.wrapping_add(1);
+        let generation = g.dual_generation;
         g.dual_pending = Some(pending);
+        // Rust 端主動逾時清除，不依賴前端呼叫（§4.3、R5）。
+        let app = window.app_handle().clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(remaining + std::time::Duration::from_millis(250));
+            let state = app.state::<VaultState>();
+            let _ = state.with_lock(|g| {
+                sweep_expired_dual(g, generation, std::time::Instant::now());
+                Ok(())
+            });
+        });
         Ok(info)
     })
 }
@@ -586,7 +620,7 @@ fn login_dual_complete(
             pending,
             pin.as_deref(),
             g.backend.as_mut(),
-            std::time::Instant::now(),
+            &mut std::time::Instant::now,
         )
         .map_err(|e| e.to_string())
     })?;
@@ -971,6 +1005,66 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod dual_pending_sweep_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn inner_with(pending: Option<vault::DualPending>, generation: u64) -> AppInner {
+        AppInner {
+            vault: None,
+            backend: Box::new(MockBackend::new()),
+            pending_csv_import: None,
+            dual_pending: pending,
+            dual_generation: generation,
+        }
+    }
+
+    fn sidecar_path(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("f2v-lib-{tag}-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&d);
+        let p = d.join("vault.db");
+        let _ = std::fs::remove_file(vault::failures_path(&p));
+        p
+    }
+
+    #[test]
+    fn sweep_clears_expired_pending_of_same_generation() {
+        let p = sidecar_path("sweep-expired");
+        let t0 = Instant::now();
+        let mut g = inner_with(Some(vault::DualPending::for_test(p.clone(), t0)), 3);
+        assert!(sweep_expired_dual(&mut g, 3, t0 + Duration::from_secs(1)));
+        assert!(g.dual_pending.is_none());
+        let text = std::fs::read_to_string(vault::failures_path(&p)).unwrap();
+        assert!(text.contains("fido2-dual-timeout"), "{text}");
+    }
+
+    #[test]
+    fn sweep_keeps_pending_that_is_not_expired() {
+        let p = sidecar_path("sweep-live");
+        let t0 = Instant::now();
+        let mut g = inner_with(
+            Some(vault::DualPending::for_test(
+                p.clone(),
+                t0 + Duration::from_secs(60),
+            )),
+            3,
+        );
+        assert!(!sweep_expired_dual(&mut g, 3, t0));
+        assert!(g.dual_pending.is_some());
+        assert!(!vault::failures_path(&p).exists());
+    }
+
+    #[test]
+    fn sweep_ignores_newer_generation() {
+        let p = sidecar_path("sweep-newer");
+        let t0 = Instant::now();
+        let mut g = inner_with(Some(vault::DualPending::for_test(p.clone(), t0)), 4);
+        assert!(!sweep_expired_dual(&mut g, 3, t0 + Duration::from_secs(1)));
+        assert!(g.dual_pending.is_some());
+    }
 }
 
 #[cfg(test)]
