@@ -9,6 +9,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use zeroize::{Zeroize, Zeroizing};
@@ -35,6 +36,10 @@ pub enum VaultError {
     WrongEdition {
         vault: Edition,
     },
+    /// 雙人版金鑰登入前提未滿足：A、B 群組各至少一支金鑰。
+    DualNotReady,
+    /// 兩步驟登入第一步完成後，未在時限內完成第二步。
+    DualStepExpired,
 }
 
 impl std::fmt::Display for VaultError {
@@ -55,6 +60,13 @@ impl std::fmt::Display for VaultError {
                 f,
                 "此為雙群組控管版金庫，請改用雙群組控管版程式（portable-fido-vault-dual.exe）"
             ),
+            Self::DualNotReady => write!(
+                f,
+                "需 A、B 群組各至少一支金鑰才能以金鑰登入；目前請以主密碼登入"
+            ),
+            Self::DualStepExpired => {
+                write!(f, "第二位成員未在時限內完成驗證，請從第一步重新開始")
+            }
             Self::WrongEdition {
                 vault: Edition::Single,
             } => write!(
@@ -189,6 +201,9 @@ pub struct Settings {
 const DEFAULT_PASSWORD_HISTORY_LIMIT: u32 = 3;
 /// 雙群組控管版：第一步完成後等待第二群組的預設時限（秒，§4.3）。
 pub const DEFAULT_DUAL_STEP_TIMEOUT_SECS: u32 = 120;
+/// 等待時限允許範圍（秒）；header 明文鏡像一律 clamp 到此範圍（§4.3）。
+pub const MIN_DUAL_STEP_TIMEOUT_SECS: u32 = 30;
+pub const MAX_DUAL_STEP_TIMEOUT_SECS: u32 = 600;
 const MAX_KEY_LABEL_CHARS: usize = 64;
 
 fn default_password_history_limit() -> u32 {
@@ -294,6 +309,110 @@ pub fn check_header_edition(header: &Header, edition: Edition) -> Result<(), Vau
         }
     }
     Ok(())
+}
+
+/// 登入前可讀的等待時限：header 明文鏡像 clamp 到允許範圍；缺值用預設。
+pub fn effective_dual_step_timeout_secs(header: &Header) -> u32 {
+    header
+        .dual_step_timeout_secs
+        .map(|secs| secs.clamp(MIN_DUAL_STEP_TIMEOUT_SECS, MAX_DUAL_STEP_TIMEOUT_SECS))
+        .unwrap_or(DEFAULT_DUAL_STEP_TIMEOUT_SECS)
+}
+
+/// 綁定值：created_at + dual_slot 密文（不含機密）。
+fn dual_binding(header: &Header) -> Result<(String, String), VaultError> {
+    let slot = header
+        .dual_slot
+        .as_ref()
+        .ok_or_else(|| VaultError::Format("v2 金庫缺少 dual_slot".into()))?;
+    Ok((header.created_at.clone(), slot.ct.clone()))
+}
+
+/// 以金鑰 PRF 解開群組槽位（AAD 綁定群組 + credential_id）→ 該群組 share。
+fn unwrap_group_share(
+    slot: &KeySlot,
+    secret: &[u8; 32],
+) -> Result<Zeroizing<[u8; 32]>, VaultError> {
+    let group = slot
+        .group
+        .ok_or_else(|| VaultError::Format("v2 金庫的金鑰槽缺少群組".into()))?;
+    let cred = base64_decode(&slot.credential_id)
+        .map_err(|_| VaultError::Format("credential_id 解碼失敗".into()))?;
+    let nonce = slot_nonce(&slot.nonce)?;
+    let ct = base64_decode(&slot.ct).map_err(|_| VaultError::Format("key slot 解碼失敗".into()))?;
+    let k = Zeroizing::new(kek_from_prf_secret(secret));
+    let plain = Zeroizing::new(
+        aes_gcm_decrypt_aad(&k, &nonce, &ct, &dual_key_slot_aad(group, &cred))
+            .map_err(VaultError::Crypto)?,
+    );
+    if plain.len() != 32 {
+        return Err(VaultError::Crypto(CryptoError::DecryptFailed));
+    }
+    let mut share = Zeroizing::new([0u8; 32]);
+    share.copy_from_slice(&plain);
+    Ok(share)
+}
+
+fn decode_credential_ids(slots: &[&KeySlot]) -> Result<Vec<Vec<u8>>, VaultError> {
+    slots
+        .iter()
+        .map(|slot| {
+            base64_decode(&slot.credential_id)
+                .map_err(|_| VaultError::Format("credential_id 解碼失敗".into()))
+        })
+        .collect()
+}
+
+/// 兩步驟登入第一步完成後的暫存狀態（§4.3）。只存在 Rust 端記憶體、不可複製；
+/// 第二步以 by-value 取用（一次性），drop 時 share 清零。
+pub struct DualPending {
+    path: PathBuf,
+    first_group: KeyGroup,
+    first_label: String,
+    share: Zeroizing<[u8; 32]>,
+    deadline: Instant,
+    timeout_secs: u32,
+    /// 綁定第一步讀到的金庫（created_at + dual_slot 密文），第二步前檔案被換掉即拒絕。
+    binding: (String, String),
+}
+
+impl std::fmt::Debug for DualPending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DualPending")
+            .field("first_group", &self.first_group)
+            .field("first_label", &self.first_label)
+            .field("share", &"<redacted>")
+            .field("timeout_secs", &self.timeout_secs)
+            .finish()
+    }
+}
+
+impl DualPending {
+    pub fn first_group(&self) -> KeyGroup {
+        self.first_group
+    }
+
+    pub fn first_label(&self) -> &str {
+        &self.first_label
+    }
+
+    pub fn timeout_secs(&self) -> u32 {
+        self.timeout_secs
+    }
+
+    /// 剩餘時間（逾時後為 0）。
+    pub fn remaining(&self, now: Instant) -> Duration {
+        self.deadline.saturating_duration_since(now)
+    }
+
+    pub fn is_expired(&self, now: Instant) -> bool {
+        now > self.deadline
+    }
+
+    /// 使用者取消：記 sidecar（僅時間戳 + method），share 隨 drop 清零。
+    pub fn cancel(self) -> Result<(), VaultError> {
+        record_login_failure(&self.path, "fido2-dual-cancel")
+    }
 }
 
 /// header 已通過 `check_header_edition` 後，由版本號推得的版本。
@@ -501,6 +620,134 @@ impl Vault {
     /// 雙群組控管版：主密碼緊急登入（break-glass，§4.4）。
     pub fn open_password_dual(path: &Path, password: &str) -> Result<Self, VaultError> {
         Self::open_password_with_edition(path, password, Edition::Dual)
+    }
+
+    /// 雙人版金鑰登入第一步：broker 允許清單 = 全部 A+B credential；解出所選金鑰群組的 share 暫存。
+    pub fn dual_login_begin(
+        path: &Path,
+        pin: Option<&str>,
+        backend: &mut (dyn FidoBackend + 'static),
+        now: Instant,
+    ) -> Result<DualPending, VaultError> {
+        let (header, _payload) = Self::read_file(path, Edition::Dual)?;
+        let has_group = |group: KeyGroup| header.key_slots.iter().any(|s| s.group == Some(group));
+        if !(has_group(KeyGroup::A) && has_group(KeyGroup::B)) {
+            return Err(VaultError::DualNotReady);
+        }
+        let all: Vec<&KeySlot> = header.key_slots.iter().collect();
+        let credential_ids = decode_credential_ids(&all)?;
+        let binding = dual_binding(&header)?;
+        let timeout_secs = effective_dual_step_timeout_secs(&header);
+
+        let (selected_id, secret) = backend.get_prf_secret_for_any(&credential_ids, pin)?;
+        let secret = Zeroizing::new(secret);
+        let selected_b64 = base64_encode(&selected_id);
+        let slot = header
+            .key_slots
+            .iter()
+            .find(|slot| slot.credential_id == selected_b64)
+            .ok_or_else(|| {
+                VaultError::Fido(FidoError::Internal(
+                    "backend selected a credential not registered in this vault".into(),
+                ))
+            })?;
+        let first_group = slot
+            .group
+            .ok_or_else(|| VaultError::Format("v2 金庫的金鑰槽缺少群組".into()))?;
+        let share = match unwrap_group_share(slot, &secret) {
+            Ok(share) => share,
+            Err(_) => {
+                record_login_failure(path, &format!("fido2-dual-step1:{}", slot.label))?;
+                return Err(VaultError::Crypto(CryptoError::DecryptFailed));
+            }
+        };
+        Ok(DualPending {
+            path: path.to_path_buf(),
+            first_group,
+            first_label: slot.label.clone(),
+            share,
+            deadline: now + Duration::from_secs(u64::from(timeout_secs)),
+            timeout_secs,
+            binding,
+        })
+    }
+
+    /// 雙人版金鑰登入第二步：允許清單只含另一群組；兩份 share → HKDF → 解 dual_slot 得 KEK。
+    pub fn dual_login_complete(
+        pending: DualPending,
+        pin: Option<&str>,
+        backend: &mut (dyn FidoBackend + 'static),
+        now: Instant,
+    ) -> Result<Self, VaultError> {
+        // 逾時：不再提示第二支金鑰；pending（含 share）隨 drop 清零。
+        if pending.is_expired(now) {
+            record_login_failure(&pending.path, "fido2-dual-timeout")?;
+            return Err(VaultError::DualStepExpired);
+        }
+        let path = pending.path.clone();
+        let (header, payload) = Self::read_file(&path, Edition::Dual)?;
+        if dual_binding(&header)? != pending.binding {
+            return Err(VaultError::Format(
+                "金庫在兩步驟之間已變更，請從第一步重新開始".into(),
+            ));
+        }
+        let second_group = pending.first_group.other();
+        let second_slots: Vec<&KeySlot> = header
+            .key_slots
+            .iter()
+            .filter(|slot| slot.group == Some(second_group))
+            .collect();
+        if second_slots.is_empty() {
+            return Err(VaultError::DualNotReady);
+        }
+        // 允許清單只含另一群組 → 同群組金鑰無法完成第二步。
+        let credential_ids = decode_credential_ids(&second_slots)?;
+        let (selected_id, secret) = backend.get_prf_secret_for_any(&credential_ids, pin)?;
+        let secret = Zeroizing::new(secret);
+        let selected_b64 = base64_encode(&selected_id);
+        // 不信任後端：所選 credential 必須屬於另一群組。
+        let slot = second_slots
+            .iter()
+            .find(|slot| slot.credential_id == selected_b64)
+            .copied()
+            .ok_or_else(|| {
+                VaultError::Fido(FidoError::Internal(
+                    "backend selected a credential outside the required group".into(),
+                ))
+            })?;
+        let step2_failure = |label: &str| -> VaultError {
+            match record_login_failure(&path, &format!("fido2-dual-step2:{label}")) {
+                Ok(()) => VaultError::Crypto(CryptoError::DecryptFailed),
+                Err(e) => e,
+            }
+        };
+        let second_share = match unwrap_group_share(slot, &secret) {
+            Ok(share) => share,
+            Err(_) => return Err(step2_failure(&slot.label)),
+        };
+        let (share_a, share_b) = match pending.first_group {
+            KeyGroup::A => (&pending.share, &second_share),
+            KeyGroup::B => (&second_share, &pending.share),
+        };
+        let wrap = dual_wrap_key_from_shares(share_a, share_b);
+        let dual_slot = header
+            .dual_slot
+            .as_ref()
+            .ok_or_else(|| VaultError::Format("v2 金庫缺少 dual_slot".into()))?;
+        let nonce = slot_nonce(&dual_slot.nonce)?;
+        let ct = base64_decode(&dual_slot.ct)
+            .map_err(|_| VaultError::Format("dual slot 解碼失敗".into()))?;
+        let kek_bytes = match aes_gcm_decrypt_aad(&wrap, &nonce, &ct, DUAL_SLOT_AAD) {
+            Ok(bytes) if bytes.len() == 32 => Zeroizing::new(bytes),
+            _ => return Err(step2_failure(&slot.label)),
+        };
+        let mut kek = Zeroizing::new([0u8; 32]);
+        kek.copy_from_slice(&kek_bytes);
+        let method = format!(
+            "fido2-dual:{:?}:{}+{:?}:{}",
+            pending.first_group, pending.first_label, second_group, slot.label
+        );
+        Self::unlock(&path, header, payload, kek, &method)
     }
 
     /// 依執行檔版本以主密碼登入。
@@ -2123,6 +2370,356 @@ mod tests {
             again.err()
         );
         assert_eq!(v.header.key_slots.len(), 2);
+    }
+
+    // ── D7：兩步驟登入 ──
+
+    /// 模擬「使用者在 broker 中刷了某一支金鑰」：只有該 credential 在允許清單內才成功
+    /// （Windows broker 只接受 allow-list 內的 credential）；`rogue` 模擬不遵守允許清單的後端。
+    struct TapBackend {
+        tap: Vec<u8>,
+        rogue: bool,
+        offered: Vec<Vec<Vec<u8>>>,
+    }
+
+    impl TapBackend {
+        fn tap(cred: &[u8]) -> Self {
+            Self {
+                tap: cred.to_vec(),
+                rogue: false,
+                offered: Vec::new(),
+            }
+        }
+    }
+
+    impl FidoBackend for TapBackend {
+        fn detect(&mut self) -> Result<crate::fido2::DetectedKey, FidoError> {
+            Err(FidoError::NoDevice)
+        }
+        fn register_credential(
+            &mut self,
+            _: &crate::fido2::DetectedKey,
+            _: Option<&str>,
+        ) -> Result<crate::fido2::RegisteredCredential, FidoError> {
+            Err(FidoError::NoDevice)
+        }
+        fn get_prf_secret(&mut self, id: &[u8], _: Option<&str>) -> Result<[u8; 32], FidoError> {
+            Ok(MockBackend::prf_for_credential(id))
+        }
+        fn get_prf_secret_for_any(
+            &mut self,
+            ids: &[Vec<u8>],
+            _: Option<&str>,
+        ) -> Result<(Vec<u8>, [u8; 32]), FidoError> {
+            self.offered.push(ids.to_vec());
+            if self.rogue || ids.contains(&self.tap) {
+                Ok((self.tap.clone(), MockBackend::prf_for_credential(&self.tap)))
+            } else {
+                Err(FidoError::Internal(
+                    "simulated NotAllowed: key not in allow list".into(),
+                ))
+            }
+        }
+    }
+
+    /// 建立雙人版金庫並依序註冊金鑰（每支一個新 mock = 不同實體金鑰）；回傳各 credential。
+    fn dual_vault_with(tag: &str, keys: &[(&str, KeyGroup)]) -> (PathBuf, Vec<Vec<u8>>) {
+        let p = fresh_path(tag);
+        let mut v = Vault::create_dual(&p, "Pw-12345").unwrap();
+        let mut creds = Vec::new();
+        for (label, group) in keys {
+            let mut b = MockBackend::new();
+            let reg = v
+                .register_key_in_group(&mut b, None, label, *group)
+                .unwrap();
+            creds.push(reg.credential_id);
+        }
+        drop(v.lock());
+        (p, creds)
+    }
+
+    fn two_step(p: &Path, first: &[u8], second: &[u8]) -> Result<Vault, VaultError> {
+        let t0 = Instant::now();
+        let mut b1 = TapBackend::tap(first);
+        let pending = Vault::dual_login_begin(p, None, &mut b1, t0)?;
+        let mut b2 = TapBackend::tap(second);
+        Vault::dual_login_complete(pending, None, &mut b2, t0 + Duration::from_secs(5))
+    }
+
+    #[test]
+    fn dual_login_a_then_b_unlocks_and_audits_order() {
+        let (p, c) = dual_vault_with("d7-ab", &[("王小明", KeyGroup::A), ("李大華", KeyGroup::B)]);
+        let r = two_step(&p, &c[0], &c[1]);
+        assert!(r.is_ok(), "A→B failed: {:?}", r.err());
+        let v = r.unwrap();
+        let last = v.audit().last().unwrap();
+        assert_eq!(last.event, "login_success");
+        assert_eq!(last.method, "fido2-dual:A:王小明+B:李大華");
+    }
+
+    #[test]
+    fn dual_login_b_then_a_unlocks_and_audits_order() {
+        let (p, c) = dual_vault_with("d7-ba", &[("a1", KeyGroup::A), ("b1", KeyGroup::B)]);
+        let r = two_step(&p, &c[1], &c[0]);
+        assert!(r.is_ok(), "B→A failed: {:?}", r.err());
+        assert_eq!(
+            r.unwrap().audit().last().unwrap().method,
+            "fido2-dual:B:b1+A:a1"
+        );
+    }
+
+    #[test]
+    fn dual_login_begin_reports_first_group_and_timeout() {
+        let (p, c) = dual_vault_with("d7-begin-info", &[("a1", KeyGroup::A), ("b1", KeyGroup::B)]);
+        let t0 = Instant::now();
+        let mut b = TapBackend::tap(&c[1]);
+        let pending = Vault::dual_login_begin(&p, None, &mut b, t0);
+        assert!(pending.is_ok(), "begin failed: {:?}", pending.err());
+        let pending = pending.unwrap();
+        assert_eq!(pending.first_group(), KeyGroup::B);
+        assert_eq!(pending.first_label(), "b1");
+        assert_eq!(pending.timeout_secs(), DEFAULT_DUAL_STEP_TIMEOUT_SECS);
+        assert_eq!(pending.remaining(t0), Duration::from_secs(120));
+        // 第一步允許清單 = 全部 A+B。
+        assert_eq!(b.offered, vec![c.clone()]);
+        let shown = format!("{pending:?}");
+        assert!(shown.contains("<redacted>"), "{shown}");
+    }
+
+    #[test]
+    fn dual_login_second_step_offers_only_other_group() {
+        let (p, c) = dual_vault_with(
+            "d7-other-group",
+            &[
+                ("a1", KeyGroup::A),
+                ("a2", KeyGroup::A),
+                ("b1", KeyGroup::B),
+            ],
+        );
+        let t0 = Instant::now();
+        let mut b1 = TapBackend::tap(&c[0]);
+        let pending = Vault::dual_login_begin(&p, None, &mut b1, t0);
+        assert!(pending.is_ok(), "begin failed: {:?}", pending.err());
+        // 第二步刷同群組的 a2：不在允許清單 → 失敗，不可解鎖。
+        let mut b2 = TapBackend::tap(&c[1]);
+        let r = Vault::dual_login_complete(pending.unwrap(), None, &mut b2, t0);
+        assert!(r.is_err(), "same-group second key must not unlock");
+        assert_eq!(
+            b2.offered,
+            vec![vec![c[2].clone()]],
+            "step 2 allow list must be group B only"
+        );
+    }
+
+    #[test]
+    fn dual_login_rejects_rogue_backend_returning_same_group() {
+        let (p, c) = dual_vault_with(
+            "d7-rogue",
+            &[
+                ("a1", KeyGroup::A),
+                ("a2", KeyGroup::A),
+                ("b1", KeyGroup::B),
+            ],
+        );
+        let t0 = Instant::now();
+        let mut b1 = TapBackend::tap(&c[0]);
+        let pending = Vault::dual_login_begin(&p, None, &mut b1, t0);
+        assert!(pending.is_ok(), "begin failed: {:?}", pending.err());
+        let mut rogue = TapBackend::tap(&c[1]);
+        rogue.rogue = true; // 無視允許清單，回傳 A 群組的 a2
+        let before = fs::read(&p).unwrap();
+        let r = Vault::dual_login_complete(pending.unwrap(), None, &mut rogue, t0);
+        assert!(
+            matches!(&r, Err(VaultError::Fido(FidoError::Internal(_)))),
+            "credential outside the required group must be refused, got {:?}",
+            r.as_ref().map(|_| ())
+        );
+        assert_eq!(fs::read(&p).unwrap(), before);
+    }
+
+    #[test]
+    fn dual_login_requires_both_groups() {
+        let (p, c) = dual_vault_with("d7-not-ready", &[("a1", KeyGroup::A)]);
+        let mut b = TapBackend::tap(&c[0]);
+        let r = Vault::dual_login_begin(&p, None, &mut b, Instant::now());
+        assert!(
+            matches!(r, Err(VaultError::DualNotReady)),
+            "got {:?}",
+            r.as_ref().map(|_| ())
+        );
+        assert!(b.offered.is_empty(), "must not prompt for a key");
+        assert!(!failures_path(&p).exists());
+    }
+
+    #[test]
+    fn dual_login_expired_second_step_is_refused_and_recorded() {
+        let (p, c) = dual_vault_with("d7-expired", &[("a1", KeyGroup::A), ("b1", KeyGroup::B)]);
+        let t0 = Instant::now();
+        let mut b1 = TapBackend::tap(&c[0]);
+        let pending = Vault::dual_login_begin(&p, None, &mut b1, t0);
+        assert!(pending.is_ok(), "begin failed: {:?}", pending.err());
+        let pending = pending.unwrap();
+        let late = t0 + Duration::from_secs(121);
+        assert!(pending.is_expired(late));
+        assert_eq!(pending.remaining(late), Duration::ZERO);
+        let mut b2 = TapBackend::tap(&c[1]);
+        let r = Vault::dual_login_complete(pending, None, &mut b2, late);
+        assert!(
+            matches!(r, Err(VaultError::DualStepExpired)),
+            "got {:?}",
+            r.as_ref().map(|_| ())
+        );
+        assert!(
+            b2.offered.is_empty(),
+            "expired pending must not prompt for the second key"
+        );
+        let stamps = read_failure_sidecar(&p);
+        assert_eq!(
+            stamps.last().map(|s| s.method.as_str()),
+            Some("fido2-dual-timeout")
+        );
+    }
+
+    #[test]
+    fn dual_login_within_deadline_succeeds() {
+        let (p, c) = dual_vault_with("d7-deadline", &[("a1", KeyGroup::A), ("b1", KeyGroup::B)]);
+        let t0 = Instant::now();
+        let mut b1 = TapBackend::tap(&c[0]);
+        let pending = Vault::dual_login_begin(&p, None, &mut b1, t0);
+        assert!(pending.is_ok(), "begin failed: {:?}", pending.err());
+        let mut b2 = TapBackend::tap(&c[1]);
+        let r = Vault::dual_login_complete(
+            pending.unwrap(),
+            None,
+            &mut b2,
+            t0 + Duration::from_secs(120),
+        );
+        assert!(
+            r.is_ok(),
+            "exactly at the deadline must still succeed: {:?}",
+            r.err()
+        );
+    }
+
+    #[test]
+    fn dual_login_cancel_is_recorded_without_touching_vault() {
+        let (p, c) = dual_vault_with("d7-cancel", &[("a1", KeyGroup::A), ("b1", KeyGroup::B)]);
+        let before = fs::read(&p).unwrap();
+        let mut b1 = TapBackend::tap(&c[0]);
+        let pending = Vault::dual_login_begin(&p, None, &mut b1, Instant::now());
+        assert!(pending.is_ok(), "begin failed: {:?}", pending.err());
+        pending.unwrap().cancel().unwrap();
+        assert_eq!(fs::read(&p).unwrap(), before);
+        let stamps = read_failure_sidecar(&p);
+        assert_eq!(
+            stamps.last().map(|s| s.method.as_str()),
+            Some("fido2-dual-cancel")
+        );
+    }
+
+    #[test]
+    fn dual_login_tampered_first_slot_group_fails_step1() {
+        let (p, c) = dual_vault_with(
+            "d7-tamper1",
+            &[
+                ("a1", KeyGroup::A),
+                ("a2", KeyGroup::A),
+                ("b1", KeyGroup::B),
+            ],
+        );
+        rewrite_header(&p, |h| h["key_slots"][1]["group"] = serde_json::json!("B"));
+        let mut b = TapBackend::tap(&c[1]);
+        let r = Vault::dual_login_begin(&p, None, &mut b, Instant::now());
+        assert!(
+            matches!(r, Err(VaultError::Crypto(CryptoError::DecryptFailed))),
+            "got {:?}",
+            r.as_ref().map(|_| ())
+        );
+        let stamps = read_failure_sidecar(&p);
+        assert_eq!(
+            stamps.last().map(|s| s.method.as_str()),
+            Some("fido2-dual-step1:a2")
+        );
+    }
+
+    #[test]
+    fn dual_login_tampered_second_slot_group_fails_step2() {
+        let (p, c) = dual_vault_with(
+            "d7-tamper2",
+            &[
+                ("a1", KeyGroup::A),
+                ("b1", KeyGroup::B),
+                ("b2", KeyGroup::B),
+            ],
+        );
+        rewrite_header(&p, |h| h["key_slots"][2]["group"] = serde_json::json!("A"));
+        let t0 = Instant::now();
+        let mut b1 = TapBackend::tap(&c[1]); // b1（B）
+        let pending = Vault::dual_login_begin(&p, None, &mut b1, t0);
+        assert!(pending.is_ok(), "begin failed: {:?}", pending.err());
+        let before = fs::read(&p).unwrap();
+        let mut b2 = TapBackend::tap(&c[2]); // b2 被改標成 A，出現在 A 允許清單
+        let r = Vault::dual_login_complete(pending.unwrap(), None, &mut b2, t0);
+        assert!(
+            matches!(r, Err(VaultError::Crypto(CryptoError::DecryptFailed))),
+            "got {:?}",
+            r.as_ref().map(|_| ())
+        );
+        assert_eq!(fs::read(&p).unwrap(), before);
+        let stamps = read_failure_sidecar(&p);
+        assert_eq!(
+            stamps.last().map(|s| s.method.as_str()),
+            Some("fido2-dual-step2:b2")
+        );
+    }
+
+    #[test]
+    fn dual_login_refuses_when_vault_replaced_between_steps() {
+        let (p, c) = dual_vault_with("d7-replaced", &[("a1", KeyGroup::A), ("b1", KeyGroup::B)]);
+        let t0 = Instant::now();
+        let mut b1 = TapBackend::tap(&c[0]);
+        let pending = Vault::dual_login_begin(&p, None, &mut b1, t0);
+        assert!(pending.is_ok(), "begin failed: {:?}", pending.err());
+        // 兩步之間檔案被換成另一個金庫（不同 dual_slot）。
+        let (other, _) = dual_vault_with(
+            "d7-replaced-other",
+            &[("a1", KeyGroup::A), ("b1", KeyGroup::B)],
+        );
+        fs::copy(&other, &p).unwrap();
+        let mut b2 = TapBackend::tap(&c[1]);
+        let r = Vault::dual_login_complete(pending.unwrap(), None, &mut b2, t0);
+        assert!(
+            matches!(&r, Err(VaultError::Format(m)) if m.contains("已變更")),
+            "got {:?}",
+            r.as_ref().map(|_| ())
+        );
+        assert!(b2.offered.is_empty());
+    }
+
+    #[test]
+    fn dual_login_rejects_single_edition_file() {
+        let p = fresh_path("d7-v1");
+        drop(Vault::create(&p, "Pw-12345").unwrap());
+        let mut b = TapBackend::tap(&[1u8; 32]);
+        assert!(matches!(
+            Vault::dual_login_begin(&p, None, &mut b, Instant::now()),
+            Err(VaultError::WrongEdition {
+                vault: Edition::Single
+            })
+        ));
+    }
+
+    #[test]
+    fn dual_step_timeout_mirror_is_clamped() {
+        let mut h = valid_v2_header();
+        h.dual_step_timeout_secs = None;
+        assert_eq!(effective_dual_step_timeout_secs(&h), 120);
+        h.dual_step_timeout_secs = Some(5);
+        assert_eq!(effective_dual_step_timeout_secs(&h), 30);
+        h.dual_step_timeout_secs = Some(99_999);
+        assert_eq!(effective_dual_step_timeout_secs(&h), 600);
+        h.dual_step_timeout_secs = Some(90);
+        assert_eq!(effective_dual_step_timeout_secs(&h), 90);
     }
 
     #[test]

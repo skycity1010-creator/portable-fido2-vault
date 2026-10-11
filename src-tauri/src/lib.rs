@@ -260,6 +260,8 @@ struct AppInner {
     vault: Option<vault::Vault>,
     backend: Box<dyn fido2::FidoBackend>,
     pending_csv_import: Option<PendingCsvImport>,
+    /// 雙人版兩步驟登入：第一步完成後的暫存（share 只在 Rust 端，drop 時清零）。
+    dual_pending: Option<vault::DualPending>,
 }
 
 fn entries_fingerprint(entries: &[vault::Entry]) -> Result<[u8; 32]> {
@@ -281,6 +283,7 @@ impl AppInner {
             vault: None,
             backend: make_backend(window_handle)?,
             pending_csv_import: None,
+            dual_pending: None,
         })
     }
 }
@@ -446,6 +449,7 @@ fn create_vault(state: tauri::State<VaultState>, password: String) -> Result<()>
     let v = vault::Vault::create_for(&path, &password, edition::current())
         .map_err(|e| e.to_string())?;
     state.with_lock(|g| {
+        g.dual_pending = None;
         g.vault = Some(v);
         Ok(())
     })?;
@@ -460,6 +464,8 @@ fn login_password(state: tauri::State<VaultState>, password: String) -> Result<V
         .map_err(|e| e.to_string())?;
     let entries = v.entries().to_vec();
     state.with_lock(|g| {
+        // 改用主密碼登入：放棄進行中的兩步驟登入（share 清零）。
+        g.dual_pending = None;
         g.vault = Some(v);
         Ok(())
     })?;
@@ -511,11 +517,104 @@ fn login_any_key(
     Ok(entries)
 }
 
+/// 雙人版兩步驟登入第一步的回應（不含任何機密）。
+#[derive(serde::Serialize)]
+struct DualBeginInfo {
+    first_group: crypto::KeyGroup,
+    first_label: String,
+    second_group: crypto::KeyGroup,
+    timeout_secs: u32,
+    remaining_ms: u64,
+}
+
+fn require_dual_edition() -> Result<()> {
+    if edition::current() == edition::Edition::Dual {
+        Ok(())
+    } else {
+        Err("此功能僅限雙群組控管版".into())
+    }
+}
+
+/// 雙人版金鑰登入第一步：任一群組的金鑰。成功後暫存該群組 share 並開始倒數。
+#[tauri::command]
+fn login_dual_begin(
+    window: tauri::WebviewWindow,
+    state: tauri::State<VaultState>,
+    pin: Option<String>,
+) -> Result<DualBeginInfo> {
+    require_dual_edition()?;
+    let require_foreground = state.with_lock(|g| Ok(g.backend.uses_brokered_key_selection()))?;
+    let owner_hwnd = raise_key_operation_window(&window, require_foreground)?;
+    let path = path_from_state_or_default();
+    state.with_lock(|g| {
+        // 新的第一步一律先丟棄舊的暫存（清零），避免殘留 share。
+        g.dual_pending = None;
+        g.backend.set_webauthn_parent_hwnd(owner_hwnd);
+        let now = std::time::Instant::now();
+        let pending =
+            vault::Vault::dual_login_begin(&path, pin.as_deref(), g.backend.as_mut(), now)
+                .map_err(|e| e.to_string())?;
+        let info = DualBeginInfo {
+            first_group: pending.first_group(),
+            first_label: pending.first_label().to_owned(),
+            second_group: pending.first_group().other(),
+            timeout_secs: pending.timeout_secs(),
+            remaining_ms: pending.remaining(now).as_millis() as u64,
+        };
+        g.dual_pending = Some(pending);
+        Ok(info)
+    })
+}
+
+/// 雙人版金鑰登入第二步：只接受另一群組的金鑰。無論成功或失敗，暫存都會被取走（一次性）。
+#[tauri::command]
+fn login_dual_complete(
+    window: tauri::WebviewWindow,
+    state: tauri::State<VaultState>,
+    pin: Option<String>,
+) -> Result<Vec<vault::Entry>> {
+    require_dual_edition()?;
+    let require_foreground = state.with_lock(|g| Ok(g.backend.uses_brokered_key_selection()))?;
+    let owner_hwnd = raise_key_operation_window(&window, require_foreground)?;
+    let v = state.with_lock(|g| {
+        let pending = g
+            .dual_pending
+            .take()
+            .ok_or_else(|| "沒有進行中的第一步驗證，請從第一步重新開始".to_string())?;
+        g.backend.set_webauthn_parent_hwnd(owner_hwnd);
+        vault::Vault::dual_login_complete(
+            pending,
+            pin.as_deref(),
+            g.backend.as_mut(),
+            std::time::Instant::now(),
+        )
+        .map_err(|e| e.to_string())
+    })?;
+    let entries = v.entries().to_vec();
+    state.with_lock(|g| {
+        g.vault = Some(v);
+        Ok(())
+    })?;
+    Ok(entries)
+}
+
+/// 雙人版：取消進行中的兩步驟登入（記 sidecar，share 清零）。沒有暫存時為 no-op。
+#[tauri::command]
+fn login_dual_cancel(state: tauri::State<VaultState>) -> Result<()> {
+    require_dual_edition()?;
+    let pending = state.with_lock(|g| Ok(g.dual_pending.take()))?;
+    if let Some(pending) = pending {
+        pending.cancel().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 /// 上鎖（手動或閒置）。回傳登入畫面資訊。
 #[tauri::command]
 fn lock(state: tauri::State<VaultState>, reason: Option<String>) -> Result<LoginScreenInfo> {
     let (header, brokered_key_login) = state.with_lock(|g| {
         let brokered_key_login = g.backend.uses_brokered_key_selection();
+        g.dual_pending = None;
         match g.vault.take() {
             Some(v) => {
                 g.pending_csv_import = None;
@@ -847,6 +946,9 @@ pub fn run() {
             login_password,
             login_key,
             login_any_key,
+            login_dual_begin,
+            login_dual_complete,
+            login_dual_cancel,
             lock,
             list_entries,
             preview_csv_import,

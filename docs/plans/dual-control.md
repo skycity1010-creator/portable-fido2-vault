@@ -224,7 +224,8 @@ KEK（隨機 256-bit，加解密 payload；與 v1 相同）
 - [x] D4 建立 v2 金庫、主密碼 break-glass、payload 形狀與 dual_slot 一致性檢查（見 §11）
 - [x] D5 雙群組註冊：槽位只包該群組 share、AAD 綁定群組與 credential（見 §11）
 - [x] D6 excludeCredentials：同一支實體金鑰只能註冊一筆（mock / raw CTAP / Windows WebAuthn，見 §11）
-- [ ] D7–D13
+- [x] D7 兩步驟登入狀態機（begin / complete / cancel / 逾時，見 §11）
+- [ ] D8–D13
 
 ## 11. 驗證紀錄
 
@@ -342,3 +343,31 @@ KEK（隨機 256-bit，加解密 payload；與 v1 相同）
   - raw CTAP 的排除清單過長時，authenticator-rs preflight 會分批送出；仍無法送出就 fail closed。`vault_cli` 本期不支援 v2（§5），所以雙人版產品不會走到這條路徑。
 - 過程中的失敗（沒有改 production code，log 都保留）：第一版 contract 測試用字面量寫了 `fn make_credential_with_diagnostics(` 和 `fn get_hmac_secret(`，違反既有 source-wiring oracle 的「標記在檔案中唯一」規則，造成 10 個既有測試失敗（`LOCATOR:section-start`），log 為 `d6r1/02/03-FAIL-contract-test-duplicates-locator-*.log`。改成以 `format!` 組出定位字串，既有 oracle 一行都沒改。
 - Rust MSVC lib：單人版 262/262、雙人版 262/262（253 + 9），無 warning；跑測試前後原始碼 SHA-256 不變；rustfmt：`windows_webauthn.rs` 維持 baseline 的 7 處、沒有新增，其餘檔案通過。
+
+### D7（2026-10-11）
+
+- **vault 層**（時間以參數 `now: Instant` 注入，方便測試逾時）：
+  - `Vault::dual_login_begin(path, pin, backend, now) -> DualPending`：
+    - 讀檔（v2 版本互斥），A、B 群組必須各至少一支，否則回 `VaultError::DualNotReady`，不提示金鑰。
+    - broker 允許清單 = 全部 A+B credential；依所選 credential 找到槽位，用 AAD(群組, credential) 解出該群組 share。
+    - 解包失敗時記 sidecar `fido2-dual-step1:<label>`，回 `DecryptFailed`。
+  - `DualPending`：只存在 Rust 端，不可複製，Debug 遮蔽 share，share 為 `Zeroizing`，drop 時清零。內含第一群組/名稱、截止時間、時限，以及綁定值（`created_at` + `dual_slot` 密文）。
+  - `Vault::dual_login_complete(pending, pin, backend, now)`：以 by-value 取用 `pending`（一次性）。
+    - 逾時（`now > deadline`）→ 記 `fido2-dual-timeout`，回 `DualStepExpired`，**不提示第二支金鑰**。
+    - 檔案綁定值不同 → 回「金庫在兩步驟之間已變更」，不提示金鑰。
+    - 允許清單**只含另一群組**；**不信任後端**，所選 credential 必須屬於另一群組，否則拒絕。
+    - 解包失敗，或 `HKDF(share_A‖share_B)` 解不開 `dual_slot` → 記 `fido2-dual-step2:<label>`，回 `DecryptFailed`，不寫檔。
+    - 成功時走共用的 `unlock`（含 payload 形狀與 dual_slot 一致性檢查），audit method 為 `fido2-dual:<第一群組>:<名稱>+<第二群組>:<名稱>`，依實際順序記錄。
+  - `DualPending::cancel` → 記 `fido2-dual-cancel`，金庫檔不變。
+  - `effective_dual_step_timeout_secs(header)`：header 明文鏡像 clamp 到 30–600 秒，缺值時為 120。設定變更與竄改修復留給 D9。
+- **app 層（`lib.rs`）**：
+  - `AppInner.dual_pending`。
+  - IPC `login_dual_begin(pin)` 回 `{first_group, first_label, second_group, timeout_secs, remaining_ms}`，不含機密；每次都會先丟棄舊的暫存。
+  - `login_dual_complete(pin)`：不論成敗都會取走暫存。
+  - `login_dual_cancel`。
+  - 三個 IPC 只限雙人版執行檔。`create_vault`、`login_password`、`lock` 都會清掉暫存；視窗關閉時 state drop 也會清零。
+- TDD：
+  - 第一次執行因 cargo 測試過濾參數用錯，沒有跑任何測試，log 保留為 `00-NOT_EXECUTED-bad-filter-args.log`。
+  - 正式 RED 為 14 個 assertion 失敗 → GREEN，新增 14 個測試。
+  - 涵蓋：A→B、B→A、第一步資訊與允許清單、第二步只提供另一群組、惡意後端回同群組被拒、兩群組不齊、逾時、恰好在截止時間仍可完成、取消、第一步/第二步群組標記被竄改、兩步之間金庫被替換、單人版檔案、時限 clamp。
+- Rust MSVC lib：單人版 276/276、雙人版 276/276，無 warning；跑測試前後原始碼 SHA-256 不變；rustfmt 通過。
