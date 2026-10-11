@@ -2041,11 +2041,12 @@ impl WindowsWebAuthnBackend {
     fn make_credential(
         &mut self,
         detected: &DetectedKey,
+        exclude: &[Vec<u8>],
     ) -> Result<RegisteredCredential, FidoError> {
         self.continuation = None;
         let result = diagnose(
             Operation::MakeCredential,
-            |diagnostic| self.make_credential_with_diagnostics(detected, diagnostic),
+            |diagnostic| self.make_credential_with_diagnostics(detected, exclude, diagnostic),
             |record| log::info!("[WebAuthN-operation] {}", record),
         );
         complete_registration(&mut self.continuation, result)
@@ -2054,9 +2055,11 @@ impl WindowsWebAuthnBackend {
     fn make_credential_with_diagnostics(
         &self,
         detected: &DetectedKey,
+        exclude: &[Vec<u8>],
         diagnostic: &mut OperationDiagnostics,
     ) -> CreationResult {
         diagnostic.failure_stage = Some(FailureStage::Preflight);
+        validate_exclude_credential_ids(exclude)?;
         let challenge = random_bytes(32);
         let mut client_json = client_data_json(ClientDataOperation::Create, &challenge);
         let client_data = make_client_data(&mut client_json)?;
@@ -2101,9 +2104,20 @@ impl WindowsWebAuthnBackend {
             cExtensions: 1,
             pExtensions: &mut hmac_secret_extension,
         };
+        // excludeCredentials（v1 CredentialList 欄位）：`exclude` 與 entries 須存活到 API 返回。
+        let mut exclude_entries = exclude_credential_entries(exclude);
+        let exclude_list = WEBAUTHN_CREDENTIALS {
+            cCredentials: exclude_entries.len() as u32,
+            pCredentials: if exclude_entries.is_empty() {
+                ptr::null_mut()
+            } else {
+                exclude_entries.as_mut_ptr()
+            },
+        };
         let options = WEBAUTHN_AUTHENTICATOR_MAKE_CREDENTIAL_OPTIONS {
             dwVersion: WEBAUTHN_AUTHENTICATOR_MAKE_CREDENTIAL_OPTIONS_VERSION_5,
             dwTimeoutMilliseconds: OP_TIMEOUT_MS,
+            CredentialList: exclude_list,
             Extensions: extensions,
             dwAuthenticatorAttachment: WEBAUTHN_AUTHENTICATOR_ATTACHMENT_CROSS_PLATFORM,
             dwUserVerificationRequirement: WEBAUTHN_USER_VERIFICATION_REQUIREMENT_PREFERRED,
@@ -2147,7 +2161,7 @@ impl WindowsWebAuthnBackend {
             if !attestation.is_null() {
                 unsafe { WebAuthNFreeCredentialAttestation(attestation) };
             }
-            return Err(api_error("makeCredential", hr));
+            return Err(make_credential_error(hr));
         }
         diagnostic.failure_stage = Some(FailureStage::Response);
         if attestation.is_null() {
@@ -2380,7 +2394,16 @@ impl FidoBackend for WindowsWebAuthnBackend {
         detected: &DetectedKey,
         _pin: Option<&str>,
     ) -> Result<RegisteredCredential, FidoError> {
-        self.make_credential(detected)
+        self.make_credential(detected, &[])
+    }
+
+    fn register_credential_excluding(
+        &mut self,
+        detected: &DetectedKey,
+        _pin: Option<&str>,
+        exclude: &[Vec<u8>],
+    ) -> Result<RegisteredCredential, FidoError> {
+        self.make_credential(detected, exclude)
     }
 
     fn get_prf_secret(
@@ -2549,6 +2572,42 @@ fn hmac_secret_enabled(extensions: &WEBAUTHN_EXTENSIONS) -> bool {
     false
 }
 
+/// makeCredential 失敗 HRESULT → FidoError。`NTE_EXISTS`（WebAuthNGetErrorName = "InvalidStateError"）
+/// 為 excludeCredentials 命中：此金鑰已持有本金庫的 credential。
+fn make_credential_error(hr: windows_sys::core::HRESULT) -> FidoError {
+    if hr == windows_sys::Win32::Foundation::NTE_EXISTS {
+        return FidoError::CredentialExcluded;
+    }
+    api_error("makeCredential", hr)
+}
+
+/// excludeCredentials 清單（指標借用 `credential_ids`，呼叫端須讓其存活至 API 返回）。
+fn exclude_credential_entries(credential_ids: &[Vec<u8>]) -> Vec<WEBAUTHN_CREDENTIAL> {
+    credential_ids
+        .iter()
+        .map(|credential_id| WEBAUTHN_CREDENTIAL {
+            dwVersion: WEBAUTHN_CREDENTIAL_CURRENT_VERSION,
+            cbId: credential_id.len() as u32,
+            pbId: credential_id.as_ptr() as *mut u8,
+            pwszCredentialType: WEBAUTHN_CREDENTIAL_TYPE_PUBLIC_KEY,
+        })
+        .collect()
+}
+
+/// 排除清單驗證：可為空；每筆不可空白或超過 API buffer 上限。
+fn validate_exclude_credential_ids(credential_ids: &[Vec<u8>]) -> Result<(), FidoError> {
+    if credential_ids.len() > u32::MAX as usize
+        || credential_ids
+            .iter()
+            .any(|id| id.is_empty() || id.len() > MAX_API_BUFFER || id.len() > u32::MAX as usize)
+    {
+        return Err(FidoError::Internal(
+            "credential exclude-list contains an invalid ID or count".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn api_error(operation: &str, hr: windows_sys::core::HRESULT) -> FidoError {
     let name = unsafe { api_wide_string(WebAuthNGetErrorName(hr)) }
         .unwrap_or_else(|| "unknown WebAuthn error".into());
@@ -2561,6 +2620,40 @@ fn api_error(operation: &str, hr: windows_sys::core::HRESULT) -> FidoError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── D6：excludeCredentials ──
+
+    #[test]
+    fn make_credential_nte_exists_is_credential_excluded() {
+        assert!(matches!(
+            make_credential_error(windows_sys::Win32::Foundation::NTE_EXISTS),
+            FidoError::CredentialExcluded
+        ));
+        let other = make_credential_error(0x8009_0030_u32 as i32);
+        assert!(
+            matches!(&other, FidoError::Internal(m) if m.contains("0x80090030")),
+            "{other:?}"
+        );
+    }
+
+    #[test]
+    fn exclude_entries_reference_each_credential_id() {
+        let ids = vec![vec![1u8, 2, 3], vec![9u8; 64]];
+        let entries = exclude_credential_entries(&ids);
+        assert_eq!(entries.len(), 2);
+        for (entry, id) in entries.iter().zip(ids.iter()) {
+            assert_eq!(entry.dwVersion, WEBAUTHN_CREDENTIAL_CURRENT_VERSION);
+            assert_eq!(entry.cbId as usize, id.len());
+            assert_eq!(entry.pbId as *const u8, id.as_ptr());
+            // `w!` 常數每次使用位址可能不同 → 比較字串內容而非指標。
+            assert_eq!(
+                unsafe { api_wide_string(entry.pwszCredentialType) }.as_deref(),
+                Some("public-key")
+            );
+        }
+        assert!(exclude_credential_entries(&[]).is_empty());
+    }
+
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
     use serde_json::Value;

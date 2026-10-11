@@ -1095,6 +1095,22 @@ impl Vault {
             (Edition::Dual, Some(group)) => Some(self.group_share(group)?),
             (Edition::Single, None) => None,
         };
+        // 雙人版：Q3「同一支實體金鑰只能註冊一筆」→ 以金庫內全部既有 credential（A+B）作
+        // excludeCredentials，由 authenticator 拒絕重複。在呼叫 authenticator 之前先解碼完成。
+        let exclude = if group.is_some() {
+            Some(
+                self.header
+                    .key_slots
+                    .iter()
+                    .map(|slot| {
+                        base64_decode(&slot.credential_id)
+                            .map_err(|_| VaultError::Format("credential_id 解碼失敗".into()))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+        } else {
+            None
+        };
         // 裁決②：不支援 hmac-secret/PRF 的金鑰拒絕註冊。
         // 順序：先 detect()（real 後端需 getInfo 才能知 PRF 能力；mock 的 detect 為無害循環），
         // 再 prf_supported()（依 detect 快取的資訊判定）。
@@ -1102,7 +1118,11 @@ impl Vault {
         if !backend.prf_supported() {
             return Err(VaultError::Fido(FidoError::PrfNotSupported));
         }
-        let mut reg = backend.register_credential(&detected, pin)?;
+        // 單人版維持原本的註冊呼叫（不帶排除清單）。
+        let mut reg = match exclude.as_deref() {
+            Some(exclude) => backend.register_credential_excluding(&detected, pin, exclude)?,
+            None => backend.register_credential(&detected, pin)?,
+        };
         let secret = backend.get_prf_secret(&reg.credential_id, pin)?;
         let k = kek_from_prf_secret(&secret);
         let nonce = random_nonce();
@@ -1960,6 +1980,124 @@ mod tests {
         assert!(v2.register_key_for(&mut backend, None, "d2", None).is_err());
         assert_eq!(backend.detects, before);
         assert_eq!(v2.header.key_slots.len(), 1);
+    }
+
+    // ── D6：同一支實體金鑰只能註冊一筆 ──
+
+    /// 記錄 vault 呼叫哪一個註冊方法與排除清單。
+    struct RecordingBackend {
+        inner: MockBackend,
+        calls: Vec<Option<Vec<Vec<u8>>>>,
+    }
+
+    impl FidoBackend for RecordingBackend {
+        fn detect(&mut self) -> Result<crate::fido2::DetectedKey, FidoError> {
+            self.inner.detect()
+        }
+        fn register_credential(
+            &mut self,
+            d: &crate::fido2::DetectedKey,
+            pin: Option<&str>,
+        ) -> Result<crate::fido2::RegisteredCredential, FidoError> {
+            self.calls.push(None);
+            self.inner.register_credential(d, pin)
+        }
+        fn register_credential_excluding(
+            &mut self,
+            d: &crate::fido2::DetectedKey,
+            pin: Option<&str>,
+            exclude: &[Vec<u8>],
+        ) -> Result<crate::fido2::RegisteredCredential, FidoError> {
+            self.calls.push(Some(exclude.to_vec()));
+            self.inner.register_credential_excluding(d, pin, exclude)
+        }
+        fn get_prf_secret(&mut self, id: &[u8], pin: Option<&str>) -> Result<[u8; 32], FidoError> {
+            self.inner.get_prf_secret(id, pin)
+        }
+        fn prf_supported(&self) -> bool {
+            self.inner.prf_supported()
+        }
+    }
+
+    #[test]
+    fn dual_registration_excludes_every_registered_credential() {
+        let p = fresh_path("d6-exclude-list");
+        let mut v = Vault::create_dual(&p, "Pw-12345").unwrap();
+        let mut b1 = MockBackend::new();
+        v.register_key_in_group(&mut b1, None, "a1", KeyGroup::A)
+            .unwrap();
+        let mut b2 = MockBackend::new();
+        v.register_key_in_group(&mut b2, None, "b1", KeyGroup::B)
+            .unwrap();
+        let expected: Vec<Vec<u8>> = v
+            .header
+            .key_slots
+            .iter()
+            .map(|s| base64_decode(&s.credential_id).unwrap())
+            .collect();
+
+        let mut rec = RecordingBackend {
+            inner: MockBackend::new(),
+            calls: Vec::new(),
+        };
+        let r = v.register_key_in_group(&mut rec, None, "a2", KeyGroup::A);
+        assert!(r.is_ok(), "third key failed: {:?}", r.err());
+        assert_eq!(
+            rec.calls,
+            vec![Some(expected)],
+            "dual registration must pass all existing credentials (A and B) as excludeCredentials"
+        );
+    }
+
+    #[test]
+    fn dual_same_physical_key_cannot_register_twice_in_any_group() {
+        let p = fresh_path("d6-same-key");
+        let mut v = Vault::create_dual(&p, "Pw-12345").unwrap();
+        let mut key = MockBackend::new();
+        v.register_key_in_group(&mut key, None, "王小明", KeyGroup::A)
+            .unwrap();
+        let audit_len = v.audit().len();
+        for (label, group) in [("同一支-B", KeyGroup::B), ("同一支-A", KeyGroup::A)] {
+            key.reuse_device();
+            let r = v.register_key_in_group(&mut key, None, label, group);
+            assert!(
+                matches!(r, Err(VaultError::Fido(FidoError::CredentialExcluded))),
+                "same physical key must be refused for group {group:?}, got {:?}",
+                r.as_ref().map(|_| ())
+            );
+        }
+        assert_eq!(v.header.key_slots.len(), 1);
+        assert_eq!(
+            v.audit().len(),
+            audit_len,
+            "refused registration must not be audited as registered"
+        );
+        drop(v.lock());
+        assert_eq!(
+            Vault::read_header(&p, Edition::Dual)
+                .unwrap()
+                .key_slots
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn single_registration_keeps_legacy_call_without_exclusion() {
+        let p = fresh_path("d6-single-legacy");
+        let mut v = Vault::create(&p, "Pw-12345").unwrap();
+        let mut rec = RecordingBackend {
+            inner: MockBackend::new(),
+            calls: Vec::new(),
+        };
+        v.register_key_with_label(&mut rec, None, "s1").unwrap();
+        let mut rec2 = RecordingBackend {
+            inner: MockBackend::new(),
+            calls: Vec::new(),
+        };
+        v.register_key_with_label(&mut rec2, None, "s2").unwrap();
+        assert_eq!(rec.calls, vec![None]);
+        assert_eq!(rec2.calls, vec![None]);
     }
 
     #[test]

@@ -222,7 +222,8 @@ KEK（隨機 256-bit，加解密 payload；與 v1 相同）
 - [x] D3 Header v2 資料模型與版本互斥（見 §11）
 - [x] D4 建立 v2 金庫、主密碼 break-glass、payload 形狀與 dual_slot 一致性檢查（見 §11）
 - [x] D5 雙群組註冊：槽位只包該群組 share、AAD 綁定群組與 credential（見 §11）
-- [ ] D6–D13
+- [x] D6 excludeCredentials：同一支實體金鑰只能註冊一筆（mock / raw CTAP / Windows WebAuthn，見 §11）
+- [ ] D7–D13
 
 ## 11. 驗證紀錄
 
@@ -302,3 +303,26 @@ KEK（隨機 256-bit，加解密 payload；與 v1 相同）
   - 修正方式是每支金鑰改用新的 mock 實例，assertion 不變，也沒改 production code。
   - 那次失敗的 log 保留為 `02/03-FAIL-fixture-pin-cycle-*.log`。
 - Rust MSVC lib：單人版 242/242、雙人版 242/242，無 warning；跑測試前後原始碼 SHA-256 不變；rustfmt 通過；Node 65/65。
+
+### D6（2026-10-11）
+
+- `FidoError::CredentialExcluded`（中文訊息：已註冊、只能屬於一個群組、未新增金鑰槽）；診斷分類為 `credential-excluded`（`webauthn_diagnostics`，封閉分類，不含原始文字）。
+- trait `FidoBackend::register_credential_excluding(detected, pin, exclude)`：
+  - 預設實作：清單為空時等同 `register_credential`；清單非空而後端沒有實作排除時，回 `NotSupported` fail closed，不會在無法排除的情況下重複註冊。
+  - `UnavailableBackend` 一律回自己的「WebAuthn 不可用」訊息。
+- **MockBackend**：
+  - 每個實例有隨機 `instance_key`；`device_tag = HMAC(instance_key, seq)[..8]` 嵌在 `credential_id[1..9]`。credential 長度 32、`[0]` 仍是 kind，PRF 語義不變。
+  - 排除清單中有本裝置簽發的 credential → `CredentialExcluded`；不同實例（另一支實體金鑰）不會誤判。
+  - 新增測試輔助 `reuse_device()`：下一次 detect 視為同一支金鑰再次插入。
+- **raw CTAP（CLI/診斷）**：`do_register` 的 `exclude_list` 填入 `PublicKeyCredentialDescriptor`；`AuthenticatorError::CredentialExcluded`（CTAP2 0x19）→ `FidoError::CredentialExcluded`。
+- **Windows WebAuthn（GUI）**：
+  - `make_credential(detected, exclude)` 把排除清單放進 `WEBAUTHN_AUTHENTICATOR_MAKE_CREDENTIAL_OPTIONS.CredentialList`（v1 exclude 欄位，`exclude` 與 entries 存活到 API 返回）。清單可以是空的；每筆先通過長度驗證。
+  - `make_credential_error`：`NTE_EXISTS`（0x8009000F；Microsoft webauthn.h 中 `WebAuthNGetErrorName` 對應 `"InvalidStateError"`）→ `CredentialExcluded`；其他 HRESULT 維持原本的 `Internal` 訊息。
+  - **實機行為待 D13 確認（風險 R1）**：Windows 安全性對話框的文案，以及命中時是否真的回 `NTE_EXISTS`。
+- **vault**：雙人版註冊在呼叫 authenticator 之前，先把全部既有 credential（A+B）解碼成排除清單，再呼叫 `register_credential_excluding`。單人版仍呼叫原本的 `register_credential`，不帶排除清單（有測試驗證）。被拒絕時不新增槽位、不寫 `key_registered` audit。
+- TDD：
+  - 第一次 RED 編譯失敗（`webauthn_diagnostics::error_category` 是窮舉 match），log 保留為 `00-NOT_EXECUTED-compile-error.log`，不算 RED。
+  - 補上 stub 後，9 個 assertion RED → GREEN。
+  - 第一次 GREEN 有 1 項失敗，原因是測試寫法錯誤：比較了 `w!("public-key")` 常數的指標，但每次使用位址可能不同。改為比較字串內容，production code 沒有改，log 保留為 `FAIL-test-pointer-compare`。
+- 新增 11 個測試（另外在既有的分類測試加入 1 個案例）。Rust MSVC lib：單人版 253/253、雙人版 253/253，無 warning；跑測試前後原始碼 SHA-256 不變。
+- rustfmt：`fido2.rs`/`vault.rs`/`webauthn_diagnostics.rs` 通過；`windows_webauthn.rs` 的 baseline 本來就有 7 處格式差異，本次沒有新增。

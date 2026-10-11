@@ -195,6 +195,7 @@ fn error_category(error: &FidoError) -> &'static str {
         FidoError::PinRejected => "pin-rejected",
         FidoError::PrfNotSupported => "prf-unsupported",
         FidoError::PrfNotConfirmed => "hmac-creation-unconfirmed",
+        FidoError::CredentialExcluded => "credential-excluded",
         FidoError::NotSupported(_) => "capability-unsupported",
         FidoError::Internal(_) => "internal",
         FidoError::DeviceOpenDenied { .. } => "device-open-denied",
@@ -1107,6 +1108,7 @@ mod tests {
             (FidoError::PinRejected, "pin-rejected"),
             (FidoError::PrfNotSupported, "prf-unsupported"),
             (FidoError::PrfNotConfirmed, "hmac-creation-unconfirmed"),
+            (FidoError::CredentialExcluded, "credential-excluded"),
             (
                 FidoError::NotSupported("SENTINEL".into()),
                 "capability-unsupported",
