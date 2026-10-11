@@ -156,16 +156,31 @@ async function doCreate() {
 
 async function doLoginPw() {
   errBox("");
-  try {
-    // 改用主密碼登入：先放棄進行中的兩步驟登入（Rust 端清零 share 並記錄取消）。
-    if (isDual() && (dualLogin || dualBusy)) await abandonDualLogin();
-    const entries = await invoke("login_password", { password: $("login-pw").value });
-    await enterMain(entries, { breakGlass: isDual() });
-  } catch (e) { errBox(String(e)); }
+  if (!isDual()) {
+    try {
+      const entries = await invoke("login_password", { password: $("login-pw").value });
+      await enterMain(entries);
+    } catch (e) { errBox(String(e)); }
+    return;
+  }
+  // 雙人版：begin／complete／cancel／主密碼登入共用同一個 in-flight 鎖，彼此序列化。
+  // 金鑰步驟進行中不接受主密碼：避免丟棄一個可能已在 Rust 端成功解鎖的回應（UI 與 Rust 狀態不一致）。
+  if (dualBusy) return errBox("金鑰驗證進行中，請先完成或取消後再改用主密碼登入");
+  await withDualLock(async () => {
+    try {
+      // 改用主密碼登入：先放棄等待中的第二步（Rust 端清零 share 並記錄取消）。
+      if (dualLogin) await abandonDualLogin();
+      const entries = await invoke("login_password", { password: $("login-pw").value });
+      await enterMain(entries, { breakGlass: true });
+    } catch (e) {
+      safely(() => errBox(String(e)));
+    }
+  });
 }
 
 async function doLoginKey() {
-  if (isDual()) return doDualBegin();
+  // 雙人版：第二步等待中（例如在 PIN 欄按 Enter）送出第二步，否則開始第一步。
+  if (isDual()) return dualLogin ? doDualComplete() : doDualBegin();
   errBox("");
   if (!brokeredKeyLogin && !selectedKey) return errBox("請先選擇一支金鑰");
   const button = $("btn-login-key");
@@ -191,6 +206,8 @@ async function doLoginKey() {
 
 async function enterMain(entries, options = {}) {
   const session = ++entryDeleteSession;
+  // 防禦：進入主畫面時不留任何兩步驟倒數。
+  if (dualLogin) returnToDualStepOne();
   hide("screen-login");
   show("screen-main");
   if (options.breakGlass) show("breakglass-banner"); else hide("breakglass-banner");
@@ -806,38 +823,59 @@ function dualPin() {
   return value ? value : null;
 }
 
-async function doDualBegin() {
-  errBox("");
-  if (dualBusy || dualLogin || !dualLoginReady) return;
+// UI 清理（DOM 操作）各自獨立執行：單一步驟失敗不可阻止解鎖、IPC 或 in-flight 鎖的釋放。
+function safely(step) {
+  try { step(); } catch { /* best-effort UI cleanup */ }
+}
+
+// begin／complete／cancel／主密碼登入共用同一個 in-flight 鎖；鎖一定在 finally 釋放。
+async function withDualLock(work) {
+  if (dualBusy) return;
   dualBusy = true;
-  const generation = ++dualGeneration;
-  const button = $("btn-login-key");
-  button.disabled = true;
-  $("key-login-status").textContent = brokeredKeyLogin
-    ? "第一步：請依 Windows 安全性視窗提示操作金鑰"
-    : "第一步：請操作金鑰";
   try {
-    const info = await invoke("login_dual_begin", { pin: dualPin() });
-    if (generation === dualGeneration) startDualStep(info);
-  } catch (e) {
-    if (generation === dualGeneration) errBox(String(e));
+    await work();
   } finally {
     dualBusy = false;
-    button.disabled = false;
-    $("key-login-status").textContent = "";
   }
+}
+
+async function doDualBegin() {
+  if (dualBusy || dualLogin || !dualLoginReady) return;
+  const button = $("btn-login-key");
+  await withDualLock(async () => {
+    try {
+      errBox("");
+      const generation = ++dualGeneration;
+      button.disabled = true;
+      $("key-login-status").textContent = brokeredKeyLogin
+        ? "第一步：請依 Windows 安全性視窗提示操作金鑰"
+        : "第一步：請操作金鑰";
+      let info;
+      try {
+        info = await invoke("login_dual_begin", { pin: dualPin() });
+      } catch (e) {
+        if (generation === dualGeneration) safely(() => errBox(String(e)));
+        return;
+      }
+      if (generation === dualGeneration) startDualStep(info);
+    } finally {
+      safely(() => { button.disabled = false; });
+      safely(() => { $("key-login-status").textContent = ""; });
+    }
+  });
 }
 
 function startDualStep(info) {
   const remainingMs = Math.max(0, Number(info.remaining_ms) || 0);
   const second = groupName(info.second_group);
+  // 先建立狀態與計時器，再更新畫面：畫面更新失敗時倒數與逾時仍然有效。
   dualLogin = { deadline: Date.now() + remainingMs, timer: null };
-  $("dual-step-text").textContent = `${groupName(info.first_group)}（${info.first_label}）已驗證，請 ${second}成員於 ${Number(info.timeout_secs) || 0} 秒內完成驗證`;
-  $("btn-dual-complete").textContent = `以 ${second}金鑰完成第二步`;
-  hide("btn-login-key");
-  show("dual-step-panel");
   dualLogin.timer = setInterval(updateDualCountdown, 250);
-  updateDualCountdown();
+  safely(() => { $("dual-step-text").textContent = `${groupName(info.first_group)}（${info.first_label}）已驗證，請 ${second}成員於 ${Number(info.timeout_secs) || 0} 秒內完成驗證`; });
+  safely(() => { $("btn-dual-complete").textContent = `以 ${second}金鑰完成第二步`; });
+  safely(() => hide("btn-login-key"));
+  safely(() => show("dual-step-panel"));
+  safely(updateDualCountdown);
 }
 
 function updateDualCountdown() {
@@ -854,55 +892,74 @@ function updateDualCountdown() {
 }
 
 function returnToDualStepOne() {
+  // 先清狀態與計時器（不會失敗），再盡力還原畫面。
   if (dualLogin && dualLogin.timer !== null) clearInterval(dualLogin.timer);
   dualLogin = null;
-  $("dual-step-text").textContent = "";
-  $("dual-countdown").textContent = "";
-  hide("dual-step-panel");
-  if (dualLoginReady) show("btn-login-key");
+  safely(() => { $("dual-step-text").textContent = ""; });
+  safely(() => { $("dual-countdown").textContent = ""; });
+  safely(() => hide("dual-step-panel"));
+  if (dualLoginReady) safely(() => show("btn-login-key"));
 }
 
 async function doDualComplete() {
   if (!dualLogin || dualBusy) return;
-  dualBusy = true;
-  const generation = dualGeneration;
-  // 第二步進行中停止前端倒數；截止時間由 Rust 在金鑰操作前後各檢查一次。
-  if (dualLogin.timer !== null) clearInterval(dualLogin.timer);
-  dualLogin.timer = null;
-  $("btn-dual-complete").disabled = true;
-  $("btn-dual-cancel").disabled = true;
-  $("dual-countdown").textContent = brokeredKeyLogin
-    ? "第二步：請依 Windows 安全性視窗提示操作金鑰"
-    : "第二步：請操作金鑰";
-  errBox("");
+  let entries;
+  let unlocked = false;
+  let generation;
+  await withDualLock(async () => {
+    try {
+      generation = dualGeneration;
+      // 送出前的畫面更新只是提示：失敗不可阻止送出，也不可留下停止的倒數。
+      safely(() => { $("btn-dual-complete").disabled = true; });
+      safely(() => { $("btn-dual-cancel").disabled = true; });
+      safely(() => errBox(""));
+      const pin = dualPin();
+      // 第二步進行中停止前端倒數（緊接在送出前）；截止時間由 Rust 在金鑰操作前後各檢查一次。
+      if (dualLogin.timer !== null) clearInterval(dualLogin.timer);
+      dualLogin.timer = null;
+      safely(() => {
+        $("dual-countdown").textContent = brokeredKeyLogin
+          ? "第二步：請依 Windows 安全性視窗提示操作金鑰"
+          : "第二步：請操作金鑰";
+      });
+      try {
+        entries = await invoke("login_dual_complete", { pin });
+        unlocked = true;
+      } catch (e) {
+        if (generation === dualGeneration) {
+          // Rust 端暫存不論成敗都已取走：一律回到第一步。
+          returnToDualStepOne();
+          safely(() => errBox(`${String(e)}\n請從第一步重新開始`));
+        }
+      }
+    } finally {
+      safely(() => { $("btn-dual-complete").disabled = false; });
+      safely(() => { $("btn-dual-cancel").disabled = false; });
+    }
+  });
+  if (!unlocked || generation !== dualGeneration) return;
+  // 已在 Rust 端解鎖：畫面清理失敗也必須進入主畫面；之後的錯誤不是第二步失敗，不提示重新開始。
+  returnToDualStepOne();
   try {
-    const entries = await invoke("login_dual_complete", { pin: dualPin() });
-    if (generation !== dualGeneration) return;
-    returnToDualStepOne();
     await enterMain(entries);
   } catch (e) {
-    if (generation !== dualGeneration) return;
-    // Rust 端暫存不論成敗都已取走：一律回到第一步。
-    returnToDualStepOne();
-    errBox(`${String(e)}\n請從第一步重新開始`);
-  } finally {
-    dualBusy = false;
-    $("btn-dual-complete").disabled = false;
-    $("btn-dual-cancel").disabled = false;
+    safely(() => errBox(String(e)));
   }
 }
 
 async function doDualCancel() {
   if (!dualLogin || dualBusy) return;
-  errBox("");
-  dualGeneration += 1;
-  returnToDualStepOne();
-  try {
-    await invoke("login_dual_cancel");
-    $("key-login-status").textContent = "已取消兩步驟登入；請從第一步重新開始";
-  } catch (e) {
-    errBox(String(e));
-  }
+  await withDualLock(async () => {
+    dualGeneration += 1;
+    returnToDualStepOne();
+    safely(() => errBox(""));
+    try {
+      await invoke("login_dual_cancel");
+      safely(() => { $("key-login-status").textContent = "已取消兩步驟登入；請從第一步重新開始"; });
+    } catch (e) {
+      safely(() => errBox(String(e)));
+    }
+  });
 }
 
 async function abandonDualLogin() {

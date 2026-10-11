@@ -5,19 +5,32 @@ const path = require("node:path");
 const test = require("node:test");
 const vm = require("node:vm");
 
+// 記錄所有非空的 innerHTML 寫入：雙人版路徑只應以 textContent／DOM 節點呈現。
+const htmlWrites = [];
+
 function element(id) {
   const attributes = {};
   const listeners = new Map();
   const classes = new Set(["hidden"]);
   let children = [];
   let html = "";
+  let text = "";
   const node = {
     id,
     value: "",
     checked: false,
     disabled: false,
     title: "",
-    textContent: "",
+    // 故障注入：設為 true 時，下一次寫入 textContent 會丟出例外（只發生一次）。
+    failNextTextSet: false,
+    get textContent() { return text; },
+    set textContent(value) {
+      if (node.failNextTextSet) {
+        node.failNextTextSet = false;
+        throw new Error("injected DOM fault");
+      }
+      text = String(value);
+    },
     dataset: {},
     style: {},
     onclick: null,
@@ -25,7 +38,7 @@ function element(id) {
     returnValue: "",
     get children() { return children; },
     get innerHTML() { return html; },
-    set innerHTML(value) { html = String(value); children = []; },
+    set innerHTML(value) { html = String(value); children = []; if (html) htmlWrites.push(html); },
     classList: {
       add(name) { classes.add(name); },
       remove(name) { classes.delete(name); },
@@ -77,6 +90,7 @@ const KEYS_AB = [
 ];
 
 function loadUi({ edition = "dual", keys = KEYS_AB, brokered = true, handlers = {}, settings } = {}) {
+  htmlWrites.length = 0;
   const elements = new Map();
   const calls = [];
   const alerts = [];
@@ -221,6 +235,7 @@ test("A then B: first step shows who verified, a countdown, and the second step 
   assert.equal(visible(ui.$("btn-login-key")), false);
   assert.match(ui.$("dual-step-text").textContent, /A 群組（王小明）已驗證，請 B 群組成員於 120 秒內完成驗證/);
   assert.equal(ui.$("dual-step-text").innerHTML, "", "labels must not be rendered as HTML");
+  assert.deepEqual(htmlWrites, [], "dual login must not write HTML");
   assert.match(ui.$("dual-countdown").textContent, /剩餘 120 秒/);
   ui.advance(30_000);
   assert.match(ui.$("dual-countdown").textContent, /剩餘 90 秒/);
@@ -446,6 +461,7 @@ test("dual key list groups keys, shows counts, and disables removing a group's l
   assert.match(buttons.a1.title, /不可刪除 A 群組的最後一支金鑰/);
   assert.equal(buttons.b1.disabled, false);
   walk(list, (node) => assert.doesNotMatch(node.innerHTML, /<img/));
+  assert.deepEqual(htmlWrites, [], "dual key list must not write HTML");
   await buttons.a1.onclick();
   await flush();
   assert.equal(commands(ui).includes("remove_key"), false, "disabled button must not remove");
@@ -487,4 +503,231 @@ test("single edition hides the dual timeout setting", async () => {
   await flush();
   assert.equal(visible(ui.$("dual-settings")), false);
   assert.equal(visible(ui.$("dual-key-status")), false);
+});
+
+// ─────────────── D11 review follow-up ───────────────
+test("master-password login is refused while a key step is in flight", async () => {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const ui = loadUi({ handlers: { login_dual_complete: async () => { await gate; return []; } } });
+  await flush();
+  await ui.$("btn-login-key").onclick();
+  await flush();
+  const completing = ui.$("btn-dual-complete").onclick();
+  await flush();
+  ui.$("login-pw").value = "wrong";
+  await ui.$("btn-login-pw").onclick();
+  await flush();
+  assert.equal(commands(ui).includes("login_password"), false, "password login must wait for the key step");
+  assert.equal(commands(ui).includes("login_dual_cancel"), false, "an in-flight step must not be abandoned");
+  assert.match(ui.$("login-error").textContent, /金鑰驗證進行中/);
+  release();
+  await completing;
+  await flush();
+  assert.equal(visible(ui.$("screen-main")), true, "the successful second step must still unlock the UI");
+  assert.equal(visible(ui.$("breakglass-banner")), false);
+});
+
+test("master-password login is refused while the first step is in flight", async () => {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const ui = loadUi({ handlers: { login_dual_begin: async () => { await gate; return { first_group: "A", first_label: "王小明", second_group: "B", timeout_secs: 120, remaining_ms: 120_000 }; } } });
+  await flush();
+  const beginning = ui.$("btn-login-key").onclick();
+  await flush();
+  await ui.$("btn-login-pw").onclick();
+  await flush();
+  assert.equal(commands(ui).includes("login_password"), false);
+  assert.match(ui.$("login-error").textContent, /金鑰驗證進行中/);
+  release();
+  await beginning;
+  await flush();
+  assert.equal(visible(ui.$("dual-step-panel")), true);
+});
+
+test("Enter in the PIN box during step two submits the second step", async () => {
+  const ui = loadUi({ brokered: false });
+  await flush();
+  await ui.$("btn-login-key").onclick();
+  await flush();
+  ui.$("login-pin").value = "5678";
+  ui.$("login-pin").dispatch("keydown", { key: "Enter" });
+  await flush();
+  const complete = ui.calls.find((item) => item.command === "login_dual_complete");
+  assert.ok(complete, "Enter must submit the second step");
+  assert.equal(complete.args.pin, "5678");
+  assert.equal(ui.calls.filter((item) => item.command === "login_dual_begin").length, 1);
+});
+
+test("an error after a successful second step is not reported as a failed step", async () => {
+  const ui = loadUi({ handlers: { get_vault_settings: () => { throw new Error("settings unavailable"); } } });
+  await flush();
+  await ui.$("btn-login-key").onclick();
+  await flush();
+  await ui.$("btn-dual-complete").onclick();
+  await flush();
+  assert.match(ui.$("login-error").textContent, /settings unavailable/);
+  assert.doesNotMatch(ui.$("login-error").textContent, /請從第一步重新開始/);
+  assert.equal(visible(ui.$("screen-main")), true);
+});
+
+test("a first step cannot start while a cancel is still being processed", async () => {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const ui = loadUi({ handlers: { login_dual_cancel: async () => { await gate; } } });
+  await flush();
+  await ui.$("btn-login-key").onclick();
+  await flush();
+  const cancelling = ui.$("btn-dual-cancel").onclick();
+  await flush();
+  await ui.$("btn-login-key").onclick();
+  await flush();
+  assert.equal(ui.calls.filter((item) => item.command === "login_dual_begin").length, 1, "begin must wait for the cancel");
+  release();
+  await cancelling;
+  await flush();
+  await ui.$("btn-login-key").onclick();
+  await flush();
+  assert.equal(ui.calls.filter((item) => item.command === "login_dual_begin").length, 2);
+});
+
+test("a first step cannot start while the master-password login is in flight", async () => {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const ui = loadUi({ handlers: { login_password: async () => { await gate; return []; } } });
+  await flush();
+  const loggingIn = ui.$("btn-login-pw").onclick();
+  await flush();
+  await ui.$("btn-login-key").onclick();
+  await flush();
+  assert.equal(commands(ui).includes("login_dual_begin"), false, "key login must wait for the password login");
+  release();
+  await loggingIn;
+  await flush();
+  assert.equal(visible(ui.$("screen-main")), true);
+  assert.equal(visible(ui.$("dual-step-panel")), false);
+  assert.equal(ui.intervals.size, 0);
+});
+
+test("double-submitting the second step sends one request", async () => {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const ui = loadUi({ handlers: { login_dual_complete: async () => { await gate; return []; } } });
+  await flush();
+  await ui.$("btn-login-key").onclick();
+  await flush();
+  const first = ui.$("btn-dual-complete").onclick();
+  const second = ui.$("btn-dual-complete").onclick();
+  release();
+  await Promise.all([first, second]);
+  await flush();
+  assert.equal(ui.calls.filter((item) => item.command === "login_dual_complete").length, 1);
+  assert.equal(visible(ui.$("screen-main")), true);
+});
+
+// ─────────────── D11 follow-up 2: exception safety of the shared in-flight lock ───────────────
+const settle = (promise) => promise.then(() => "resolved", () => "rejected");
+
+test("a DOM fault while cancelling still sends the cancel and releases the lock", async () => {
+  const ui = loadUi();
+  await flush();
+  await ui.$("btn-login-key").onclick();
+  await flush();
+  ui.$("dual-step-text").failNextTextSet = true;
+  await settle(ui.$("btn-dual-cancel").onclick());
+  await flush();
+  assert.ok(commands(ui).includes("login_dual_cancel"), "cancel IPC must still be sent");
+  await ui.$("btn-login-key").onclick();
+  await flush();
+  assert.equal(ui.calls.filter((item) => item.command === "login_dual_begin").length, 2, "lock must be released");
+});
+
+test("a DOM fault while starting the first step releases the lock and the button", async () => {
+  const ui = loadUi();
+  await flush();
+  ui.$("key-login-status").failNextTextSet = true;
+  await settle(ui.$("btn-login-key").onclick());
+  await flush();
+  assert.equal(ui.$("btn-login-key").disabled, false);
+  await ui.$("btn-login-key").onclick();
+  await flush();
+  assert.ok(commands(ui).includes("login_dual_begin"), "a later first step must still reach Rust");
+});
+
+test("a DOM fault while starting the second step still sends it and releases both buttons", async () => {
+  // 第二輪覆核：送出前的畫面更新失敗不可停住倒數或留下等待中的第二步；改為照常送出第二步。
+  const ui = loadUi();
+  await flush();
+  await ui.$("btn-login-key").onclick();
+  await flush();
+  ui.$("dual-countdown").failNextTextSet = true;
+  const outcome = await settle(ui.$("btn-dual-complete").onclick());
+  await flush();
+  assert.equal(outcome, "resolved");
+  assert.ok(commands(ui).includes("login_dual_complete"), "the second step must still reach Rust");
+  assert.equal(ui.$("btn-dual-complete").disabled, false);
+  assert.equal(ui.$("btn-dual-cancel").disabled, false);
+  assert.equal(visible(ui.$("screen-main")), true);
+  assert.equal(ui.intervals.size, 0);
+});
+
+test("a DOM fault while showing the first-step result keeps the panel, the countdown and expiry", async () => {
+  const ui = loadUi();
+  await flush();
+  ui.$("dual-step-text").failNextTextSet = true;
+  const outcome = await settle(ui.$("btn-login-key").onclick());
+  await flush();
+  assert.equal(outcome, "resolved");
+  assert.equal(visible(ui.$("dual-step-panel")), true, "the second-step controls must still be shown");
+  assert.equal(visible(ui.$("btn-login-key")), false);
+  assert.equal(ui.intervals.size, 1, "countdown must be running");
+  ui.advance(120_001);
+  await flush();
+  assert.equal(visible(ui.$("dual-step-panel")), false);
+  assert.equal(commands(ui).includes("login_dual_cancel"), false);
+  await ui.$("btn-login-key").onclick();
+  await flush();
+  assert.equal(ui.calls.filter((item) => item.command === "login_dual_begin").length, 2);
+});
+
+test("a DOM fault after a successful second step still enters the main screen", async () => {
+  const ui = loadUi();
+  await flush();
+  await ui.$("btn-login-key").onclick();
+  await flush();
+  ui.$("dual-step-text").failNextTextSet = true;
+  const outcome = await settle(ui.$("btn-dual-complete").onclick());
+  await flush();
+  assert.equal(outcome, "resolved");
+  assert.equal(visible(ui.$("screen-main")), true, "Rust is unlocked, so the UI must be too");
+  assert.equal(ui.intervals.size, 0);
+});
+
+test("after a rejected cancel or a rejected password login the first step can start again", async () => {
+  const ui = loadUi({ handlers: {
+    login_dual_cancel: () => { throw new Error("cancel failed"); },
+    login_password: () => { throw new Error("密碼不正確"); },
+  } });
+  await flush();
+  await ui.$("btn-login-key").onclick();
+  await flush();
+  await ui.$("btn-dual-cancel").onclick();
+  await flush();
+  assert.match(ui.$("login-error").textContent, /cancel failed/);
+  await ui.$("btn-login-pw").onclick();
+  await flush();
+  assert.match(ui.$("login-error").textContent, /密碼不正確/);
+  await ui.$("btn-login-key").onclick();
+  await flush();
+  assert.equal(ui.calls.filter((item) => item.command === "login_dual_begin").length, 2);
+  assert.equal(visible(ui.$("dual-step-panel")), true);
+});
+
+test("a malicious first-step label is rendered as text only", async () => {
+  const ui = loadUi({ handlers: { login_dual_begin: () => ({ first_group: "A", first_label: "<img src=x onerror=alert(1)>", second_group: "B", timeout_secs: 120, remaining_ms: 120_000 }) } });
+  await flush();
+  await ui.$("btn-login-key").onclick();
+  await flush();
+  assert.match(ui.$("dual-step-text").textContent, /<img src=x onerror=alert\(1\)>/);
+  assert.deepEqual(htmlWrites, []);
 });

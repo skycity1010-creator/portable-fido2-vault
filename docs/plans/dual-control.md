@@ -1,6 +1,6 @@
 # 雙群組金鑰控管版（Dual-Control Edition）設計文件
 
-> 狀態：**D1–D10 已實作；D11–D13 未開始，實機驗收待 D13**。PR #29 維持 draft，未合併／未部署。
+> 狀態：**D1–D11 已完成；D12–D13 未開始，實機驗收待 D13**。PR #29 維持 draft，未合併／未部署。
 > 分支：`feature/dual-control-20261011`（base `main` `656ac95`）。
 > 需求來源：使用者 2026-10-11 Hermes desktop 對話（Q1–Q6 已裁決，見 §1）。
 
@@ -228,7 +228,8 @@ KEK（隨機 256-bit，加解密 payload；與 v1 相同）
 - [x] D8 群組最後一支金鑰不可刪除 + 金鑰清單群組資料（見 §11）
 - [x] D9 時限設定：payload 權威值、header 鏡像、clamp 與竄改修復（見 §11）
 - [x] D10 前端：edition 切換、兩步驟登入與倒數、群組註冊、金鑰清單群組／刪除限制、時限設定、break-glass 提示（見 §11）
-- [ ] D11–D13
+- [x] D11 全套驗證：Rust single/dual、Node、單人版與雙人版 mock Gate E2E、GNU Release 雙執行檔、Clippy／rustfmt、靜態掃描、兩位獨立審查（見 §11）
+- [ ] D12–D13
 
 ## 11. 驗證紀錄
 
@@ -455,3 +456,32 @@ KEK（隨機 256-bit，加解密 payload；與 v1 相同）
   - 原生視窗標題仍為 `tauri.conf.json` 的「可攜式 FIDO2 密碼金庫」；D10 只改頁面標題與畫面內標示。§5「視窗標題顯示雙群組控管版」需 Rust 端 `set_title` 或設定調整，留待 D11 決定。
   - 「關於」畫面目前不存在，本期未新增。
   - 計時執行緒實際觸發、IPC 整合與 GUI 實際操作留待 D11 mock E2E 與 D13 實機。
+
+### D11（2026-10-11）
+
+- 使用者決定：原生視窗標題**不改**（維持 `tauri.conf.json`）；§5 標題要求以畫面內「雙群組控管版」標示為準。
+- **雙人版 mock Gate E2E**（新增，`scripts/gate_e2e.py` 與單人版 20 項不變）：
+  - `src-tauri/examples/dual_vault_cli.rs`：只供 E2E 的 mock CLI，`required-features = ["dual-control"]`，不進產品執行檔。`--device` 名稱代表一支實體金鑰：同名即同一支（excludeCredentials 拒絕），金鑰只認得自己簽發的 credential（模擬 broker 允許清單）。`vault_cli` 仍不支援 v2（§5 不變）。
+  - `scripts/gate_e2e_dual.py`：跨行程驗證 25 項（DG1–DG9），涵蓋 §6.1：建立 v2、break-glass 成功／失敗、群組註冊、同一支金鑰重複註冊（選 A、選 B）被拒、A→B／B→A 解鎖、同群組第二步失敗、未註冊金鑰、逾時（120／60 秒，含恰好截止）、取消、時限 29／601 拒絕與 60 生效、明文鏡像竄改 clamp 與修復、群組標記竄改（AAD 失敗，在另一個合成副本上進行）、群組最後一支不可刪、移除後可重新註冊、v1／v2 版本互斥且檔案不變、audit 完整、金庫檔不含主密碼。腳本拒絕使用既有資料夾、不刪除任何檔案、subprocess 不用 shell、每個子行程 120 秒逾時。
+  - CI 新增兩步：`cargo build --release --locked --features dual-control --example dual_vault_cli` 與 `python ../scripts/gate_e2e_dual.py`。
+- **D9 審查留下的測試補強**（`vault.rs` 3 個 test-only 測試，由 Claude Code CLI writer 撰寫、parent 重跑驗證，production 未改）：鏡像不一致＋payload tag 破壞不修復；兩支金鑰成功但權威時限缺失／29／601 且有 sidecar → `Format`、檔案與 sidecar 不變；修復登入的 rename 失敗（tmp 已寫入）→ `Io`、檔案與 sidecar 不變，之後可正常修復（`#[cfg(windows)]`）。三項首次即 GREEN，屬 GREEN→GREEN 覆蓋。觀察：payload 解密失敗不記 sidecar（既有行為）。
+- **獨立審查與追加修正**（Reviewer profile `reviwer` ＋ Claude Code CLI，唯讀、各自 JSON verdict；evidence 在 `d11/review`、`followup-review`、`followup2-review`、`followup3-review`）：
+  1. 第一輪（D10＋D11 全 patch）兩位都 `passed=false`，各一項邏輯問題：第二步進行中改用主密碼可能丟掉 Rust 已成功的解鎖（UI 已鎖／Rust 已解鎖）；cancel／密碼登入與新的第一步沒有序列化；E2E 腳本會刪 sidecar；CLI `--advance-secs` 溢位 panic。
+  2. 修正：雙人版 begin／complete／cancel／主密碼登入共用同一個 in-flight 鎖（`withDualLock`，finally 必釋放），金鑰步驟進行中拒絕主密碼；PIN 欄 Enter 在第二步送出第二步；解鎖後的 `enterMain` 錯誤不再顯示「請從第一步重新開始」；UI 清理以 `safely` 個別執行，任一 DOM 失敗都不阻止 IPC、解鎖或釋放鎖；送出第二步前的提示失敗不再停住倒數；`startDualStep` 先建狀態與計時器再更新畫面。E2E 腳本不再刪檔（竄改情境改用新副本）、負向檢查比對具體原因、`assert`→`raise`；CLI 改用 `checked_add`。
+  3. 每次行為修正都先 assertion RED：follow-up 1 共 4＋2 個 RED，follow-up 2 共 4 個，follow-up 3 共 2 個（`d11/followup/*-red-*.log`）。fake DOM 加入非空 `innerHTML` 寫入記錄與一次性 `textContent` 故障注入。follow-up 3 把「第二步開始前 DOM 故障」測試的預期由「中止後取消」改為「照常送出並解鎖」，屬刻意的行為變更。
+  4. 第 2、3、4 輪：Claude Code CLI 皆 `passed=true`；Reviewer profile 第 2、3 輪各指出一項 exception-safety 缺口（已修），第 4 輪確認前述問題已解決，但另提出一項**既有**問題（見下方殘餘風險 1），判 `passed=false`。使用者 2026-10-11 決定列為既有殘餘風險，D11 以目前候選版收尾。
+- 最終驗證（`d11/verify-final3/`，跑前跑後九個檔案 SHA-256 一致，並與 follow-up 3 審查 snapshot 相同）：
+  - Rust MSVC lib：單人版 327/327、雙人版 327/327（324 + 3）。
+  - Node 98/98（65 + 33）、`node --check src/app.js`、`git diff --check`。
+  - mock Gate E2E：單人版 20/20、雙人版 25/25（MSVC release example）。
+  - Clippy `--lib`（single、dual）與 `--example dual_vault_cli`：以 `-D warnings -A dead_code -A clippy::too_many_arguments` 全過；嚴格 `-D warnings` 對照組仍只有既有的 3 項（`try_lock` dead_code、兩個 too_many_arguments），證明 lib 有被檢查、沒有新增 lint。
+  - rustfmt（`vault.rs`、`dual_vault_cli.rs` 等，skip_children）通過。
+  - GNU Release：`portable-fido-vault.exe` SHA256 `a6d16552edfe0333faea13bed8bf273d9c6a45e5882223602c4a4822a0c6ee13`、`portable-fido-vault-dual.exe` SHA256 `e2e9f52c060fbf4dbe4046104b2515973303cc00c1d371b3a45304ed11441af6`（x86_64 PE）；僅留在 scratch target，未執行、未部署。
+  - 新增行靜態掃描（hardcoded credentials、shell injection、eval/exec、pickle、SQL interpolation、HTML sink、unsafe、刪檔）：無發現；測試用密碼皆為合成值。
+  - 較早的驗證回合因之後又修改原始碼，保留為 `verify-SUPERSEDED-*`，不計入。
+- **殘餘風險／後續事項**：
+  1. （既有、單人版與雙人版共用，使用者決定另開維護項目）`enterMain` 在 Rust 已解鎖後，若畫面切換的 DOM 操作或之後的設定／audit 讀取失敗，畫面可能停在登入頁或閒置自動上鎖不啟動。
+  2. （既有）`write_data` 的 rename 失敗時會留下 `vault.db.tmp`（含密文），兩個版本相同。
+  3. 打包規則：`target/*/examples/*`（`vault_cli`、`dual_vault_cli`）不得隨產品發佈 → D12 文件。
+  4. 雙人版 E2E 是 vault 層跨行程驗證，不涵蓋 Tauri IPC、Rust 計時執行緒實際觸發、Windows broker 與實體金鑰 → D13 實機。
+  5. 審查的其他非阻擋建議（begin 前置提示改 `safely`、更多種 DOM 故障注入、`--advance-secs` 溢位時先取消暫存等）未處理，視需要併入後續維護。

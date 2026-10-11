@@ -3789,6 +3789,124 @@ mod tests {
     }
 
     #[test]
+    fn d11_mirror_mismatch_with_corrupted_payload_tag_does_not_repair() {
+        let p = fresh_path("d11-corrupt-tag");
+        drop(Vault::create_dual(&p, "Pw-12345").unwrap());
+        rewrite_header(&p, |h| h["dual_step_timeout_secs"] = serde_json::json!(600));
+        let mut bytes = fs::read(&p).unwrap();
+        *bytes.last_mut().unwrap() ^= 0x01; // synthetic payload GCM tag corruption.
+        fs::write(&p, &bytes).unwrap();
+        record_login_failure(&p, "synthetic-existing-failure").unwrap();
+        let before = fs::read(&p).unwrap();
+        let failure_before = fs::read(failures_path(&p)).unwrap();
+        let r = Vault::open_password_dual(&p, "Pw-12345");
+        // Password slot opens; payload decrypt fails via `?` in unlock(), which records no failure.
+        assert!(
+            matches!(r, Err(VaultError::Crypto(CryptoError::DecryptFailed))),
+            "corrupted payload tag must fail closed: {:?}",
+            r.err()
+        );
+        assert!(fs::read(&p).unwrap() == before);
+        assert!(!p.with_extension("db.tmp").exists());
+        assert!(fs::read(failures_path(&p)).unwrap() == failure_before);
+        assert_eq!(
+            Vault::read_header(&p, Edition::Dual)
+                .unwrap()
+                .dual_step_timeout_secs,
+            Some(600)
+        );
+    }
+
+    #[test]
+    fn d11_dual_key_login_rejects_missing_or_out_of_range_authority_with_sidecar() {
+        for authority in [None, Some(29u32), Some(601)] {
+            let (p, c) = dual_vault_with(
+                &format!("d11-key-authority-{authority:?}"),
+                &[("a", KeyGroup::A), ("b", KeyGroup::B)],
+            );
+            let mut v = reopen_dual(&p);
+            v.data.settings.dual_step_timeout_secs = authority;
+            v.write_file().unwrap(); // re-encrypt synthetic invalid payload with fixture KEK.
+            drop(v);
+            assert_eq!(
+                Vault::read_header(&p, Edition::Dual)
+                    .unwrap()
+                    .dual_step_timeout_secs,
+                Some(120)
+            );
+            record_login_failure(&p, "synthetic-existing-failure").unwrap();
+            let before = fs::read(&p).unwrap();
+            let failure_before = fs::read(failures_path(&p)).unwrap();
+            let r = two_step(&p, &c[0], &c[1]);
+            assert!(
+                matches!(r, Err(VaultError::Format(_))),
+                "authority {authority:?} must fail closed: {:?}",
+                r.err()
+            );
+            assert!(fs::read(&p).unwrap() == before);
+            assert!(!p.with_extension("db.tmp").exists());
+            assert!(fs::read(failures_path(&p)).unwrap() == failure_before);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn d11_repair_login_rename_failure_preserves_vault_and_failure_sidecar() {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x1;
+        let p = fresh_path("d11-repair-rename-failure");
+        drop(Vault::create_dual(&p, "Pw-12345").unwrap());
+        rewrite_header(&p, |h| h["dual_step_timeout_secs"] = serde_json::json!(600));
+        record_login_failure(&p, "synthetic-existing-failure").unwrap();
+        let before = fs::read(&p).unwrap();
+        let failure_before = fs::read(failures_path(&p)).unwrap();
+        let tmp = p.with_extension("db.tmp");
+        assert!(!tmp.exists());
+        // Synthetic reader that denies delete sharing: reads still work, replacing vault.db fails.
+        let guard = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&p)
+            .unwrap();
+        assert!(
+            fs::read(&p).unwrap() == before,
+            "login read must work with guard open"
+        );
+        let result = Vault::open_password_dual(&p, "Pw-12345");
+        let temp_was_written = tmp.is_file();
+        drop(guard);
+        if temp_was_written {
+            fs::remove_file(&tmp).unwrap();
+        }
+        assert!(
+            temp_was_written,
+            "failure must occur AFTER temporary ciphertext write"
+        );
+        assert!(
+            matches!(result, Err(VaultError::Io(_))),
+            "rename failure must surface as Io: {:?}",
+            result.err()
+        );
+        assert!(fs::read(&p).unwrap() == before);
+        assert!(fs::read(failures_path(&p)).unwrap() == failure_before);
+        let v = reopen_dual(&p);
+        assert_eq!(v.header.dual_step_timeout_secs, Some(120));
+        assert_eq!(
+            v.audit()
+                .iter()
+                .filter(|a| a.event == "settings_tamper_detected")
+                .count(),
+            1
+        );
+        assert!(v
+            .audit()
+            .iter()
+            .any(|a| a.event == "login_failed" && a.method == "synthetic-existing-failure"));
+        assert!(!failures_path(&p).exists());
+        assert!(!tmp.exists());
+    }
+
+    #[test]
     fn dual_step_timeout_mirror_is_clamped() {
         let mut h = valid_v2_header();
         h.dual_step_timeout_secs = None;

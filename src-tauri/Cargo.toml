@@ -12,6 +12,12 @@ path = "src/lib.rs"
 name = "vault_cli"
 path = "examples/vault_cli.rs"
 
+# 雙群組控管版 mock 端到端驗證 CLI（只供 scripts/gate_e2e_dual.py；模擬金鑰，不進產品）。
+[[example]]
+name = "dual_vault_cli"
+path = "examples/dual_vault_cli.rs"
+required-features = ["dual-control"]
+
 # 單人版（預設）。明確宣告以免自動探索規則改變時漏掉。
 [[bin]]
 name = "portable-fido-vault"
