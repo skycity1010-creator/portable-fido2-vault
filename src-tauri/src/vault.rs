@@ -40,6 +40,8 @@ pub enum VaultError {
     DualNotReady,
     /// 兩步驟登入第一步完成後，未在時限內完成第二步。
     DualStepExpired,
+    /// 雙人版：不可刪除群組中的最後一支金鑰（§4.5）。
+    LastKeyInGroup(KeyGroup),
 }
 
 impl std::fmt::Display for VaultError {
@@ -63,6 +65,11 @@ impl std::fmt::Display for VaultError {
             Self::DualNotReady => write!(
                 f,
                 "需 A、B 群組各至少一支金鑰才能以金鑰登入；目前請以主密碼登入"
+            ),
+            Self::LastKeyInGroup(group) => write!(
+                f,
+                "不可刪除 {} 群組的最後一支金鑰（A、B 群組各須保留至少一支）",
+                group.as_str()
             ),
             Self::DualStepExpired => {
                 write!(f, "第二位成員未在時限內完成驗證，請從第一步重新開始")
@@ -345,6 +352,25 @@ fn escape_audit_label(label: &str) -> String {
         }
     }
     out
+}
+
+/// 雙人版：若刪除此 credential 會讓它的群組歸零，回傳該群組（§4.5 一律禁止）。
+/// 單人版或找不到槽位 → None。
+pub fn last_key_in_group(header: &Header, credential_id_b64: &str) -> Option<KeyGroup> {
+    if edition_of(header) != Edition::Dual {
+        return None;
+    }
+    let group = header
+        .key_slots
+        .iter()
+        .find(|slot| slot.credential_id == credential_id_b64)?
+        .group?;
+    let members = header
+        .key_slots
+        .iter()
+        .filter(|slot| slot.group == Some(group))
+        .count();
+    (members <= 1).then_some(group)
 }
 
 /// 綁定值：created_at + dual_slot 密文（不含機密）。
@@ -1487,13 +1513,18 @@ impl Vault {
             .iter()
             .position(|s| s.credential_id == credential_id_b64)
             .ok_or(VaultError::Fido(FidoError::NoDevice))?;
+        // 雙人版：群組歸零會讓金鑰登入永久失效 → 一律拒絕（不改 header、不寫檔、不記 audit）。
+        if let Some(group) = last_key_in_group(&self.header, credential_id_b64) {
+            return Err(VaultError::LastKeyInGroup(group));
+        }
         let label = self.header.key_slots[idx].label.clone();
+        let group = self.header.key_slots[idx].group;
         self.header.key_slots.remove(idx);
-        self.record(
-            "key_removed",
-            &format!("fido2:{label}"),
-            "金鑰槽已移除（該金鑰無法再解鎖）",
-        )?;
+        let detail = match group {
+            Some(group) => format!("金鑰槽已移除（該金鑰無法再解鎖） group={}", group.as_str()),
+            None => "金鑰槽已移除（該金鑰無法再解鎖）".to_owned(),
+        };
+        self.record("key_removed", &format!("fido2:{label}"), &detail)?;
         Ok(())
     }
 
@@ -3029,6 +3060,135 @@ mod tests {
             stamps.last().map(|s| s.method.as_str()),
             Some("fido2-dual-step1:x%2By")
         );
+    }
+
+    // ── D8：群組最後一支金鑰不可刪除 ──
+
+    fn slot_id(v: &Vault, label: &str) -> String {
+        v.header
+            .key_slots
+            .iter()
+            .find(|s| s.label == label)
+            .unwrap()
+            .credential_id
+            .clone()
+    }
+
+    fn reopen_dual(p: &Path) -> Vault {
+        Vault::open_password_dual(p, "Pw-12345").unwrap()
+    }
+
+    #[test]
+    fn dual_cannot_remove_last_key_of_a_group() {
+        let (p, _) = dual_vault_with("d8-last", &[("a1", KeyGroup::A), ("b1", KeyGroup::B)]);
+        let mut v = reopen_dual(&p);
+        let audit_len = v.audit().len();
+        let before = fs::read(&p).unwrap();
+        for label in ["a1", "b1"] {
+            let id = slot_id(&v, label);
+            let r = v.remove_key(&id);
+            let expected = if label == "a1" {
+                KeyGroup::A
+            } else {
+                KeyGroup::B
+            };
+            assert!(
+                matches!(r, Err(VaultError::LastKeyInGroup(g)) if g == expected),
+                "removing the last {label} must be refused, got {:?}",
+                r
+            );
+        }
+        assert_eq!(v.header.key_slots.len(), 2);
+        assert_eq!(
+            v.audit().len(),
+            audit_len,
+            "refused removal must not be audited"
+        );
+        assert_eq!(
+            fs::read(&p).unwrap(),
+            before,
+            "refused removal must not write"
+        );
+    }
+
+    #[test]
+    fn dual_can_remove_non_last_key_then_blocks_the_last() {
+        let (p, _) = dual_vault_with(
+            "d8-non-last",
+            &[
+                ("a1", KeyGroup::A),
+                ("a2", KeyGroup::A),
+                ("b1", KeyGroup::B),
+            ],
+        );
+        let mut v = reopen_dual(&p);
+        let a1 = slot_id(&v, "a1");
+        let r = v.remove_key(&a1);
+        assert!(r.is_ok(), "removing a1 (A still has a2) failed: {r:?}");
+        let last = v.audit().last().unwrap().clone();
+        assert_eq!(last.event, "key_removed");
+        assert!(last.detail.contains("group=A"), "{}", last.detail);
+        let a2 = slot_id(&v, "a2");
+        assert!(matches!(
+            v.remove_key(&a2),
+            Err(VaultError::LastKeyInGroup(KeyGroup::A))
+        ));
+        drop(v.lock());
+        assert_eq!(
+            Vault::read_header(&p, Edition::Dual)
+                .unwrap()
+                .key_slots
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn dual_single_group_only_key_is_also_protected() {
+        let (p, _) = dual_vault_with("d8-only-a", &[("a1", KeyGroup::A)]);
+        let mut v = reopen_dual(&p);
+        let a1 = slot_id(&v, "a1");
+        assert!(matches!(
+            v.remove_key(&a1),
+            Err(VaultError::LastKeyInGroup(KeyGroup::A))
+        ));
+    }
+
+    #[test]
+    fn single_edition_can_still_remove_its_only_key() {
+        let p = fresh_path("d8-single");
+        let mut v = Vault::create(&p, "Pw-12345").unwrap();
+        let mut b = MockBackend::new();
+        let reg = v.register_key_with_label(&mut b, None, "s1").unwrap();
+        assert!(v.remove_key(&base64_encode(&reg.credential_id)).is_ok());
+        assert!(v.header.key_slots.is_empty());
+        assert_eq!(
+            v.audit().last().unwrap().detail,
+            "金鑰槽已移除（該金鑰無法再解鎖）"
+        );
+    }
+
+    #[test]
+    fn last_key_in_group_reports_only_singletons() {
+        let mut h = valid_v2_header();
+        let mut a2 = sample_key_slot(Some(KeyGroup::A));
+        a2.credential_id = "QTI=".into();
+        let mut b1 = sample_key_slot(Some(KeyGroup::B));
+        b1.credential_id = "QjE=".into();
+        h.key_slots = vec![sample_key_slot(Some(KeyGroup::A)), a2, b1];
+        assert_eq!(last_key_in_group(&h, "Y3JlZA=="), None);
+        assert_eq!(last_key_in_group(&h, "QTI="), None);
+        assert_eq!(last_key_in_group(&h, "QjE="), Some(KeyGroup::B));
+        assert_eq!(last_key_in_group(&h, "bm9uZQ=="), None);
+        let mut single = sample_header(1);
+        single.key_slots = vec![sample_key_slot(None)];
+        assert_eq!(last_key_in_group(&single, "Y3JlZA=="), None);
+    }
+
+    #[test]
+    fn last_key_in_group_error_message_is_clear() {
+        let m = VaultError::LastKeyInGroup(KeyGroup::B).to_string();
+        assert!(m.contains("B 群組的最後一支金鑰"), "{m}");
     }
 
     #[test]

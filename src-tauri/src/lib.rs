@@ -112,19 +112,32 @@ pub struct KeyInfo {
     pub label: String,
     pub key_type: fido2::KeyKind,
     pub prompt_zh: &'static str,
+    /// 雙人版：所屬群組（單人版不輸出）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<crypto::KeyGroup>,
+    /// 雙人版：是否為該群組最後一支（UI 停用移除鈕）；false 不輸出。
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub last_in_group: bool,
+}
+
+/// header → 金鑰清單（登入畫面與金鑰管理共用）。
+fn key_infos(h: &vault::Header) -> Vec<KeyInfo> {
+    h.key_slots
+        .iter()
+        .map(|s| KeyInfo {
+            credential_id: s.credential_id.clone(),
+            label: s.label.clone(),
+            key_type: s.key_type,
+            prompt_zh: s.key_type.prompt_zh(),
+            group: s.group,
+            last_in_group: vault::last_key_in_group(h, &s.credential_id).is_some(),
+        })
+        .collect()
 }
 
 impl From<&vault::Header> for Vec<KeyInfo> {
     fn from(h: &vault::Header) -> Self {
-        h.key_slots
-            .iter()
-            .map(|s| KeyInfo {
-                credential_id: s.credential_id.clone(),
-                label: s.label.clone(),
-                key_type: s.key_type,
-                prompt_zh: s.key_type.prompt_zh(),
-            })
-            .collect()
+        key_infos(h)
     }
 }
 
@@ -443,15 +456,7 @@ fn boot_info(state: tauri::State<VaultState>) -> Result<LoginScreenInfo> {
 fn read_keys_from_file(path: &std::path::Path) -> Result<Vec<KeyInfo>> {
     // 與解鎖路徑共用同一個 reader：magic/長度邊界/版本互斥都在 vault 層檢查。
     let h = vault::Vault::read_header(path, edition::current()).map_err(|e| e.to_string())?;
-    Ok(h.key_slots
-        .iter()
-        .map(|s| KeyInfo {
-            credential_id: s.credential_id.clone(),
-            label: s.label.clone(),
-            key_type: s.key_type,
-            prompt_zh: s.key_type.prompt_zh(),
-        })
-        .collect())
+    Ok(key_infos(&h))
 }
 
 /// 首次執行：建立帳號（主密碼）。
@@ -1005,6 +1010,82 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod key_info_tests {
+    use super::*;
+
+    fn header_json(v: u8, slots: serde_json::Value) -> vault::Header {
+        let mut h = serde_json::json!({
+            "v": v,
+            "argon2": {"salt": "c2FsdA=="},
+            "password_slot": {"nonce": "bm9uY2U=", "ct": "Y3Q="},
+            "key_slots": slots,
+            "created_at": "2026-10-11T00:00:00Z"
+        });
+        if v == 2 {
+            h["policy"] = serde_json::json!("dual");
+            h["dual_slot"] = serde_json::json!({"nonce": "bm9uY2U=", "ct": "Y3Q="});
+            h["dual_step_timeout_secs"] = serde_json::json!(120);
+        }
+        serde_json::from_value(h).unwrap()
+    }
+
+    fn slot(id: &str, group: Option<&str>) -> serde_json::Value {
+        let mut s = serde_json::json!({
+            "credential_id": id, "aaguid": "00", "label": id,
+            "key_type": "touch_only", "nonce": "bm9uY2U=", "ct": "Y3Q="
+        });
+        if let Some(g) = group {
+            s["group"] = serde_json::json!(g);
+        }
+        s
+    }
+
+    #[test]
+    fn dual_key_infos_carry_group_and_last_in_group() {
+        let h = header_json(
+            2,
+            serde_json::json!([
+                slot("a1", Some("A")),
+                slot("a2", Some("A")),
+                slot("b1", Some("B"))
+            ]),
+        );
+        let infos = key_infos(&h);
+        let view: Vec<(Option<crypto::KeyGroup>, bool)> =
+            infos.iter().map(|k| (k.group, k.last_in_group)).collect();
+        assert_eq!(
+            view,
+            vec![
+                (Some(crypto::KeyGroup::A), false),
+                (Some(crypto::KeyGroup::A), false),
+                (Some(crypto::KeyGroup::B), true),
+            ]
+        );
+        let json = serde_json::to_value(&infos).unwrap();
+        assert_eq!(json[0]["group"], "A");
+        assert_eq!(json[2]["last_in_group"], true);
+        assert!(json[0].get("last_in_group").is_none());
+    }
+
+    #[test]
+    fn single_key_infos_json_shape_is_unchanged() {
+        let h = header_json(1, serde_json::json!([slot("s1", None)]));
+        let json = serde_json::to_value(key_infos(&h)).unwrap();
+        let mut keys: Vec<&str> = json[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["credential_id", "key_type", "label", "prompt_zh"]
+        );
+    }
 }
 
 #[cfg(test)]

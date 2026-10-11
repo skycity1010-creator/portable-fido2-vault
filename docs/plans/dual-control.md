@@ -225,7 +225,8 @@ KEK（隨機 256-bit，加解密 payload；與 v1 相同）
 - [x] D5 雙群組註冊：槽位只包該群組 share、AAD 綁定群組與 credential（見 §11）
 - [x] D6 excludeCredentials：同一支實體金鑰只能註冊一筆（mock / raw CTAP / Windows WebAuthn，見 §11）
 - [x] D7 兩步驟登入狀態機（begin / complete / cancel / 逾時，見 §11）
-- [ ] D8–D13
+- [x] D8 群組最後一支金鑰不可刪除 + 金鑰清單群組資料（見 §11）
+- [ ] D9–D13
 
 ## 11. 驗證紀錄
 
@@ -387,3 +388,15 @@ KEK（隨機 256-bit，加解密 payload；與 v1 相同）
   - lib 3 個：`sweep_expired_dual` 會清除同一代且已逾時的暫存；未逾時或已是新一代的暫存保留。
 - TDD：10 個 assertion RED → GREEN。Rust MSVC lib：單人版 292/292、雙人版 292/292（276 + 16），無 warning；跑測試前後原始碼 SHA-256 不變；rustfmt：`lib.rs`/`vault.rs`/`crypto.rs`/`fido2.rs` 通過。
 - 仍未涵蓋（需 GUI 或 IPC 整合）：`lock`/`login_password`/`create_vault`/新的 begin 會清除暫存（都是一行指定，已人工檢查），以及計時執行緒實際觸發。留到 D10/D11 的 UI 與 E2E 驗證。
+
+### D8（2026-10-11）
+
+- `vault::last_key_in_group(header, credential_id_b64) -> Option<KeyGroup>`：只對雙人版有效；刪除該 credential 會讓所屬群組歸零時，回傳該群組。
+- `Vault::remove_key`：雙人版若是群組最後一支 → `VaultError::LastKeyInGroup(group)`（「不可刪除 A 群組的最後一支金鑰（A、B 群組各須保留至少一支）」），不改 header、不寫檔、不記 audit。
+  - 依 §4.5 一律禁止，包括另一群組還沒有金鑰時的唯一金鑰。
+  - 雙人版成功刪除時，audit detail 附加 ` group=A|B`；單人版的行為與 detail 逐字不變（可刪唯一金鑰，有回歸測試）。
+- `lib.rs`：抽出 `key_infos(header)`，登入畫面與金鑰管理共用（原本兩處重複的建構程式改呼叫它）。
+  - `KeyInfo` 新增 `group` 與 `last_in_group`（UI 用來停用移除鈕），兩者在單人版都不輸出（`skip_serializing_if`），單人版 JSON 形狀不變，有測試保證。
+  - 實際的刪除限制以 Rust 端為準，UI 只是輔助。
+- TDD：6 個 assertion RED → GREEN；另有 2 個既有行為的回歸測試（GREEN→GREEN，不算 RED）：單人版 KeyInfo JSON 形狀、單人版可刪唯一金鑰。新增測試共 8 個。
+- Rust MSVC lib：單人版 300/300、雙人版 300/300，無 warning；跑測試前後原始碼 SHA-256 不變；rustfmt 通過；Node 65/65（前端未改）。
