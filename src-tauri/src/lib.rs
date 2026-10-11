@@ -23,6 +23,7 @@ pub mod crypto;
 pub mod csv_import;
 #[cfg(feature = "real-ctap")]
 pub mod diag_log;
+pub mod edition;
 pub mod fido2;
 pub mod vault;
 #[cfg(all(windows, feature = "real-ctap"))]
@@ -111,19 +112,32 @@ pub struct KeyInfo {
     pub label: String,
     pub key_type: fido2::KeyKind,
     pub prompt_zh: &'static str,
+    /// 雙人版：所屬群組（單人版不輸出）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<crypto::KeyGroup>,
+    /// 雙人版：是否為該群組最後一支（UI 停用移除鈕）；false 不輸出。
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub last_in_group: bool,
+}
+
+/// header → 金鑰清單（登入畫面與金鑰管理共用）。
+fn key_infos(h: &vault::Header) -> Vec<KeyInfo> {
+    h.key_slots
+        .iter()
+        .map(|s| KeyInfo {
+            credential_id: s.credential_id.clone(),
+            label: s.label.clone(),
+            key_type: s.key_type,
+            prompt_zh: s.key_type.prompt_zh(),
+            group: s.group,
+            last_in_group: vault::last_key_in_group(h, &s.credential_id).is_some(),
+        })
+        .collect()
 }
 
 impl From<&vault::Header> for Vec<KeyInfo> {
     fn from(h: &vault::Header) -> Self {
-        h.key_slots
-            .iter()
-            .map(|s| KeyInfo {
-                credential_id: s.credential_id.clone(),
-                label: s.label.clone(),
-                key_type: s.key_type,
-                prompt_zh: s.key_type.prompt_zh(),
-            })
-            .collect()
+        key_infos(h)
     }
 }
 
@@ -259,6 +273,25 @@ struct AppInner {
     vault: Option<vault::Vault>,
     backend: Box<dyn fido2::FidoBackend>,
     pending_csv_import: Option<PendingCsvImport>,
+    /// 雙人版兩步驟登入：第一步完成後的暫存（share 只在 Rust 端，drop 時清零）。
+    dual_pending: Option<vault::DualPending>,
+    /// 每次第一步遞增；逾時計時器只清除自己那一代的暫存。
+    dual_generation: u64,
+}
+
+/// 逾時計時器：同一代且已逾時 → 取走暫存、記 `fido2-dual-timeout`（share 清零）。
+fn sweep_expired_dual(g: &mut AppInner, generation: u64, now: std::time::Instant) -> bool {
+    if g.dual_generation != generation {
+        return false;
+    }
+    match g.dual_pending.as_ref() {
+        Some(pending) if pending.is_expired(now) => {}
+        _ => return false,
+    }
+    if let Some(pending) = g.dual_pending.take() {
+        let _ = pending.expire();
+    }
+    true
 }
 
 fn entries_fingerprint(entries: &[vault::Entry]) -> Result<[u8; 32]> {
@@ -280,6 +313,8 @@ impl AppInner {
             vault: None,
             backend: make_backend(window_handle)?,
             pending_csv_import: None,
+            dual_pending: None,
+            dual_generation: 0,
         })
     }
 }
@@ -392,6 +427,12 @@ fn raise_key_operation_window(
 
 // ─────────────────────────── commands ───────────────────────────
 
+/// 產品版本（"single" / "dual"），前端依此切換雙群組控管 UI。
+#[tauri::command]
+fn get_edition() -> edition::Edition {
+    edition::current()
+}
+
 /// 啟動畫面資訊：是否有金庫、已註冊金鑰清單（供登入畫面）。
 #[tauri::command]
 fn boot_info(state: tauri::State<VaultState>) -> Result<LoginScreenInfo> {
@@ -413,22 +454,9 @@ fn boot_info(state: tauri::State<VaultState>) -> Result<LoginScreenInfo> {
 
 /// 讀取 vault.db 的 header（不需 KEK）→ 金鑰清單。
 fn read_keys_from_file(path: &std::path::Path) -> Result<Vec<KeyInfo>> {
-    let buf = std::fs::read(path).map_err(|e| e.to_string())?;
-    if buf.len() < 10 || &buf[..6] != crypto::VAULT_MAGIC {
-        return Err("非 vault.db".into());
-    }
-    let header_len = u32::from_le_bytes(buf[6..10].try_into().map_err(|_| "bad len")?) as usize;
-    let header_json = std::str::from_utf8(&buf[10..10 + header_len]).map_err(|e| e.to_string())?;
-    let h: vault::Header = serde_json::from_str(header_json).map_err(|e| e.to_string())?;
-    Ok(h.key_slots
-        .iter()
-        .map(|s| KeyInfo {
-            credential_id: s.credential_id.clone(),
-            label: s.label.clone(),
-            key_type: s.key_type,
-            prompt_zh: s.key_type.prompt_zh(),
-        })
-        .collect())
+    // 與解鎖路徑共用同一個 reader：magic/長度邊界/版本互斥都在 vault 層檢查。
+    let h = vault::Vault::read_header(path, edition::current()).map_err(|e| e.to_string())?;
+    Ok(key_infos(&h))
 }
 
 /// 首次執行：建立帳號（主密碼）。
@@ -441,8 +469,10 @@ fn create_vault(state: tauri::State<VaultState>, password: String) -> Result<()>
     if path.exists() {
         return Err("vault.db 已存在（請改走登入）".into());
     }
-    let v = vault::Vault::create(&path, &password).map_err(|e| e.to_string())?;
+    let v = vault::Vault::create_for(&path, &password, edition::current())
+        .map_err(|e| e.to_string())?;
     state.with_lock(|g| {
+        g.dual_pending = None;
         g.vault = Some(v);
         Ok(())
     })?;
@@ -453,9 +483,12 @@ fn create_vault(state: tauri::State<VaultState>, password: String) -> Result<()>
 #[tauri::command]
 fn login_password(state: tauri::State<VaultState>, password: String) -> Result<Vec<vault::Entry>> {
     let path = path_from_state_or_default();
-    let v = vault::Vault::open_password(&path, &password).map_err(|e| e.to_string())?;
+    let v = vault::Vault::open_password_for(&path, &password, edition::current())
+        .map_err(|e| e.to_string())?;
     let entries = v.entries().to_vec();
     state.with_lock(|g| {
+        // 改用主密碼登入：放棄進行中的兩步驟登入（share 清零）。
+        g.dual_pending = None;
         g.vault = Some(v);
         Ok(())
     })?;
@@ -507,11 +540,120 @@ fn login_any_key(
     Ok(entries)
 }
 
+/// 雙人版兩步驟登入第一步的回應（不含任何機密）。
+#[derive(serde::Serialize)]
+struct DualBeginInfo {
+    first_group: crypto::KeyGroup,
+    first_label: String,
+    second_group: crypto::KeyGroup,
+    timeout_secs: u32,
+    remaining_ms: u64,
+}
+
+fn require_dual_edition() -> Result<()> {
+    if edition::current() == edition::Edition::Dual {
+        Ok(())
+    } else {
+        Err("此功能僅限雙群組控管版".into())
+    }
+}
+
+/// 雙人版金鑰登入第一步：任一群組的金鑰。成功後暫存該群組 share 並開始倒數。
+#[tauri::command]
+fn login_dual_begin(
+    window: tauri::WebviewWindow,
+    state: tauri::State<VaultState>,
+    pin: Option<String>,
+) -> Result<DualBeginInfo> {
+    require_dual_edition()?;
+    let require_foreground = state.with_lock(|g| Ok(g.backend.uses_brokered_key_selection()))?;
+    let owner_hwnd = raise_key_operation_window(&window, require_foreground)?;
+    let path = path_from_state_or_default();
+    state.with_lock(|g| {
+        // 新的第一步一律先丟棄舊的暫存（清零），避免殘留 share。
+        g.dual_pending = None;
+        g.backend.set_webauthn_parent_hwnd(owner_hwnd);
+        let pending = vault::Vault::dual_login_begin(
+            &path,
+            pin.as_deref(),
+            g.backend.as_mut(),
+            &mut std::time::Instant::now,
+        )
+        .map_err(|e| e.to_string())?;
+        let remaining = pending.remaining(std::time::Instant::now());
+        let info = DualBeginInfo {
+            first_group: pending.first_group(),
+            first_label: pending.first_label().to_owned(),
+            second_group: pending.first_group().other(),
+            timeout_secs: pending.timeout_secs(),
+            remaining_ms: remaining.as_millis() as u64,
+        };
+        g.dual_generation = g.dual_generation.wrapping_add(1);
+        let generation = g.dual_generation;
+        g.dual_pending = Some(pending);
+        // Rust 端主動逾時清除，不依賴前端呼叫（§4.3、R5）。
+        let app = window.app_handle().clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(remaining + std::time::Duration::from_millis(250));
+            let state = app.state::<VaultState>();
+            let _ = state.with_lock(|g| {
+                sweep_expired_dual(g, generation, std::time::Instant::now());
+                Ok(())
+            });
+        });
+        Ok(info)
+    })
+}
+
+/// 雙人版金鑰登入第二步：只接受另一群組的金鑰。無論成功或失敗，暫存都會被取走（一次性）。
+#[tauri::command]
+fn login_dual_complete(
+    window: tauri::WebviewWindow,
+    state: tauri::State<VaultState>,
+    pin: Option<String>,
+) -> Result<Vec<vault::Entry>> {
+    require_dual_edition()?;
+    let require_foreground = state.with_lock(|g| Ok(g.backend.uses_brokered_key_selection()))?;
+    let owner_hwnd = raise_key_operation_window(&window, require_foreground)?;
+    let v = state.with_lock(|g| {
+        let pending = g
+            .dual_pending
+            .take()
+            .ok_or_else(|| "沒有進行中的第一步驗證，請從第一步重新開始".to_string())?;
+        g.backend.set_webauthn_parent_hwnd(owner_hwnd);
+        vault::Vault::dual_login_complete(
+            pending,
+            pin.as_deref(),
+            g.backend.as_mut(),
+            &mut std::time::Instant::now,
+        )
+        .map_err(|e| e.to_string())
+    })?;
+    let entries = v.entries().to_vec();
+    state.with_lock(|g| {
+        g.vault = Some(v);
+        Ok(())
+    })?;
+    Ok(entries)
+}
+
+/// 雙人版：取消進行中的兩步驟登入（記 sidecar，share 清零）。沒有暫存時為 no-op。
+#[tauri::command]
+fn login_dual_cancel(state: tauri::State<VaultState>) -> Result<()> {
+    require_dual_edition()?;
+    let pending = state.with_lock(|g| Ok(g.dual_pending.take()))?;
+    if let Some(pending) = pending {
+        pending.cancel().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 /// 上鎖（手動或閒置）。回傳登入畫面資訊。
 #[tauri::command]
 fn lock(state: tauri::State<VaultState>, reason: Option<String>) -> Result<LoginScreenInfo> {
     let (header, brokered_key_login) = state.with_lock(|g| {
         let brokered_key_login = g.backend.uses_brokered_key_selection();
+        g.dual_pending = None;
         match g.vault.take() {
             Some(v) => {
                 g.pending_csv_import = None;
@@ -709,6 +851,7 @@ fn register_key(
     state: tauri::State<VaultState>,
     pin: Option<String>,
     label: String,
+    group: Option<crypto::KeyGroup>,
 ) -> Result<fido2::RegisteredCredential> {
     let require_foreground = state.with_lock(|g| Ok(g.backend.uses_brokered_key_selection()))?;
     let owner_hwnd = raise_key_operation_window(&window, require_foreground)?;
@@ -716,7 +859,8 @@ fn register_key(
     state.with_lock(|g| match g.vault.as_mut() {
         Some(v) => {
             g.backend.set_webauthn_parent_hwnd(owner_hwnd);
-            v.register_key_with_label(g.backend.as_mut(), pin.as_deref(), &label)
+            // 單人版不可帶群組、雙人版必須帶群組（vault 層 fail closed，不碰 authenticator）。
+            v.register_key_for(g.backend.as_mut(), pin.as_deref(), &label, group)
                 .map_err(|e| e.to_string())
         }
         None => Err("金庫未解鎖".to_string()),
@@ -741,6 +885,17 @@ fn suggest_key_label(state: tauri::State<VaultState>) -> Result<String> {
 fn remove_key(state: tauri::State<VaultState>, credential_id: String) -> Result<()> {
     with_unlocked(&state, |v| {
         v.remove_key(&credential_id).map_err(|e| e.to_string())
+    })
+}
+
+#[tauri::command]
+fn set_dual_step_timeout(state: tauri::State<VaultState>, secs: u32) -> Result<()> {
+    update_dual_step_timeout(&state, secs)
+}
+
+fn update_dual_step_timeout(state: &VaultState, secs: u32) -> Result<()> {
+    with_unlocked(state, |v| {
+        v.set_dual_step_timeout(secs).map_err(|e| e.to_string())
     })
 }
 
@@ -835,11 +990,15 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            get_edition,
             boot_info,
             create_vault,
             login_password,
             login_key,
             login_any_key,
+            login_dual_begin,
+            login_dual_complete,
+            login_dual_cancel,
             lock,
             list_entries,
             preview_csv_import,
@@ -855,6 +1014,7 @@ pub fn run() {
             suggest_key_label,
             remove_key,
             set_idle_lock,
+            set_dual_step_timeout,
             get_vault_settings,
             set_password_history_limit,
             clear_clipboard_if_matches,
@@ -862,6 +1022,230 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod key_info_tests {
+    use super::*;
+
+    pub(super) fn header_json(v: u8, slots: serde_json::Value) -> vault::Header {
+        let mut h = serde_json::json!({
+            "v": v,
+            "argon2": {"salt": "c2FsdA=="},
+            "password_slot": {"nonce": "bm9uY2U=", "ct": "Y3Q="},
+            "key_slots": slots,
+            "created_at": "2026-10-11T00:00:00Z"
+        });
+        if v == 2 {
+            h["policy"] = serde_json::json!("dual");
+            h["dual_slot"] = serde_json::json!({"nonce": "bm9uY2U=", "ct": "Y3Q="});
+            h["dual_step_timeout_secs"] = serde_json::json!(120);
+        }
+        serde_json::from_value(h).unwrap()
+    }
+
+    pub(super) fn slot(id: &str, group: Option<&str>) -> serde_json::Value {
+        let mut s = serde_json::json!({
+            "credential_id": id, "aaguid": "00", "label": id,
+            "key_type": "touch_only", "nonce": "bm9uY2U=", "ct": "Y3Q="
+        });
+        if let Some(g) = group {
+            s["group"] = serde_json::json!(g);
+        }
+        s
+    }
+
+    #[test]
+    fn dual_key_infos_carry_group_and_last_in_group() {
+        let h = header_json(
+            2,
+            serde_json::json!([
+                slot("a1", Some("A")),
+                slot("a2", Some("A")),
+                slot("b1", Some("B"))
+            ]),
+        );
+        let infos = key_infos(&h);
+        let view: Vec<(Option<crypto::KeyGroup>, bool)> =
+            infos.iter().map(|k| (k.group, k.last_in_group)).collect();
+        assert_eq!(
+            view,
+            vec![
+                (Some(crypto::KeyGroup::A), false),
+                (Some(crypto::KeyGroup::A), false),
+                (Some(crypto::KeyGroup::B), true),
+            ]
+        );
+        let json = serde_json::to_value(&infos).unwrap();
+        assert_eq!(json[0]["group"], "A");
+        assert_eq!(json[2]["last_in_group"], true);
+        assert!(json[0].get("last_in_group").is_none());
+    }
+
+    #[test]
+    fn single_key_infos_json_shape_is_unchanged() {
+        let h = header_json(1, serde_json::json!([slot("s1", None)]));
+        let json = serde_json::to_value(key_infos(&h)).unwrap();
+        let mut keys: Vec<&str> = json[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["credential_id", "key_type", "label", "prompt_zh"]
+        );
+    }
+}
+
+#[cfg(test)]
+mod d8_list_review_tests {
+    use super::*;
+
+    #[test]
+    fn d8_key_list_values_order_and_duplicate_hint_match_actual_target() {
+        let mut h = key_info_tests::header_json(2, serde_json::json!([]));
+        assert!(key_infos(&h).is_empty());
+        for slots in [
+            serde_json::json!([key_info_tests::slot("a1", Some("A"))]),
+            serde_json::json!([key_info_tests::slot("b1", Some("B"))]),
+            serde_json::json!([
+                key_info_tests::slot("dup", Some("A")),
+                key_info_tests::slot("dup", Some("B")),
+                key_info_tests::slot("b2", Some("B"))
+            ]),
+            serde_json::json!([
+                key_info_tests::slot("dup", Some("A")),
+                key_info_tests::slot("dup", Some("A"))
+            ]),
+        ] {
+            h = key_info_tests::header_json(2, slots);
+            assert!(vault::check_header_edition(&h, edition::Edition::Dual).is_ok());
+            let infos = key_infos(&h);
+            assert_eq!(infos.len(), h.key_slots.len());
+            for (info, slot) in infos.iter().zip(&h.key_slots) {
+                assert_eq!(info.credential_id, slot.credential_id);
+                assert_eq!(info.label, slot.label);
+                assert_eq!(info.key_type, slot.key_type);
+                assert_eq!(info.prompt_zh, slot.key_type.prompt_zh());
+                assert_eq!(info.group, slot.group);
+                // A hint describes the actual first-match credential removal, not this row's group.
+                assert_eq!(
+                    info.last_in_group,
+                    vault::last_key_in_group(&h, &slot.credential_id).is_some()
+                );
+            }
+            if h.key_slots.len() == 3 {
+                assert!(infos[0].last_in_group && infos[1].last_in_group);
+                assert!(!infos[2].last_in_group);
+            }
+            let converted: Vec<KeyInfo> = (&h).into();
+            assert_eq!(
+                serde_json::to_value(converted).unwrap(),
+                serde_json::to_value(infos).unwrap()
+            );
+        }
+        let single = key_info_tests::header_json(
+            1,
+            serde_json::json!([
+                key_info_tests::slot("s1", None),
+                key_info_tests::slot("s2", None)
+            ]),
+        );
+        let infos = key_infos(&single);
+        for (info, slot) in infos.iter().zip(&single.key_slots) {
+            assert_eq!(info.credential_id, slot.credential_id);
+            assert_eq!(info.label, slot.label);
+            assert_eq!(info.key_type, slot.key_type);
+            assert_eq!(info.prompt_zh, slot.key_type.prompt_zh());
+            assert!(info.group.is_none() && !info.last_in_group);
+        }
+    }
+
+    #[test]
+    fn d8_file_reader_and_unlocked_header_conversion_agree() {
+        let d = std::env::temp_dir().join(format!("f2v-d8-list-review-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("vault.db");
+        // Synthetic fixture only; never target an existing file.
+        assert!(!p.exists());
+        let ed = edition::current();
+        let mut v = vault::Vault::create_for(&p, "D8-Synthetic-Pw", ed).unwrap();
+        for (label, group) in [("a", crypto::KeyGroup::A), ("b", crypto::KeyGroup::B)] {
+            let mut backend = MockBackend::new();
+            let group = (ed == edition::Edition::Dual).then_some(group);
+            assert!(v.register_key_for(&mut backend, None, label, group).is_ok());
+        }
+        let h = v.lock();
+        let expected: Vec<KeyInfo> = (&h).into();
+        assert_eq!(
+            serde_json::to_value(read_keys_from_file(&p).unwrap()).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+        std::fs::remove_file(&p).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod dual_pending_sweep_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn inner_with(pending: Option<vault::DualPending>, generation: u64) -> AppInner {
+        AppInner {
+            vault: None,
+            backend: Box::new(MockBackend::new()),
+            pending_csv_import: None,
+            dual_pending: pending,
+            dual_generation: generation,
+        }
+    }
+
+    fn sidecar_path(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("f2v-lib-{tag}-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&d);
+        let p = d.join("vault.db");
+        let _ = std::fs::remove_file(vault::failures_path(&p));
+        p
+    }
+
+    #[test]
+    fn sweep_clears_expired_pending_of_same_generation() {
+        let p = sidecar_path("sweep-expired");
+        let t0 = Instant::now();
+        let mut g = inner_with(Some(vault::DualPending::for_test(p.clone(), t0)), 3);
+        assert!(sweep_expired_dual(&mut g, 3, t0 + Duration::from_secs(1)));
+        assert!(g.dual_pending.is_none());
+        let text = std::fs::read_to_string(vault::failures_path(&p)).unwrap();
+        assert!(text.contains("fido2-dual-timeout"), "{text}");
+    }
+
+    #[test]
+    fn sweep_keeps_pending_that_is_not_expired() {
+        let p = sidecar_path("sweep-live");
+        let t0 = Instant::now();
+        let mut g = inner_with(
+            Some(vault::DualPending::for_test(
+                p.clone(),
+                t0 + Duration::from_secs(60),
+            )),
+            3,
+        );
+        assert!(!sweep_expired_dual(&mut g, 3, t0));
+        assert!(g.dual_pending.is_some());
+        assert!(!vault::failures_path(&p).exists());
+    }
+
+    #[test]
+    fn sweep_ignores_newer_generation() {
+        let p = sidecar_path("sweep-newer");
+        let t0 = Instant::now();
+        let mut g = inner_with(Some(vault::DualPending::for_test(p.clone(), t0)), 4);
+        assert!(!sweep_expired_dual(&mut g, 3, t0 + Duration::from_secs(1)));
+        assert!(g.dual_pending.is_some());
+    }
 }
 
 #[cfg(test)]
@@ -1064,5 +1448,94 @@ mod clipboard_match_tests {
         let unterminated: Vec<u16> = "expected".encode_utf16().collect();
         assert!(!clipboard_text_matches(&unterminated, "expected"));
         assert!(!clipboard_text_matches(&[], ""));
+    }
+}
+
+#[cfg(test)]
+mod d9_settings_ipc_tests {
+    use super::*;
+
+    fn state(vault: Option<vault::Vault>) -> VaultState {
+        VaultState(Mutex::new(AppInner {
+            vault,
+            backend: Box::new(fido2::UnavailableBackend::new(3)),
+            pending_csv_import: None,
+            dual_pending: None,
+            dual_generation: 0,
+        }))
+    }
+
+    #[test]
+    fn d9_ipc_locked_session_refuses_without_accessing_settings() {
+        let state = state(None);
+        assert_eq!(
+            update_dual_step_timeout(&state, 60).unwrap_err(),
+            "金庫未解鎖"
+        );
+        assert_eq!(
+            update_dual_step_timeout(&state, 0).unwrap_err(),
+            "金庫未解鎖"
+        );
+        state
+            .with_lock(|g| {
+                assert!(g.vault.is_none());
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn d9_ipc_unlocked_session_updates_and_core_checks_bounds() {
+        let dir = std::env::var_os("TMPDIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let p = dir.join(format!("d9-ipc-{}.db", rand::random::<u64>()));
+        let state = state(Some(
+            vault::Vault::create_dual(&p, "synthetic-d9-password").unwrap(),
+        ));
+        assert!(update_dual_step_timeout(&state, 60).is_ok());
+        state
+            .with_lock(|g| {
+                assert_eq!(
+                    g.vault.as_ref().unwrap().settings().dual_step_timeout_secs,
+                    Some(60)
+                );
+                Ok(())
+            })
+            .unwrap();
+        let before = std::fs::read(&p).unwrap();
+        assert!(update_dual_step_timeout(&state, 0).is_err());
+        assert!(std::fs::read(&p).unwrap() == before);
+        assert_eq!(
+            vault::Vault::read_header(&p, edition::Edition::Dual)
+                .unwrap()
+                .dual_step_timeout_secs,
+            Some(60)
+        );
+    }
+
+    #[test]
+    fn d9_ipc_command_registered_and_uses_the_tested_unlocked_guard() {
+        let source = include_str!("lib.rs");
+        let commands = source
+            .split(".invoke_handler(tauri::generate_handler![")
+            .nth(1)
+            .unwrap()
+            .split("])")
+            .next()
+            .unwrap();
+        assert!(commands
+            .lines()
+            .any(|l| l.trim() == "set_dual_step_timeout,"));
+        // Split deliberately avoids finding this test itself as the command body.
+        let marker = ["fn set_dual_step_", "timeout(state:"].concat();
+        let body = source
+            .split(&marker)
+            .nth(1)
+            .expect("Tauri setter exists")
+            .split("#[tauri::command]")
+            .next()
+            .unwrap();
+        assert!(body.contains("update_dual_step_timeout(&state, secs)"));
     }
 }

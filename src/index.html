@@ -10,7 +10,7 @@
   <!-- ─────────── 登入 / 建立畫面 ─────────── -->
   <div id="screen-login" class="screen hidden">
     <div class="login-card">
-      <h1>🔐 可攜式 FIDO2 密碼金庫</h1>
+      <h1>🔐 可攜式 FIDO2 密碼金庫<span id="edition-badge" class="hidden">（雙群組控管版）</span></h1>
       <p class="sub" id="login-sub">可使用主密碼或任一支已註冊金鑰登入</p>
 
       <!-- 建立帳號（首次執行） -->
@@ -37,6 +37,15 @@
           <input type="password" id="login-pin" autocomplete="off" />
         </div>
         <button id="btn-login-key" class="primary hidden">以金鑰登入</button>
+        <div id="dual-login-hint" class="muted hidden" role="status" aria-live="polite"></div>
+        <div id="dual-step-panel" class="dual-step hidden" role="status" aria-live="polite">
+          <div id="dual-step-text"></div>
+          <div id="dual-countdown" class="mono"></div>
+          <div class="row">
+            <button id="btn-dual-complete" class="primary" type="button">完成第二步驗證</button>
+            <button id="btn-dual-cancel" type="button">取消</button>
+          </div>
+        </div>
         <div id="key-login-status" class="muted" aria-live="polite"></div>
       </div>
 
@@ -51,6 +60,7 @@
       <span id="lock-status" class="muted">已解鎖</span>
       <button id="btn-lock">上鎖</button>
     </header>
+    <div id="breakglass-banner" class="warn hidden" role="alert">⚠️ <b>本次以主密碼緊急登入（break-glass）</b>：已略過 A、B 雙群組金鑰控管，本次登入已記錄於軌跡紀錄。</div>
 
     <nav class="tabs">
       <button data-tab="entries" class="active">條目</button>
@@ -115,7 +125,8 @@
     <!-- 金鑰管理 -->
     <section id="tab-keys" class="tab hidden">
       <h3>已註冊 FIDO2 金鑰</h3>
-      <p class="muted">任一支已註冊金鑰皆可解鎖金庫。移除後該金鑰<b>無法再解鎖</b>（不可逆）。</p>
+      <p id="keys-hint" class="muted">任一支已註冊金鑰皆可解鎖金庫。移除後該金鑰<b>無法再解鎖</b>（不可逆）。</p>
+      <div id="dual-key-status" class="muted hidden" role="status" aria-live="polite"></div>
       <div id="keys-list"></div>
       <div class="row" style="margin-top:12px">
         <button id="btn-register-key" class="primary">＋ 註冊新金鑰</button>
@@ -147,6 +158,15 @@
         <button id="btn-set-password-history-limit" class="primary">套用</button>
       </div>
       <p class="muted">只保留最近 N 個舊密碼版本；不包含目前密碼。調低上限時會立即移除最舊版本。</p>
+      <div id="dual-settings" class="hidden">
+        <label for="dual-step-timeout">雙群組金鑰登入第二步等待時限（秒，30–600）</label>
+        <div class="row">
+          <input id="dual-step-timeout" type="number" min="30" max="600" value="120" style="width:80px" />
+          <button id="btn-set-dual-step-timeout" class="primary">套用</button>
+        </div>
+        <p id="dual-timeout-feedback" class="muted hidden" role="status" aria-live="polite" aria-atomic="true"></p>
+        <p class="muted">第一支金鑰驗證後，另一群組成員須在此時限內完成第二步；自下次金鑰登入起生效。</p>
+      </div>
       <div class="warn" style="margin-top:16px">⚠️ <b>無復原機制</b>：金鑰全失 + 忘記主密碼 = 資料永久無法取回（設計如此）。</div>
     </section>
   </div>
@@ -174,6 +194,11 @@
     <p class="warn">⚠️ 名稱會以明文保存在金庫檔案的標頭中；請勿輸入密碼或敏感個人資料。</p>
     <label for="key-name-input">辨識名稱</label>
     <input id="key-name-input" type="text" required autocomplete="off" aria-describedby="key-name-description key-name-status" />
+    <fieldset id="key-group-fieldset" class="hidden">
+      <legend>所屬群組（必選；註冊後不可修改）</legend>
+      <label><input type="radio" name="key-group" id="key-group-a" value="A" /> A 群組</label>
+      <label><input type="radio" name="key-group" id="key-group-b" value="B" /> B 群組</label>
+    </fieldset>
     <div id="key-name-status" class="error" role="alert" aria-live="assertive"></div>
     <div class="row">
       <button id="btn-confirm-key-name" class="primary" type="button">繼續註冊</button>

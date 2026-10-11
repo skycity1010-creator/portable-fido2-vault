@@ -241,3 +241,13 @@ td .mono { font-family: Consolas, monospace; color: var(--muted); }
 #entry-delete-dialog p { overflow-wrap: anywhere; }
 #entry-delete-dialog .row { justify-content: flex-end; }
 #btn-confirm-entry-delete { background: var(--danger); }
+
+/* 雙群組控管版 */
+#edition-badge { font-size: .6em; color: var(--muted); margin-left: 6px; }
+.dual-step { border: 1px solid var(--accent); border-radius: 10px; padding: 12px; margin-top: 10px; background: rgba(79,140,255,.08); }
+#dual-countdown { font-size: 18px; margin: 6px 0; }
+#key-group-fieldset { border: 1px solid var(--border); border-radius: 8px; margin: 10px 0; padding: 8px 12px; }
+#key-group-fieldset label { display: inline-flex; align-items: center; gap: 6px; margin-right: 16px; }
+#key-group-fieldset input { width: auto; }
+.key-group h4 { margin: 12px 0 6px; }
+#breakglass-banner { margin: 8px 16px; }

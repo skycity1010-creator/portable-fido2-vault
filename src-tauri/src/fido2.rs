@@ -115,6 +115,8 @@ pub enum FidoError {
     PrfNotSupported,
     /// Windows WebAuthn 未回報 hmac-secret 建立成功；系統端可能已留下一個無 vault slot 的 credential。
     PrfNotConfirmed,
+    /// makeCredential 的 excludeCredentials 命中：此實體金鑰已持有本金庫的 credential（dual-control Q3）。
+    CredentialExcluded,
     NotSupported(String),
     Internal(String),
     /// FIDO HID open 被 Win32 拒絕（os error 5/32）：只證明此次 open 失敗，不代表已識別 holder；
@@ -140,6 +142,10 @@ impl std::fmt::Display for FidoError {
             Self::PrfNotConfirmed => write!(
                 f,
                 "Windows WebAuthn 未確認此金鑰支援 hmac-secret/PRF；vault 未新增金鑰槽，但金鑰端可能已建立一筆未被金庫使用的 credential。"
+            ),
+            Self::CredentialExcluded => write!(
+                f,
+                "此安全性金鑰已註冊於本金庫（同一支實體金鑰只能註冊一次，且只能屬於 A 或 B 其中一個群組）；未新增金鑰槽。"
             ),
             Self::NotSupported(m) => write!(f, "不支援：{m}"),
             Self::Internal(m) => write!(f, "FIDO2 內部錯誤：{m}"),
@@ -201,6 +207,23 @@ pub trait FidoBackend: Send {
         credential_id: &[u8],
         pin: Option<&str>,
     ) -> Result<[u8; 32], FidoError>;
+
+    /// 註冊新 credential，並要求 authenticator 排除 `exclude` 中的 credential（excludeCredentials）。
+    /// 同一支實體金鑰已持有其中任一筆 → `FidoError::CredentialExcluded`，不建立新 credential。
+    /// 預設實作：清單為空時等同 `register_credential`；清單非空而後端未實作排除時 fail closed。
+    fn register_credential_excluding(
+        &mut self,
+        detected: &DetectedKey,
+        pin: Option<&str>,
+        exclude: &[Vec<u8>],
+    ) -> Result<RegisteredCredential, FidoError> {
+        if exclude.is_empty() {
+            return self.register_credential(detected, pin);
+        }
+        Err(FidoError::NotSupported(
+            "此金鑰後端無法排除已註冊的金鑰；為避免同一支金鑰重複註冊，已拒絕註冊".into(),
+        ))
+    }
 
     /// Selects one credential from the registered candidates and returns its ID with its PRF secret.
     /// Interactive broker backends should submit all candidates in one operation and report the
@@ -308,6 +331,15 @@ impl FidoBackend for UnavailableBackend {
         Err(self.error())
     }
 
+    fn register_credential_excluding(
+        &mut self,
+        _detected: &DetectedKey,
+        _pin: Option<&str>,
+        _exclude: &[Vec<u8>],
+    ) -> Result<RegisteredCredential, FidoError> {
+        Err(self.error())
+    }
+
     /// 維持 Windows 單一「以金鑰登入」入口的 UI。
     fn uses_brokered_key_selection(&self) -> bool {
         true
@@ -341,6 +373,10 @@ pub struct MockBackend {
     next_kind_override: Option<KeyKind>,
     /// 模擬金鑰是否支援 hmac-secret/PRF（預設 true = YubiKey 5+；--no-prf 驗證裁決②）。
     prf_enabled: bool,
+    /// 測試用：下一次 detect 視為「同一支實體金鑰再次插入」（不推進 seq）。
+    reuse_device_next: bool,
+    /// 每個 mock 實例代表一組獨立的實體金鑰；與 seq 一起決定「裝置標記」。
+    instance_key: [u8; 16],
 }
 
 impl Default for MockBackend {
@@ -356,7 +392,31 @@ impl MockBackend {
             seq: 0,
             next_kind_override: None,
             prf_enabled: true,
+            reuse_device_next: false,
+            instance_key: {
+                let mut k = [0u8; 16];
+                use rand::RngCore;
+                rand::rngs::OsRng.fill_bytes(&mut k);
+                k
+            },
         }
+    }
+
+    /// 目前這支模擬金鑰的裝置標記（8B）：嵌在 credential_id[1..9]，供 excludeCredentials 判斷
+    /// 「是否由同一支金鑰簽發」——模擬實體 authenticator 只認得自己簽發的 credential。
+    fn device_tag(&self) -> [u8; 8] {
+        let mut mac = Hmac::<Sha256>::new_from_slice(&self.instance_key).expect("hmac key any len");
+        mac.update(b"f2vlt-mock-device-v1");
+        mac.update(&self.seq.to_le_bytes());
+        let out = mac.finalize().into_bytes();
+        let mut tag = [0u8; 8];
+        tag.copy_from_slice(&out[..8]);
+        tag
+    }
+
+    /// 模擬「同一支實體金鑰再次插入」：下一次 detect 沿用上一支金鑰（驗證 excludeCredentials）。
+    pub fn reuse_device(&mut self) {
+        self.reuse_device_next = true;
     }
 
     /// 設定下一支偵測到的金鑰類型（CLI register-key --kind pin 用）。
@@ -384,11 +444,13 @@ impl MockBackend {
     }
 
     /// credential_id[0] = kind 編碼（保留位元組，讓無狀態 mock 在登入時還原類型）。
-    fn make_credential_id(kind: KeyKind) -> Vec<u8> {
+    /// credential_id 版面：`[kind, device_tag(8), random(23)]`（長度 32 與 kind 前綴不變）。
+    fn make_credential_id(&self, kind: KeyKind) -> Vec<u8> {
         let mut id = [0u8; 32];
         use rand::RngCore;
         rand::rngs::OsRng.fill_bytes(&mut id);
         id[0] = kind.to_u8();
+        id[1..9].copy_from_slice(&self.device_tag());
         id.to_vec()
     }
 
@@ -417,7 +479,12 @@ impl FidoBackend for MockBackend {
                 k
             }
         };
-        self.seq += 1; // 每支偵測到的金鑰都有獨立編號（label/AAGUID 唯一）
+        if self.reuse_device_next {
+            // 同一支實體金鑰再次插入：沿用 seq（裝置標記相同）。
+            self.reuse_device_next = false;
+        } else {
+            self.seq += 1; // 每支偵測到的金鑰都有獨立編號（label/AAGUID 唯一）
+        }
         let aaguid = mock_aaguid(self.seq);
         Ok(DetectedKey {
             kind,
@@ -432,11 +499,28 @@ impl FidoBackend for MockBackend {
         _pin: Option<&str>,
     ) -> Result<RegisteredCredential, FidoError> {
         Ok(RegisteredCredential {
-            credential_id: Self::make_credential_id(detected.kind),
+            credential_id: self.make_credential_id(detected.kind),
             aaguid: detected.aaguid,
             label: detected.label.clone(),
             kind: detected.kind,
         })
+    }
+
+    fn register_credential_excluding(
+        &mut self,
+        detected: &DetectedKey,
+        pin: Option<&str>,
+        exclude: &[Vec<u8>],
+    ) -> Result<RegisteredCredential, FidoError> {
+        // 模擬 authenticator：排除清單中有本裝置簽發的 credential → CTAP2_ERR_CREDENTIAL_EXCLUDED。
+        let tag = self.device_tag();
+        if exclude
+            .iter()
+            .any(|id| id.len() >= 9 && id[1..9] == tag[..])
+        {
+            return Err(FidoError::CredentialExcluded);
+        }
+        self.register_credential(detected, pin)
     }
 
     fn get_prf_secret(
@@ -846,6 +930,7 @@ mod real {
             &mut self,
             detected: &DetectedKey,
             pin: Option<&str>,
+            exclude: &[Vec<u8>],
         ) -> Result<RegisteredCredential, FidoError> {
             let args = RegisterArgs {
                 client_data_hash: Self::op_client_data_hash(b"register"),
@@ -859,7 +944,8 @@ mod real {
                 pub_cred_params: vec![PublicKeyCredentialParameters {
                     alg: COSEAlgorithm::ES256,
                 }],
-                exclude_list: vec![],
+                // excludeCredentials：金鑰已持有其中任一筆 → CTAP2_ERR_CREDENTIAL_EXCLUDED。
+                exclude_list: exclude_descriptors(exclude),
                 user_verification_req: UserVerificationRequirement::Preferred,
                 resident_key_req: ResidentKeyRequirement::Preferred,
                 extensions: AuthenticationExtensionsClientInputs {
@@ -1067,7 +1153,18 @@ mod real {
             pin: Option<&str>,
         ) -> Result<RegisteredCredential, FidoError> {
             // contention-aware retry：makeCredential 前 device open 被拒 → backoff 重試。
-            self.retry_on_contention("register", |b: &mut Self| b.do_register(detected, pin))
+            self.retry_on_contention("register", |b: &mut Self| b.do_register(detected, pin, &[]))
+        }
+
+        fn register_credential_excluding(
+            &mut self,
+            detected: &DetectedKey,
+            pin: Option<&str>,
+            exclude: &[Vec<u8>],
+        ) -> Result<RegisteredCredential, FidoError> {
+            self.retry_on_contention("register", |b: &mut Self| {
+                b.do_register(detected, pin, exclude)
+            })
         }
 
         fn get_prf_secret(
@@ -1151,11 +1248,24 @@ mod real {
         }
     }
 
+    /// excludeCredentials → CTAP2 descriptors（transports 不限定）。清單過長時由 authenticator-rs
+    /// preflight 分批；仍無法送出則註冊失敗（fail closed，不會在未排除下建立 credential）。
+    fn exclude_descriptors(exclude: &[Vec<u8>]) -> Vec<PublicKeyCredentialDescriptor> {
+        exclude
+            .iter()
+            .map(|id| PublicKeyCredentialDescriptor {
+                id: id.clone(),
+                transports: vec![],
+            })
+            .collect()
+    }
+
     fn map_auth_error(e: authenticator::errors::AuthenticatorError) -> FidoError {
         use authenticator::errors::AuthenticatorError as AE;
         match e {
             AE::NoConfiguredTransports => FidoError::NoDevice,
             AE::CancelledByUser => FidoError::Internal("使用者取消 / 超時".into()),
+            AE::CredentialExcluded => FidoError::CredentialExcluded,
             other => FidoError::Internal(format!("authenticator-rs: {other:?}")),
         }
     }
@@ -1181,6 +1291,27 @@ mod real {
                 options: opts,
                 ..Default::default()
             }
+        }
+
+        #[test]
+        fn exclude_descriptors_keep_every_id() {
+            let ids = vec![vec![1u8, 2], vec![3u8; 40]];
+            let d = exclude_descriptors(&ids);
+            assert_eq!(d.len(), 2);
+            assert_eq!(d[0].id, ids[0]);
+            assert_eq!(d[1].id, ids[1]);
+            assert!(d.iter().all(|x| x.transports.is_empty()));
+            assert!(exclude_descriptors(&[]).is_empty());
+        }
+
+        #[test]
+        fn credential_excluded_status_maps_to_fido_error() {
+            let mapped =
+                map_auth_error(authenticator::errors::AuthenticatorError::CredentialExcluded);
+            assert!(
+                matches!(mapped, FidoError::CredentialExcluded),
+                "got {mapped:?}"
+            );
         }
 
         /// YubiKey 5 系列：無 clientPin、無 bioEnroll → touch-only（PM 預先提醒的預期結果）。
@@ -1458,6 +1589,117 @@ mod tests {
         assert!(
             !message.contains("handle 被其他 process / USB session 鎖定"),
             "{message}"
+        );
+    }
+
+    // ── D6：excludeCredentials ──
+
+    #[test]
+    fn credential_excluded_message_is_clear() {
+        let m = FidoError::CredentialExcluded.to_string();
+        assert!(m.contains("已註冊"), "{m}");
+        assert!(m.contains("未新增"), "{m}");
+    }
+
+    /// 只實作必要方法的後端：驗證 trait 預設實作在非空排除清單時 fail closed。
+    struct MinimalBackend(MockBackend);
+    impl FidoBackend for MinimalBackend {
+        fn detect(&mut self) -> Result<DetectedKey, FidoError> {
+            self.0.detect()
+        }
+        fn register_credential(
+            &mut self,
+            d: &DetectedKey,
+            pin: Option<&str>,
+        ) -> Result<RegisteredCredential, FidoError> {
+            self.0.register_credential(d, pin)
+        }
+        fn get_prf_secret(&mut self, id: &[u8], pin: Option<&str>) -> Result<[u8; 32], FidoError> {
+            self.0.get_prf_secret(id, pin)
+        }
+    }
+
+    #[test]
+    fn default_excluding_registration_fails_closed_for_nonempty_list() {
+        let mut b = MinimalBackend(MockBackend::new());
+        let d = b.detect().unwrap();
+        assert!(b.register_credential_excluding(&d, None, &[]).is_ok());
+        let d = b.detect().unwrap();
+        let r = b.register_credential_excluding(&d, Some("1234"), &[vec![0u8; 32]]);
+        assert!(
+            matches!(r, Err(FidoError::NotSupported(_))),
+            "backend without exclusion support must refuse, got {:?}",
+            r.map(|c| c.credential_id)
+        );
+    }
+
+    #[test]
+    fn mock_same_device_is_excluded() {
+        let mut b = MockBackend::new();
+        let d = b.detect().unwrap();
+        let first = b.register_credential_excluding(&d, None, &[]).unwrap();
+        b.reuse_device();
+        let d = b.detect().unwrap();
+        let again = b.register_credential_excluding(&d, None, &[first.credential_id.clone()]);
+        assert!(
+            matches!(again, Err(FidoError::CredentialExcluded)),
+            "same mock device must be excluded, got {:?}",
+            again.map(|c| c.credential_id)
+        );
+    }
+
+    #[test]
+    fn mock_other_device_is_not_excluded() {
+        let mut b = MockBackend::new();
+        let d = b.detect().unwrap();
+        let first = b.register_credential_excluding(&d, None, &[]).unwrap();
+        let d = b.detect().unwrap(); // 下一支（不同裝置）
+        assert!(b
+            .register_credential_excluding(&d, Some("1234"), &[first.credential_id.clone()])
+            .is_ok());
+        // 另一個 mock 實例 = 另一支實體金鑰，即使 seq 相同也不可誤判。
+        let mut other = MockBackend::new();
+        let d = other.detect().unwrap();
+        assert!(other
+            .register_credential_excluding(&d, None, &[first.credential_id.clone()])
+            .is_ok());
+    }
+
+    #[test]
+    fn mock_ignores_malformed_short_exclude_entries() {
+        let mut b = MockBackend::new();
+        let d = b.detect().unwrap();
+        assert!(b
+            .register_credential_excluding(&d, None, &[vec![], vec![1u8; 8]])
+            .is_ok());
+    }
+
+    #[test]
+    fn unavailable_backend_excluding_keeps_its_own_message() {
+        let mut b = UnavailableBackend::new(1);
+        let d = DetectedKey {
+            kind: KeyKind::WindowsManaged,
+            label: "x".into(),
+            aaguid: [0; 16],
+        };
+        let e = b
+            .register_credential_excluding(&d, None, &[vec![1u8; 16]])
+            .unwrap_err();
+        assert!(e.to_string().contains("WebAuthn API v1"), "{e}");
+    }
+
+    #[test]
+    fn mock_credential_id_keeps_kind_prefix_and_prf_semantics() {
+        let mut b = MockBackend::new().with_next_kind(KeyKind::Pin);
+        let d = b.detect().unwrap();
+        let reg = b
+            .register_credential_excluding(&d, Some("1234"), &[])
+            .unwrap();
+        assert_eq!(reg.credential_id.len(), 32);
+        assert_eq!(KeyKind::from_u8(reg.credential_id[0]), KeyKind::Pin);
+        assert_eq!(
+            b.get_prf_secret(&reg.credential_id, Some("1234")).unwrap(),
+            MockBackend::prf_for_credential(&reg.credential_id)
         );
     }
 

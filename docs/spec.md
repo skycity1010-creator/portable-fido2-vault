@@ -1,6 +1,7 @@
 # 可攜式 FIDO2 密碼金庫 v0.1 — 技術規格書
 
 > 專案：`portable-fido2-vault`｜卡：t_31e9ef5e｜語言介面：繁體中文
+> 雙群組控管版（v2 金庫、`portable-fido-vault-dual.exe`）：§3.1、§5.5、§6.1、§8.1；開發中（PR #29 draft，實機驗收待執行），設計決策見 `docs/plans/dual-control.md`。
 > 目標平台：Windows 10/11 x64；目標機須確認 WebView2 Runtime 可用，硬體版 GUI 需 Windows WebAuthn API v4+，於本機 Console 或已驗證矩陣內的 RDP session（WebAuthn 重新導向）操作；RDP 支援範圍見 `docs/rdp-webauthn-verification.md` R6。WebAuthn 不可用（API < v4）時 GUI 仍啟動，僅主密碼可用、金鑰操作 fail closed。Windows 11／Edge 已安裝不代替 Runtime 檢查。
 
 ## 1. 目標 / 非目標
@@ -90,6 +91,66 @@ offset   size   field
 
 **設計要點（仿 LUKS 多槽位）**：KEK 是隨機 256-bit，本身從不明文落盤；每個「解鎖方式」（密碼／每支金鑰）各自用不同金流把同一份 KEK 包裝一次。新增/移除金鑰只改 header、不需重加密 payload。
 
+## 3.1 金庫檔案格式 v2（雙群組控管版）
+
+只有以 `--features dual-control` 建置的 `portable-fido-vault-dual.exe` 建立／開啟 v2；單人版只建立／開啟 v1。二進位外框（magic、`header_len`、payload nonce、AES-GCM payload）與 v1 相同，差異在 header JSON 與 payload 內容。
+
+### 金鑰階層
+
+```
+KEK（隨機 256-bit，加解密 payload；與 v1 相同）
+ ├─ password_slot  = AES-GCM( Argon2id(主密碼), KEK )                         ← break-glass，結構同 v1
+ ├─ dual_slot      = AES-GCM( HKDF(share_A ‖ share_B), KEK, AAD="f2vlt-v2|dual-slot" )
+ ├─ key_slots[A]   = AES-GCM( HKDF(PRF secret), share_A, AAD="f2vlt-v2|A|" ‖ credential_id )
+ └─ key_slots[B]   = AES-GCM( HKDF(PRF secret), share_B, AAD="f2vlt-v2|B|" ‖ credential_id )
+```
+
+- `share_A`、`share_B` 各為建立金庫時以 OS CSPRNG 產生的 256-bit 隨機值，存在加密 payload（`dual.share_a/share_b`），所以任何完整解鎖的 session（含主密碼 break-glass）都能替新金鑰包裝槽位。
+- 合併：`HKDF-SHA256(salt="f2vlt-domain-v1", ikm=share_A ‖ share_B, info="f2vlt-dual-v2")`，參數順序固定 A、B；Rust 單元測試以 Python 獨立計算的 KAT 鎖定輸出。
+- 金鑰槽的 PRF → 包裝金鑰派生與 v1 相同（§4）。差別在槽位包裝的是群組 share 而不是 KEK，而且 AAD 綁定群組與 credential ID：把 header 中的 `group` 從 A 改成 B 會讓 GCM 驗證失敗，不會得到錯誤的 share。
+- 每次 v2 解鎖（兩支金鑰或主密碼）後，都以 payload 的兩個 share 重新解 `dual_slot`，要求結果等於本次使用的 KEK；不一致即 `Format` 錯誤、不寫檔，避免 `dual_slot` 被竄改後主密碼仍可登入、金鑰登入卻默默失效。
+
+### header JSON（v2 新增欄位）
+
+```json
+{
+  "v": 2,
+  "policy": "dual",
+  "argon2": { "t": 3, "m": 19456, "p": 4, "salt": "<b64 32B>" },
+  "password_slot": { "nonce": "<b64 12B>", "ct": "<b64 AES-GCM(KEK)>" },
+  "dual_slot":     { "nonce": "<b64 12B>", "ct": "<b64 AES-GCM(KEK)>" },
+  "key_slots": [
+    { "credential_id": "<b64url>", "aaguid": "<hex32>", "label": "王小明",
+      "key_type": "windows_managed", "group": "A",
+      "nonce": "<b64 12B>", "ct": "<b64 AES-GCM(share_A)>" }
+  ],
+  "dual_step_timeout_secs": 120,
+  "created_at": "RFC3339"
+}
+```
+
+- `policy` 只接受 `"dual"`；`group` 只接受大寫 `"A"`/`"B"`，未知值反序列化失敗（fail closed）。
+- `dual_step_timeout_secs` 是加密 payload 權威值的**明文鏡像**，只供登入畫面（尚未解密）使用，見 §5.5。
+- 新欄位在 Rust 型別中皆為 `Option` + `skip_serializing_if`，v1 檔序列化結果逐位元組不變（有 GREEN→GREEN 迴歸測試）。
+
+### payload（v2 新增）
+
+- `dual: { "share_a": "<b64 32B>", "share_b": "<b64 32B>" }`（只在 v2；記憶體中 `ZeroizeOnDrop`，Debug 遮蔽）。
+- `settings.dual_step_timeout_secs`：第二步等待時限權威值，30–600 秒（含端點），新金庫預設 120。
+
+### 版本判斷（任何解密或寫檔之前）
+
+| 檔案 | 單人版 | 雙群組控管版 |
+|---|---|---|
+| `v=1` 且無任何 v2 欄位 | 開啟 | `WrongEdition`：「此為單人版金庫…」 |
+| `v=2` 且 `policy=dual`、有 `dual_slot`、每個槽位都有 `group` | `WrongEdition`：「此為雙群組控管版金庫，請改用雙群組控管版程式（portable-fido-vault-dual.exe）」 | 開啟 |
+| `v=1` 帶任一 v2 欄位、`v=2` 缺 policy／dual_slot／group、其他版本 | `Format` 錯誤 | `Format` 錯誤 |
+
+- 版本不符時不解密、不寫失敗 sidecar、不產生 `.db.tmp`，檔案逐位元組不變。
+- 解密後再檢查 payload 形狀：v2 必須有 `dual` 與合法的 `dual_step_timeout_secs`，v1 不可有；不符即拒絕。
+- 登入畫面讀 header 與 vault 核心共用 `Vault::read_header(path, edition)`，magic／長度／版本規則只有一份實作。
+- 不提供 v1→v2 轉換或降級；`vault_cli` 不支援 v2。
+
 ## 4. 金鑰派生與加密
 
 | 項目 | 演算法 / 參數 |
@@ -131,12 +192,39 @@ offset   size   field
 - Windows API assertion 設定 `WEBAUTHN_AUTHENTICATOR_HMAC_SECRET_VALUES_FLAG`，明確傳入原始 32-byte vault salt，避免 WebAuthn PRF 的 domain-separated transform 造成既有槽位無法解鎖。
 - 呼叫註冊或登入前，GUI 先還原/顯示並聚焦 Tauri 主視窗，並以該視窗 HWND 作為 WebAuthn parent，讓系統金鑰 UI 由前景應用程式觸發；視窗聚焦失敗只記錄警告，仍不提升權限或切換 backend。
 
+### 5.5 雙群組控管版：註冊與兩步驟登入
+
+**註冊**（已解鎖）：
+- 名稱規則同 §5.1；另需選擇群組 A/B（必選、無預設、註冊後不可修改）。Rust 在呼叫 authenticator 前驗證名稱、群組與版本，並先解析所有既有槽位的 credential ID（槽位損毀即 `Format`，不碰金鑰）。
+- MakeCredential 帶 **excludeCredentials = 金庫內全部 credential ID**（A+B）。Windows WebAuthn 填入 `WEBAUTHN_AUTHENTICATOR_MAKE_CREDENTIAL_OPTIONS.CredentialList`；raw CTAP 填 `exclude_list`；只有帶了 exclude 清單時才把 `NTE_EXISTS`（Windows）／CTAP2 `0x19`（raw）對應為 `CredentialExcluded`，單人版錯誤訊息不變。被拒時不新增槽位。
+- 成功後以該群組的 share 包裝槽位，audit `key_registered` 的 detail 為 `type=<類型> group=<A|B>`。
+
+**金鑰登入**（A、B 群組各至少一支才啟用，否則回 `DualNotReady`，只能用主密碼）：
+1. `login_dual_begin`：broker allowList = 全部 credential。依回傳的 credential ID 找到槽位（必須存在於金庫），以 AAD 解出該群組 share，存進 Rust 端 `AppState` 的 pending 狀態（`Zeroizing`、不可 Clone、Debug 遮蔽），截止時間在第一支金鑰與 share 解包**之後**才取樣。IPC 只回傳第一步的群組、名稱、時限與剩餘毫秒，不回傳 share。
+2. `login_dual_complete`：以 by-value 取出 pending（單次使用），先檢查未逾時、金庫 header 仍與第一步相同（綁定 `created_at` + dual_slot 密文），再以 **另一群組** 的 credential 作 allowList 呼叫 broker；返回後再檢查一次逾時，並要求回傳的 credential 確實屬於另一群組。之後合併 share、解 `dual_slot` 得 KEK、解 payload。
+3. `login_dual_cancel`、逾時、第二步任何失敗、上鎖、視窗關閉、改用主密碼：pending 一律清零，需從第一步重新開始。逾時以 Rust 端 `Instant` 為準：begin 時遞增 generation 並啟動計時執行緒，到期只清除同一 generation 的 pending；前端倒數僅供顯示。
+
+**第二步時限設定**：
+- `set_dual_step_timeout(secs)`：只在已解鎖的雙人版 session 接受 30–600 秒；一次寫入 payload 權威值、header 鏡像與 audit `settings_changed`（detail `dual_step_timeout_secs=<n>`）。任何存檔失敗都還原原設定、鏡像與 audit。
+- 登入當下只能讀 header 鏡像：合法 `u32` 夾在 30–600；缺值或 null 用 120；字串、負數、小數、超出 `u32` 的值維持反序列化拒絕。
+- 完整解鎖（兩支金鑰或主密碼）後，若 header 原始鏡像（未 clamp 的值）與 payload 權威值不同，以權威值修復 header 並記 `settings_tamper_detected`，與 `login_success` 同一次存檔。payload 權威值缺失或超界則拒絕解鎖，不以預設值掩蓋；登入失敗或只完成第一步不修復、不寫金庫。
+
+**主密碼 break-glass**：與 v1 相同的密碼槽；audit method=`password-breakglass`，UI 顯示醒目提示（不阻擋操作）。
+
+**金鑰刪除**：刪除後該群組會剩 0 支 → `LastKeyInGroup`，拒絕且槽位數不變（vault 層強制）。
+
 ## 6. 軌跡紀錄（audit）
 
 事件集：`vault_created, login_success, login_failed, key_registered, key_removed, entry_added, entry_updated, entry_deleted, entries_imported, auto_lock, manual_lock`。
 - `method`：`password` / `fido2:<label>` / `setup` / `idle` / `manual` / `csv`。
 - `detail`：**僅非機密資訊**（如 site 名稱、失敗原因代碼 wrong_password/no_device/decrypt_failed）。**永不記錄密碼、PIN、金流、credentialId 明文值以外的敏感資料。**`entries_imported` 僅記新增／更新／略過數量，不記錄 CSV 欄位或資料列內容。
 - 儲存於加密 payload 內；UI「軌跡紀錄」頁可查（最新在前，上限 1000 筆，超出丟最舊）。
+
+### 6.1 雙群組控管版的 audit 與失敗紀錄
+
+- 新增事件：`settings_changed`（第二步時限，method=`manual`）、`settings_tamper_detected`（header 鏡像被改、解鎖後修復，method=`system`）。
+- 成功：`login_success` method=`fido2-dual:<群組>:<名稱>#<fp>+<群組>:<名稱>#<fp>`（依實際順序）；`fp` 為 SHA-256(credential_id) 前 4 bytes hex，讓 audit 不只依賴可被竄改的明文名稱；名稱中的 `% + : #` 會跳脫（`%25` 等）。主密碼為 `password-breakglass`。
+- 失敗 sidecar（上限 10 筆，只記時間戳與 method）：`fido2-dual-step1:<名稱>`、`fido2-dual-step2:<名稱>`、`fido2-dual-step2-rejected`（第二步回傳非另一群組的 credential）、`fido2-dual-binding-mismatch`（兩步之間金庫被換掉）、`fido2-dual-timeout`、`fido2-dual-cancel`。broker 取消／無裝置與 v1 相同不記錄。
 
 ## 7. 閒置自動上鎖
 
@@ -178,6 +266,21 @@ offset   size   field
 - 複製密碼會短暫暴露於系統共用剪貼簿；其他桌面程式可能在 60 秒清除前讀取。Windows 剪貼簿歷程/雲端剪貼簿也可能在此期間擷取或同步內容；EmptyClipboard 不負責清除已另行保存的歷程項目。
 - 已知限制（v0.1）：單機單使用者；檔案權限依賴 OS 使用者權限；不防執行中記憶體 dump（與一般密碼管理程式同級）。
 
+### 8.1 雙群組控管版
+
+| 攻擊者持有 | 結果 |
+|---|---|
+| `vault.db` + A 群組任意數量金鑰 | 只得 `share_A`，無法得 KEK |
+| `vault.db` + A 一支 + B 一支 | 可解鎖（設計預期） |
+| `vault.db` + 主密碼 | 可解鎖（break-glass，刻意接受；以 UI 提示與 audit 補強） |
+| 竄改 header `group` | 解包 GCM 驗證失敗，記失敗 |
+| 竄改 header `dual_step_timeout_secs` | 登入時夾在 30–600；完整解鎖後以權威值修復並記 `settings_tamper_detected` |
+| 竄改 `dual_slot` | 解鎖後一致性檢查失敗，拒絕且不寫檔 |
+
+- 兩步驟之間的 share 只存在 Rust 端 `Zeroizing` 記憶體，設有時限，任何中斷都清零。仍不防執行中記憶體 dump。
+- 「同一支實體金鑰只能註冊一次」依賴 authenticator 遵守 excludeList；金鑰 reset 後舊 credential 失效，可重新註冊（舊槽位應由管理者刪除）。
+- 槽位名稱仍是明文 header metadata，audit 另附 credential 指紋以利追查。
+
 ## 9. Gate 對應
 
 | Gate | 驗證方式 |
@@ -192,3 +295,4 @@ offset   size   field
 | 8 加密檔直拷別機可解密 | vault_cli copy-test：A 建立 → 複製 vault.db 至 B 路徑 → B 同密碼/金鑰登入成功 |
 | 9 舊密碼歷史 | 修改密碼時封存；N=1–20（預設3）；調低立即裁剪；查看日期並還原；舊 payload 預設相容 |
 | 10 密碼剪貼簿複製 | 複製成功/失敗、60 秒到期條件清除、保留被其他 app 取代的剪貼簿內容 |
+| D 雙群組控管版 | Rust 單元測試（`--features real-ctap,dual-control`）＋ `scripts/gate_e2e_dual.py` mock 跨行程 25 項（DG1–DG9）；Tauri IPC、計時執行緒實際觸發、Windows broker 與實體金鑰由 Win11-NB 本機 Console 實機驗收（`docs/user-verification-steps.md` 末節） |

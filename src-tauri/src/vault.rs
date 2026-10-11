@@ -9,15 +9,19 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::crypto::{
-    aes_gcm_decrypt, aes_gcm_encrypt, argon2id_derive, base64_decode, base64_encode,
-    kek_from_prf_secret, random_kek, random_nonce, CryptoError, VAULT_MAGIC,
+    aes_gcm_decrypt, aes_gcm_decrypt_aad, aes_gcm_encrypt, aes_gcm_encrypt_aad, argon2id_derive,
+    base64_decode, base64_encode, dual_key_slot_aad, dual_wrap_key_from_shares,
+    kek_from_prf_secret, random_kek, random_nonce, CryptoError, KeyGroup, DUAL_SLOT_AAD,
+    FORMAT_VERSION, FORMAT_VERSION_DUAL, VAULT_MAGIC,
 };
 use crate::csv_import::{ImportAction, ImportPlan, ImportPreview};
+use crate::edition::Edition;
 use crate::fido2::{FidoBackend, FidoError, KeyKind, RegisteredCredential};
 
 #[derive(Debug)]
@@ -28,6 +32,16 @@ pub enum VaultError {
     WrongPassword,
     Fido(FidoError),
     Json(serde_json::Error),
+    /// 金庫檔的版本（單人版 v1 / 雙群組控管版 v2）與執行檔版本不符；未解密、未寫檔。
+    WrongEdition {
+        vault: Edition,
+    },
+    /// 雙人版金鑰登入前提未滿足：A、B 群組各至少一支金鑰。
+    DualNotReady,
+    /// 兩步驟登入第一步完成後，未在時限內完成第二步。
+    DualStepExpired,
+    /// 雙人版：不可刪除群組中的最後一支金鑰（§4.5）。
+    LastKeyInGroup(KeyGroup),
 }
 
 impl std::fmt::Display for VaultError {
@@ -42,6 +56,30 @@ impl std::fmt::Display for VaultError {
             Self::WrongPassword => write!(f, "密碼不正確"),
             Self::Fido(e) => write!(f, "{e}"),
             Self::Json(e) => write!(f, "JSON 錯誤：{e}"),
+            Self::WrongEdition {
+                vault: Edition::Dual,
+            } => write!(
+                f,
+                "此為雙群組控管版金庫，請改用雙群組控管版程式（portable-fido-vault-dual.exe）"
+            ),
+            Self::DualNotReady => write!(
+                f,
+                "需 A、B 群組各至少一支金鑰才能以金鑰登入；目前請以主密碼登入"
+            ),
+            Self::LastKeyInGroup(group) => write!(
+                f,
+                "不可刪除 {} 群組的最後一支金鑰（A、B 群組各須保留至少一支）",
+                group.as_str()
+            ),
+            Self::DualStepExpired => {
+                write!(f, "第二位成員未在時限內完成驗證，請從第一步重新開始")
+            }
+            Self::WrongEdition {
+                vault: Edition::Single,
+            } => write!(
+                f,
+                "此為單人版金庫，請改用單人版程式（portable-fido-vault.exe）"
+            ),
         }
     }
 }
@@ -86,16 +124,35 @@ pub struct KeySlot {
     pub aaguid: String,        // hex 32
     pub label: String,
     pub key_type: KeyKind,
+    /// 雙群組控管版（v2）必填；單人版（v1）必為 None，且不序列化（v1 檔案格式不變）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<KeyGroup>,
     pub nonce: String,
     pub ct: String,
+}
+
+/// 金庫解鎖政策。v2 目前只有 `dual`；未知值在反序列化時即失敗（fail closed）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VaultPolicy {
+    Dual,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Header {
     pub v: u8,
+    /// v2：必為 `dual`。v1：None（不序列化）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<VaultPolicy>,
     pub argon2: Argon2Params,
     pub password_slot: Slot,
+    /// v2：AES-GCM(HKDF(share_A ‖ share_B), KEK)。v1：None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dual_slot: Option<Slot>,
     pub key_slots: Vec<KeySlot>,
+    /// v2：第一步等待時限的明文鏡像（登入前可讀；權威值在加密 payload settings）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dual_step_timeout_secs: Option<u32>,
     pub created_at: String,
 }
 
@@ -143,9 +200,17 @@ pub struct Settings {
     pub idle_lock_minutes: u32,
     #[serde(default = "default_password_history_limit")]
     pub password_history_limit: u32,
+    /// v2：第一步等待時限權威值（秒）。v1：None（不序列化）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dual_step_timeout_secs: Option<u32>,
 }
 
 const DEFAULT_PASSWORD_HISTORY_LIMIT: u32 = 3;
+/// 雙群組控管版：第一步完成後等待第二群組的預設時限（秒，§4.3）。
+pub const DEFAULT_DUAL_STEP_TIMEOUT_SECS: u32 = 120;
+/// 等待時限允許範圍（秒）；header 明文鏡像一律 clamp 到此範圍（§4.3）。
+pub const MIN_DUAL_STEP_TIMEOUT_SECS: u32 = 30;
+pub const MAX_DUAL_STEP_TIMEOUT_SECS: u32 = 600;
 const MAX_KEY_LABEL_CHARS: usize = 64;
 
 fn default_password_history_limit() -> u32 {
@@ -195,6 +260,307 @@ pub struct VaultData {
     pub entries: Vec<Entry>,
     pub audit: Vec<AuditEvent>,
     pub settings: Settings,
+    /// v2：兩群組 share（只存在加密 payload）。v1：None（不序列化）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dual: Option<DualShares>,
+}
+
+/// 雙群組 share（各 32B，b64）。只存在加密 payload；Debug 遮蔽，drop 時清零。
+#[derive(Clone, serde::Serialize, serde::Deserialize, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
+pub struct DualShares {
+    pub share_a: String,
+    pub share_b: String,
+}
+
+impl std::fmt::Debug for DualShares {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DualShares { share_a: <redacted>, share_b: <redacted> }")
+    }
+}
+
+/// 檢查 header 是否符合執行檔版本與該版本的欄位形狀（docs/plans/dual-control.md §3）。
+/// 在任何解密或寫檔之前呼叫；不符 → fail closed。
+pub fn check_header_edition(header: &Header, edition: Edition) -> Result<(), VaultError> {
+    let vault_edition = match header.v {
+        FORMAT_VERSION => Edition::Single,
+        FORMAT_VERSION_DUAL => Edition::Dual,
+        other => {
+            return Err(VaultError::Format(format!("不支援的格式版本 v{other}")));
+        }
+    };
+    if vault_edition != edition {
+        return Err(VaultError::WrongEdition {
+            vault: vault_edition,
+        });
+    }
+    match edition {
+        Edition::Single => {
+            if header.policy.is_some()
+                || header.dual_slot.is_some()
+                || header.dual_step_timeout_secs.is_some()
+                || header.key_slots.iter().any(|slot| slot.group.is_some())
+            {
+                return Err(VaultError::Format("v1 金庫不應含雙群組控管欄位".into()));
+            }
+        }
+        Edition::Dual => {
+            if header.policy != Some(VaultPolicy::Dual) {
+                return Err(VaultError::Format("v2 金庫缺少 policy=dual".into()));
+            }
+            if header.dual_slot.is_none() {
+                return Err(VaultError::Format("v2 金庫缺少 dual_slot".into()));
+            }
+            if header.key_slots.iter().any(|slot| slot.group.is_none()) {
+                return Err(VaultError::Format("v2 金庫的金鑰槽缺少群組".into()));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 登入前可讀的等待時限：header 明文鏡像 clamp 到允許範圍；缺值用預設。
+pub fn effective_dual_step_timeout_secs(header: &Header) -> u32 {
+    header
+        .dual_step_timeout_secs
+        .map(|secs| secs.clamp(MIN_DUAL_STEP_TIMEOUT_SECS, MAX_DUAL_STEP_TIMEOUT_SECS))
+        .unwrap_or(DEFAULT_DUAL_STEP_TIMEOUT_SECS)
+}
+
+/// 稽核用的成員識別：`<群組>:<跳脫後名稱>#<credential 指紋>`。名稱是 header 明文（未驗證），
+/// 指紋取自已通過 AAD 驗證的 credential_id，讓竄改名稱無法冒名。
+fn dual_audit_party(group: KeyGroup, label: &str, credential_id: &[u8]) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(credential_id);
+    let fingerprint: String = digest[..4].iter().map(|b| format!("{b:02x}")).collect();
+    format!(
+        "{}:{}#{fingerprint}",
+        group.as_str(),
+        escape_audit_label(label)
+    )
+}
+
+/// 稽核 method 內的名稱跳脫（`%` `+` `:` `#`），避免分隔字元造成歧義。
+fn escape_audit_label(label: &str) -> String {
+    let mut out = String::with_capacity(label.len());
+    for ch in label.chars() {
+        match ch {
+            '%' => out.push_str("%25"),
+            '+' => out.push_str("%2B"),
+            ':' => out.push_str("%3A"),
+            '#' => out.push_str("%23"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// 雙人版：若刪除此 credential 會讓它的群組歸零，回傳該群組（§4.5 一律禁止）。
+/// 單人版或找不到槽位 → None。
+pub fn last_key_in_group(header: &Header, credential_id_b64: &str) -> Option<KeyGroup> {
+    if edition_of(header) != Edition::Dual {
+        return None;
+    }
+    let group = header
+        .key_slots
+        .iter()
+        .find(|slot| slot.credential_id == credential_id_b64)?
+        .group?;
+    let members = header
+        .key_slots
+        .iter()
+        .filter(|slot| slot.group == Some(group))
+        .count();
+    (members <= 1).then_some(group)
+}
+
+/// 綁定值：created_at + dual_slot 密文（不含機密）。
+fn dual_binding(header: &Header) -> Result<(String, String), VaultError> {
+    let slot = header
+        .dual_slot
+        .as_ref()
+        .ok_or_else(|| VaultError::Format("v2 金庫缺少 dual_slot".into()))?;
+    Ok((header.created_at.clone(), slot.ct.clone()))
+}
+
+/// 以金鑰 PRF 解開群組槽位（AAD 綁定群組 + credential_id）→ 該群組 share。
+fn unwrap_group_share(
+    slot: &KeySlot,
+    secret: &[u8; 32],
+) -> Result<Zeroizing<[u8; 32]>, VaultError> {
+    let group = slot
+        .group
+        .ok_or_else(|| VaultError::Format("v2 金庫的金鑰槽缺少群組".into()))?;
+    let cred = base64_decode(&slot.credential_id)
+        .map_err(|_| VaultError::Format("credential_id 解碼失敗".into()))?;
+    let nonce = slot_nonce(&slot.nonce)?;
+    let ct = base64_decode(&slot.ct).map_err(|_| VaultError::Format("key slot 解碼失敗".into()))?;
+    let k = Zeroizing::new(kek_from_prf_secret(secret));
+    let plain = Zeroizing::new(
+        aes_gcm_decrypt_aad(&k, &nonce, &ct, &dual_key_slot_aad(group, &cred))
+            .map_err(VaultError::Crypto)?,
+    );
+    if plain.len() != 32 {
+        return Err(VaultError::Crypto(CryptoError::DecryptFailed));
+    }
+    let mut share = Zeroizing::new([0u8; 32]);
+    share.copy_from_slice(&plain);
+    Ok(share)
+}
+
+fn decode_credential_ids(slots: &[&KeySlot]) -> Result<Vec<Vec<u8>>, VaultError> {
+    slots
+        .iter()
+        .map(|slot| {
+            base64_decode(&slot.credential_id)
+                .map_err(|_| VaultError::Format("credential_id 解碼失敗".into()))
+        })
+        .collect()
+}
+
+/// 兩步驟登入第一步完成後的暫存狀態（§4.3）。只存在 Rust 端記憶體、不可複製；
+/// 第二步以 by-value 取用（一次性），drop 時 share 清零。
+pub struct DualPending {
+    path: PathBuf,
+    first_group: KeyGroup,
+    first_label: String,
+    /// 稽核用的第一位成員識別（含 credential 指紋）。
+    first_party: String,
+    share: Zeroizing<[u8; 32]>,
+    deadline: Instant,
+    timeout_secs: u32,
+    /// 綁定第一步讀到的金庫（created_at + dual_slot 密文），第二步前檔案被換掉即拒絕。
+    binding: (String, String),
+}
+
+impl std::fmt::Debug for DualPending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DualPending")
+            .field("first_group", &self.first_group)
+            .field("first_label", &self.first_label)
+            .field("share", &"<redacted>")
+            .field("timeout_secs", &self.timeout_secs)
+            .finish()
+    }
+}
+
+impl DualPending {
+    pub fn first_group(&self) -> KeyGroup {
+        self.first_group
+    }
+
+    pub fn first_label(&self) -> &str {
+        &self.first_label
+    }
+
+    pub fn timeout_secs(&self) -> u32 {
+        self.timeout_secs
+    }
+
+    /// 剩餘時間（逾時後為 0）。
+    pub fn remaining(&self, now: Instant) -> Duration {
+        self.deadline.saturating_duration_since(now)
+    }
+
+    pub fn is_expired(&self, now: Instant) -> bool {
+        now > self.deadline
+    }
+
+    /// 逾時清除（app 層計時器呼叫）：記 sidecar `fido2-dual-timeout`，share 隨 drop 清零。
+    pub fn expire(self) -> Result<(), VaultError> {
+        record_login_failure(&self.path, "fido2-dual-timeout")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(path: PathBuf, deadline: Instant) -> Self {
+        Self {
+            path,
+            first_group: KeyGroup::A,
+            first_label: "test".into(),
+            first_party: "A:test#00000000".into(),
+            share: Zeroizing::new([7u8; 32]),
+            deadline,
+            timeout_secs: DEFAULT_DUAL_STEP_TIMEOUT_SECS,
+            binding: (String::new(), String::new()),
+        }
+    }
+
+    /// 使用者取消：記 sidecar（僅時間戳 + method），share 隨 drop 清零。
+    pub fn cancel(self) -> Result<(), VaultError> {
+        record_login_failure(&self.path, "fido2-dual-cancel")
+    }
+}
+
+/// header 已通過 `check_header_edition` 後，由版本號推得的版本。
+fn edition_of(header: &Header) -> Edition {
+    if header.v == FORMAT_VERSION_DUAL {
+        Edition::Dual
+    } else {
+        Edition::Single
+    }
+}
+
+fn decode_share(b64: &str) -> Result<Zeroizing<[u8; 32]>, VaultError> {
+    let raw = Zeroizing::new(
+        base64_decode(b64).map_err(|_| VaultError::Format("v2 share 解碼失敗".into()))?,
+    );
+    if raw.len() != 32 {
+        return Err(VaultError::Format("v2 share 長度錯誤".into()));
+    }
+    let mut out = Zeroizing::new([0u8; 32]);
+    out.copy_from_slice(&raw);
+    Ok(out)
+}
+
+/// 解密後、寫檔前檢查 payload 形狀；v2 另驗證 dual_slot 確實是 HKDF(shares) 包出的同一把 KEK，
+/// 避免 header 被竄改後主密碼仍可登入、金鑰登入卻默默失效。
+fn check_payload_edition(
+    header: &Header,
+    data: &VaultData,
+    kek: &[u8; 32],
+) -> Result<(), VaultError> {
+    match edition_of(header) {
+        Edition::Single => {
+            if data.dual.is_some() || data.settings.dual_step_timeout_secs.is_some() {
+                return Err(VaultError::Format(
+                    "v1 金庫 payload 不應含雙群組控管資料".into(),
+                ));
+            }
+        }
+        Edition::Dual => {
+            let shares = data
+                .dual
+                .as_ref()
+                .ok_or_else(|| VaultError::Format("v2 金庫 payload 缺少 share".into()))?;
+            let share_a = decode_share(&shares.share_a)?;
+            let share_b = decode_share(&shares.share_b)?;
+            let secs = data
+                .settings
+                .dual_step_timeout_secs
+                .ok_or_else(|| VaultError::Format("v2 金庫 payload 缺少等待時限設定".into()))?;
+            if !(MIN_DUAL_STEP_TIMEOUT_SECS..=MAX_DUAL_STEP_TIMEOUT_SECS).contains(&secs) {
+                return Err(VaultError::Format(
+                    "v2 金庫 payload 等待時限超出 30–600 秒".into(),
+                ));
+            }
+            let slot = header
+                .dual_slot
+                .as_ref()
+                .ok_or_else(|| VaultError::Format("v2 金庫缺少 dual_slot".into()))?;
+            let inconsistent =
+                || VaultError::Format("dual_slot 與 share 不一致（金庫可能遭竄改）".into());
+            let nonce = slot_nonce(&slot.nonce).map_err(|_| inconsistent())?;
+            let ct = base64_decode(&slot.ct).map_err(|_| inconsistent())?;
+            let wrap = dual_wrap_key_from_shares(&share_a, &share_b);
+            let unwrapped = Zeroizing::new(
+                aes_gcm_decrypt_aad(&wrap, &nonce, &ct, DUAL_SLOT_AAD)
+                    .map_err(|_| inconsistent())?,
+            );
+            if unwrapped.as_slice() != kek.as_slice() {
+                return Err(inconsistent());
+            }
+        }
+    }
+    Ok(())
 }
 
 const MAX_AUDIT: usize = 1000;
@@ -202,6 +568,12 @@ const MAX_LOGIN_FAILURES: usize = 10;
 
 fn now_rfc3339() -> String {
     Utc::now().to_rfc3339()
+}
+
+/// Audit and locked-login sidecar timestamps use the system's local wall clock.
+/// Non-audit metadata retains RFC3339 so existing format and bindings stay unchanged.
+fn now_audit_time() -> String {
+    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
 // ─────────────────────────── Vault ───────────────────────────
@@ -216,8 +588,16 @@ pub struct Vault {
 impl Vault {
     // ── 建立 ──
 
-    /// 首次執行：以主密碼建立金庫。
+    /// 首次執行：以主密碼建立金庫（單人版 v1）。
     pub fn create(path: &Path, password: &str) -> Result<Self, VaultError> {
+        Self::create_with_edition(path, password, Edition::Single)
+    }
+
+    fn create_with_edition(
+        path: &Path,
+        password: &str,
+        edition: Edition,
+    ) -> Result<Self, VaultError> {
         if path.exists() {
             return Err(VaultError::Format("vault.db 已存在".into()));
         }
@@ -228,8 +608,44 @@ impl Vault {
         let nonce = random_nonce();
         let ct = aes_gcm_encrypt(&pw_key, &nonce, kek.as_slice());
 
+        // v2：兩群組 share 各自隨機；dual_slot = AES-GCM(HKDF(share_A ‖ share_B), KEK)。
+        let (version, policy, dual_slot, dual_timeout, dual_shares) = match edition {
+            Edition::Single => (FORMAT_VERSION, None, None, None, None),
+            Edition::Dual => {
+                let share_a = random_kek();
+                let share_b = random_kek();
+                let wrap = dual_wrap_key_from_shares(&share_a, &share_b);
+                let dual_nonce = random_nonce();
+                let dual_ct =
+                    aes_gcm_encrypt_aad(&wrap, &dual_nonce, kek.as_slice(), DUAL_SLOT_AAD);
+                (
+                    FORMAT_VERSION_DUAL,
+                    Some(VaultPolicy::Dual),
+                    Some(Slot {
+                        nonce: base64_encode(&dual_nonce),
+                        ct: base64_encode(&dual_ct),
+                    }),
+                    Some(DEFAULT_DUAL_STEP_TIMEOUT_SECS),
+                    Some(DualShares {
+                        share_a: base64_encode(share_a.as_slice()),
+                        share_b: base64_encode(share_b.as_slice()),
+                    }),
+                )
+            }
+        };
+        let mut created_detail = format!(
+            "argon2id m={}KiB t={} p={}",
+            crate::crypto::ARGON2_M_COST,
+            crate::crypto::ARGON2_T_COST,
+            crate::crypto::ARGON2_P_COST
+        );
+        if edition == Edition::Dual {
+            created_detail.push_str(" edition=dual");
+        }
+
         let header = Header {
-            v: 1,
+            v: version,
+            policy,
             argon2: Argon2Params {
                 salt: base64_encode(&salt),
             },
@@ -237,27 +653,26 @@ impl Vault {
                 nonce: base64_encode(&nonce),
                 ct: base64_encode(&ct),
             },
+            dual_slot,
             key_slots: Vec::new(),
+            dual_step_timeout_secs: dual_timeout,
             created_at: now_rfc3339(),
         };
 
         let data = VaultData {
             entries: Vec::new(),
             audit: vec![AuditEvent {
-                ts: now_rfc3339(),
+                ts: now_audit_time(),
                 event: "vault_created".into(),
                 method: "setup".into(),
-                detail: format!(
-                    "argon2id m={}KiB t={} p={}",
-                    crate::crypto::ARGON2_M_COST,
-                    crate::crypto::ARGON2_T_COST,
-                    crate::crypto::ARGON2_P_COST
-                ),
+                detail: created_detail,
             }],
             settings: Settings {
                 idle_lock_minutes: 5,
                 password_history_limit: DEFAULT_PASSWORD_HISTORY_LIMIT,
+                dual_step_timeout_secs: dual_timeout,
             },
+            dual: dual_shares,
         };
 
         let vault = Self {
@@ -270,11 +685,206 @@ impl Vault {
         Ok(vault)
     }
 
+    /// 雙群組控管版：以主密碼建立 v2 金庫（docs/plans/dual-control.md §4.1）。
+    pub fn create_dual(path: &Path, password: &str) -> Result<Self, VaultError> {
+        Self::create_with_edition(path, password, Edition::Dual)
+    }
+
+    /// 依執行檔版本建立金庫（lib.rs 以 `edition::current()` 呼叫）。
+    pub fn create_for(path: &Path, password: &str, edition: Edition) -> Result<Self, VaultError> {
+        Self::create_with_edition(path, password, edition)
+    }
+
+    /// 這個金庫的版本（由 header.v 決定，read_file 已驗證過形狀）。
+    pub fn edition(&self) -> Edition {
+        edition_of(&self.header)
+    }
+
     // ── 開啟（解鎖）──
+
+    /// 雙群組控管版：主密碼緊急登入（break-glass，§4.4）。
+    pub fn open_password_dual(path: &Path, password: &str) -> Result<Self, VaultError> {
+        Self::open_password_with_edition(path, password, Edition::Dual)
+    }
+
+    /// 雙人版金鑰登入第一步：broker 允許清單 = 全部 A+B credential；解出所選金鑰群組的 share 暫存。
+    pub fn dual_login_begin(
+        path: &Path,
+        pin: Option<&str>,
+        backend: &mut (dyn FidoBackend + 'static),
+        clock: &mut dyn FnMut() -> Instant,
+    ) -> Result<DualPending, VaultError> {
+        let (header, _payload) = Self::read_file(path, Edition::Dual)?;
+        let has_group = |group: KeyGroup| header.key_slots.iter().any(|s| s.group == Some(group));
+        if !(has_group(KeyGroup::A) && has_group(KeyGroup::B)) {
+            return Err(VaultError::DualNotReady);
+        }
+        let all: Vec<&KeySlot> = header.key_slots.iter().collect();
+        let credential_ids = decode_credential_ids(&all)?;
+        let binding = dual_binding(&header)?;
+        let timeout_secs = effective_dual_step_timeout_secs(&header);
+
+        let (selected_id, secret) = backend.get_prf_secret_for_any(&credential_ids, pin)?;
+        let secret = Zeroizing::new(secret);
+        let selected_b64 = base64_encode(&selected_id);
+        let slot = header
+            .key_slots
+            .iter()
+            .find(|slot| slot.credential_id == selected_b64)
+            .ok_or_else(|| {
+                VaultError::Fido(FidoError::Internal(
+                    "backend selected a credential not registered in this vault".into(),
+                ))
+            })?;
+        let first_group = slot
+            .group
+            .ok_or_else(|| VaultError::Format("v2 金庫的金鑰槽缺少群組".into()))?;
+        let share = match unwrap_group_share(slot, &secret) {
+            Ok(share) => share,
+            Err(_) => {
+                record_login_failure(
+                    path,
+                    &format!("fido2-dual-step1:{}", escape_audit_label(&slot.label)),
+                )?;
+                return Err(VaultError::Crypto(CryptoError::DecryptFailed));
+            }
+        };
+        let first_cred = base64_decode(&slot.credential_id)
+            .map_err(|_| VaultError::Format("credential_id 解碼失敗".into()))?;
+        // 倒數從「第一支金鑰完成」開始（§4.3），不吃掉第一步的互動時間。
+        let now = clock();
+        Ok(DualPending {
+            path: path.to_path_buf(),
+            first_group,
+            first_label: slot.label.clone(),
+            first_party: dual_audit_party(first_group, &slot.label, &first_cred),
+            share,
+            deadline: now + Duration::from_secs(u64::from(timeout_secs)),
+            timeout_secs,
+            binding,
+        })
+    }
+
+    /// 雙人版金鑰登入第二步：允許清單只含另一群組；兩份 share → HKDF → 解 dual_slot 得 KEK。
+    pub fn dual_login_complete(
+        pending: DualPending,
+        pin: Option<&str>,
+        backend: &mut (dyn FidoBackend + 'static),
+        clock: &mut dyn FnMut() -> Instant,
+    ) -> Result<Self, VaultError> {
+        let now = clock();
+        // 逾時：不再提示第二支金鑰；pending（含 share）隨 drop 清零。
+        if pending.is_expired(now) {
+            record_login_failure(&pending.path, "fido2-dual-timeout")?;
+            return Err(VaultError::DualStepExpired);
+        }
+        let path = pending.path.clone();
+        let (header, payload) = Self::read_file(&path, Edition::Dual)?;
+        if dual_binding(&header)? != pending.binding {
+            record_login_failure(&path, "fido2-dual-binding-mismatch")?;
+            return Err(VaultError::Format(
+                "金庫在兩步驟之間已變更，請從第一步重新開始".into(),
+            ));
+        }
+        let second_group = pending.first_group.other();
+        let second_slots: Vec<&KeySlot> = header
+            .key_slots
+            .iter()
+            .filter(|slot| slot.group == Some(second_group))
+            .collect();
+        if second_slots.is_empty() {
+            return Err(VaultError::DualNotReady);
+        }
+        // 允許清單只含另一群組 → 同群組金鑰無法完成第二步。
+        let credential_ids = decode_credential_ids(&second_slots)?;
+        let (selected_id, secret) = backend.get_prf_secret_for_any(&credential_ids, pin)?;
+        let secret = Zeroizing::new(secret);
+        // 截止時間是硬上限：第二支金鑰互動結束後再檢查一次。
+        if pending.is_expired(clock()) {
+            record_login_failure(&path, "fido2-dual-timeout")?;
+            return Err(VaultError::DualStepExpired);
+        }
+        let selected_b64 = base64_encode(&selected_id);
+        // 不信任後端：所選 credential 必須屬於另一群組。
+        let slot = match second_slots
+            .iter()
+            .find(|slot| slot.credential_id == selected_b64)
+            .copied()
+        {
+            Some(slot) => slot,
+            None => {
+                record_login_failure(&path, "fido2-dual-step2-rejected")?;
+                return Err(VaultError::Fido(FidoError::Internal(
+                    "backend selected a credential outside the required group".into(),
+                )));
+            }
+        };
+        let step2_failure = |label: &str| -> VaultError {
+            match record_login_failure(
+                &path,
+                &format!("fido2-dual-step2:{}", escape_audit_label(label)),
+            ) {
+                Ok(()) => VaultError::Crypto(CryptoError::DecryptFailed),
+                Err(e) => e,
+            }
+        };
+        let second_share = match unwrap_group_share(slot, &secret) {
+            Ok(share) => share,
+            Err(_) => return Err(step2_failure(&slot.label)),
+        };
+        let (share_a, share_b) = match pending.first_group {
+            KeyGroup::A => (&pending.share, &second_share),
+            KeyGroup::B => (&second_share, &pending.share),
+        };
+        let wrap = dual_wrap_key_from_shares(share_a, share_b);
+        let dual_slot = header
+            .dual_slot
+            .as_ref()
+            .ok_or_else(|| VaultError::Format("v2 金庫缺少 dual_slot".into()))?;
+        let nonce = slot_nonce(&dual_slot.nonce)?;
+        let ct = base64_decode(&dual_slot.ct)
+            .map_err(|_| VaultError::Format("dual slot 解碼失敗".into()))?;
+        let kek_bytes = match aes_gcm_decrypt_aad(&wrap, &nonce, &ct, DUAL_SLOT_AAD) {
+            Ok(bytes) if bytes.len() == 32 => Zeroizing::new(bytes),
+            _ => return Err(step2_failure(&slot.label)),
+        };
+        let mut kek = Zeroizing::new([0u8; 32]);
+        kek.copy_from_slice(&kek_bytes);
+        let second_cred = base64_decode(&slot.credential_id)
+            .map_err(|_| VaultError::Format("credential_id 解碼失敗".into()))?;
+        let method = format!(
+            "fido2-dual:{}+{}",
+            pending.first_party,
+            dual_audit_party(second_group, &slot.label, &second_cred)
+        );
+        Self::unlock(&path, header, payload, kek, &method)
+    }
+
+    /// 依執行檔版本以主密碼登入。
+    pub fn open_password_for(
+        path: &Path,
+        password: &str,
+        edition: Edition,
+    ) -> Result<Self, VaultError> {
+        Self::open_password_with_edition(path, password, edition)
+    }
 
     /// 主密碼登入。失敗 → sidecar 記一筆 login_failed。
     pub fn open_password(path: &Path, password: &str) -> Result<Self, VaultError> {
-        let (header, payload) = Self::read_file(path)?;
+        Self::open_password_with_edition(path, password, Edition::Single)
+    }
+
+    fn open_password_with_edition(
+        path: &Path,
+        password: &str,
+        edition: Edition,
+    ) -> Result<Self, VaultError> {
+        // 雙群組控管版的主密碼登入是 break-glass，稽核 method 與一般登入區分。
+        let method = match edition {
+            Edition::Single => "password",
+            Edition::Dual => "password-breakglass",
+        };
+        let (header, payload) = Self::read_file(path, edition)?;
         let salt = base64_decode(&header.argon2.salt)
             .map_err(|_| VaultError::Format("argon2 salt 解碼失敗".into()))?;
         let k = argon2id_derive(password.as_bytes(), &salt).map_err(VaultError::Crypto)?;
@@ -286,10 +896,10 @@ impl Vault {
             Ok(kek_bytes) if kek_bytes.len() == 32 => {
                 let mut kek = [0u8; 32];
                 kek.copy_from_slice(&kek_bytes);
-                Self::unlock(path, header, payload, Zeroizing::new(kek), "password")
+                Self::unlock(path, header, payload, Zeroizing::new(kek), method)
             }
             _ => {
-                record_login_failure(path, "password")?;
+                record_login_failure(path, method)?;
                 Err(VaultError::WrongPassword)
             }
         }
@@ -302,7 +912,7 @@ impl Vault {
         pin: Option<&str>,
         backend: &mut (dyn FidoBackend + 'static),
     ) -> Result<Self, VaultError> {
-        let (header, payload) = Self::read_file(path)?;
+        let (header, payload) = Self::read_file(path, Edition::Single)?;
         let slot = header
             .key_slots
             .iter()
@@ -323,7 +933,7 @@ impl Vault {
         pin: Option<&str>,
         backend: &mut (dyn FidoBackend + 'static),
     ) -> Result<Self, VaultError> {
-        let (header, payload) = Self::read_file(path)?;
+        let (header, payload) = Self::read_file(path, Edition::Single)?;
         let credential_ids = header
             .key_slots
             .iter()
@@ -391,6 +1001,24 @@ impl Vault {
         method: &str,
     ) -> Result<Self, VaultError> {
         let mut data = Self::decrypt_payload(&kek, &payload)?;
+        check_payload_edition(&header, &data, &kek)?;
+        let mut header = header;
+        if edition_of(&header) == Edition::Dual {
+            // The encrypted payload is authoritative; compare the RAW mirror, not its clamp.
+            let secs = data
+                .settings
+                .dual_step_timeout_secs
+                .ok_or_else(|| VaultError::Format("v2 金庫 payload 缺少等待時限設定".into()))?;
+            if header.dual_step_timeout_secs != Some(secs) {
+                header.dual_step_timeout_secs = Some(secs);
+                data.audit.push(AuditEvent {
+                    ts: now_audit_time(),
+                    event: "settings_tamper_detected".into(),
+                    method: "system".into(),
+                    detail: format!("dual_step_timeout_secs mirror repaired to {secs}"),
+                });
+            }
+        }
 
         // 合併 sidecar（僅時間戳的失敗記錄）進加密 audit。
         let failures = read_failure_sidecar(path);
@@ -404,7 +1032,9 @@ impl Vault {
                     detail: "decrypt_failed".into(),
                 })
                 .collect();
-            data.audit.splice(0..0, events);
+            // Sidecar events occurred after the previous unlocked session. Append them
+            // before login_success so reverse display and oldest-first trimming agree.
+            data.audit.extend(events);
         }
 
         let mut vault = Self {
@@ -414,7 +1044,7 @@ impl Vault {
             kek,
         };
         vault.data.audit.push(AuditEvent {
-            ts: now_rfc3339(),
+            ts: now_audit_time(),
             event: "login_success".into(),
             method: method.into(),
             detail: "金庫解鎖".into(),
@@ -427,8 +1057,8 @@ impl Vault {
 
     // ── 檔案 I/O ──
 
-    /// 讀檔 → (header, (payload_nonce, ciphertext))。
-    fn read_file(path: &Path) -> Result<VaultFileContents, VaultError> {
+    /// 讀檔 → (header, (payload_nonce, ciphertext))。先檢查版本，不符即 fail closed。
+    fn read_file(path: &Path, edition: Edition) -> Result<VaultFileContents, VaultError> {
         let buf = fs::read(path)?;
         if buf.len() < 6 + 4 + 12 {
             return Err(VaultError::Format("檔案過小".into()));
@@ -443,16 +1073,16 @@ impl Vault {
         let header_json = std::str::from_utf8(&buf[10..10 + header_len])
             .map_err(|_| VaultError::Format("header 非 UTF-8".into()))?;
         let header: Header = serde_json::from_str(header_json).map_err(VaultError::Json)?;
-        if header.v != 1 {
-            return Err(VaultError::Format(format!(
-                "不支援的格式版本 v{}",
-                header.v
-            )));
-        }
+        check_header_edition(&header, edition)?;
         let off = 10 + header_len;
         let nonce: [u8; 12] = buf[off..off + 12].try_into().unwrap();
         let ciphertext = buf[off + 12..].to_vec();
         Ok((header, (nonce, ciphertext)))
+    }
+
+    /// 只讀 header（不需 KEK），供登入畫面列出金鑰；同樣先檢查版本。
+    pub fn read_header(path: &Path, edition: Edition) -> Result<Header, VaultError> {
+        Self::read_file(path, edition).map(|(header, _)| header)
     }
 
     fn decrypt_payload(
@@ -492,7 +1122,7 @@ impl Vault {
     /// 記一筆軌跡並落盤（detail 僅非機密資訊；永不記錄密碼/PIN/金流）。
     pub fn record(&mut self, event: &str, method: &str, detail: &str) -> Result<(), VaultError> {
         self.data.audit.push(AuditEvent {
-            ts: now_rfc3339(),
+            ts: now_audit_time(),
             event: event.into(),
             method: method.into(),
             detail: detail.into(),
@@ -685,7 +1315,7 @@ impl Vault {
         }
 
         next_data.audit.push(AuditEvent {
-            ts: now_rfc3339(),
+            ts: now_audit_time(),
             event: "entries_imported".into(),
             method: "csv".into(),
             detail: format!(
@@ -707,6 +1337,33 @@ impl Vault {
         }
         self.record("entry_deleted", "manual", "（條目已刪除）")?;
         Ok(())
+    }
+
+    /// Change the authenticated timeout and its login-screen mirror together.
+    /// Only an unlocked dual vault may call this; invalid input never mutates state.
+    pub fn set_dual_step_timeout(&mut self, secs: u32) -> Result<(), VaultError> {
+        if self.edition() != Edition::Dual {
+            return Err(VaultError::Format("單人版不支援雙群組等待時限".into()));
+        }
+        if !(MIN_DUAL_STEP_TIMEOUT_SECS..=MAX_DUAL_STEP_TIMEOUT_SECS).contains(&secs) {
+            return Err(VaultError::Format("等待時限須介於 30–600 秒".into()));
+        }
+        let previous_setting = self.data.settings.dual_step_timeout_secs;
+        let previous_mirror = self.header.dual_step_timeout_secs;
+        let previous_audit = self.data.audit.clone();
+        self.data.settings.dual_step_timeout_secs = Some(secs);
+        self.header.dual_step_timeout_secs = Some(secs);
+        let result = self.record(
+            "settings_changed",
+            "manual",
+            &format!("dual_step_timeout_secs={secs}"),
+        );
+        if result.is_err() {
+            self.data.settings.dual_step_timeout_secs = previous_setting;
+            self.header.dual_step_timeout_secs = previous_mirror;
+            self.data.audit = previous_audit;
+        }
+        result
     }
 
     pub fn set_idle_lock(&mut self, minutes: u32) -> Result<(), VaultError> {
@@ -743,7 +1400,7 @@ impl Vault {
         backend: &mut (dyn FidoBackend + 'static),
         pin: Option<&str>,
     ) -> Result<RegisteredCredential, VaultError> {
-        self.register_key_internal(backend, pin, None)
+        self.register_key_internal(backend, pin, None, None)
     }
 
     /// Register with a FidoVault-local alias. Validate it before querying the authenticator.
@@ -754,7 +1411,49 @@ impl Vault {
         candidate_label: &str,
     ) -> Result<RegisteredCredential, VaultError> {
         let label = self.validate_new_key_label(candidate_label)?;
-        self.register_key_internal(backend, pin, Some(&label))
+        self.register_key_internal(backend, pin, Some(&label), None)
+    }
+
+    /// 雙群組控管版：註冊金鑰並指定群組（§4.2）。以該群組 share 包裝槽位，AAD 綁定群組與 credential。
+    pub fn register_key_in_group(
+        &mut self,
+        backend: &mut (dyn FidoBackend + 'static),
+        pin: Option<&str>,
+        candidate_label: &str,
+        group: KeyGroup,
+    ) -> Result<RegisteredCredential, VaultError> {
+        if self.edition() != Edition::Dual {
+            return Err(VaultError::Format("單人版金庫不支援金鑰群組".into()));
+        }
+        let label = self.validate_new_key_label(candidate_label)?;
+        self.register_key_internal(backend, pin, Some(&label), Some(group))
+    }
+
+    /// 依金庫版本分派註冊：單人版不可帶群組；雙人版必須帶群組。
+    pub fn register_key_for(
+        &mut self,
+        backend: &mut (dyn FidoBackend + 'static),
+        pin: Option<&str>,
+        candidate_label: &str,
+        group: Option<KeyGroup>,
+    ) -> Result<RegisteredCredential, VaultError> {
+        match group {
+            None => self.register_key_with_label(backend, pin, candidate_label),
+            Some(group) => self.register_key_in_group(backend, pin, candidate_label, group),
+        }
+    }
+
+    /// 已解鎖 session 的群組 share（只在雙人版有；payload 形狀已於解鎖時驗證）。
+    fn group_share(&self, group: KeyGroup) -> Result<Zeroizing<[u8; 32]>, VaultError> {
+        let shares = self
+            .data
+            .dual
+            .as_ref()
+            .ok_or_else(|| VaultError::Format("v2 金庫 payload 缺少 share".into()))?;
+        match group {
+            KeyGroup::A => decode_share(&shares.share_a),
+            KeyGroup::B => decode_share(&shares.share_b),
+        }
     }
 
     /// Validate a proposed local alias against every slot already stored in this vault.
@@ -784,7 +1483,37 @@ impl Vault {
         backend: &mut (dyn FidoBackend + 'static),
         pin: Option<&str>,
         custom_label: Option<&str>,
+        group: Option<KeyGroup>,
     ) -> Result<RegisteredCredential, VaultError> {
+        // 版本與群組必須一致；不一致時 fail closed，不呼叫 authenticator。
+        let share = match (self.edition(), group) {
+            (Edition::Dual, None) => {
+                return Err(VaultError::Format(
+                    "雙群組控管版註冊金鑰須指定群組（A 或 B）".into(),
+                ));
+            }
+            (Edition::Single, Some(_)) => {
+                return Err(VaultError::Format("單人版金庫不支援金鑰群組".into()));
+            }
+            (Edition::Dual, Some(group)) => Some(self.group_share(group)?),
+            (Edition::Single, None) => None,
+        };
+        // 雙人版：Q3「同一支實體金鑰只能註冊一筆」→ 以金庫內全部既有 credential（A+B）作
+        // excludeCredentials，由 authenticator 拒絕重複。在呼叫 authenticator 之前先解碼完成。
+        let exclude = if group.is_some() {
+            Some(
+                self.header
+                    .key_slots
+                    .iter()
+                    .map(|slot| {
+                        base64_decode(&slot.credential_id)
+                            .map_err(|_| VaultError::Format("credential_id 解碼失敗".into()))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+        } else {
+            None
+        };
         // 裁決②：不支援 hmac-secret/PRF 的金鑰拒絕註冊。
         // 順序：先 detect()（real 後端需 getInfo 才能知 PRF 能力；mock 的 detect 為無害循環），
         // 再 prf_supported()（依 detect 快取的資訊判定）。
@@ -792,11 +1521,24 @@ impl Vault {
         if !backend.prf_supported() {
             return Err(VaultError::Fido(FidoError::PrfNotSupported));
         }
-        let mut reg = backend.register_credential(&detected, pin)?;
+        // 單人版維持原本的註冊呼叫（不帶排除清單）。
+        let mut reg = match exclude.as_deref() {
+            Some(exclude) => backend.register_credential_excluding(&detected, pin, exclude)?,
+            None => backend.register_credential(&detected, pin)?,
+        };
         let secret = backend.get_prf_secret(&reg.credential_id, pin)?;
         let k = kek_from_prf_secret(&secret);
         let nonce = random_nonce();
-        let ct = aes_gcm_encrypt(&k, &nonce, self.kek.as_slice());
+        // 單人版：槽位包 KEK。雙人版：槽位只包該群組 share，AAD 綁定群組與 credential_id。
+        let ct = match (group, share.as_ref()) {
+            (Some(group), Some(share)) => aes_gcm_encrypt_aad(
+                &k,
+                &nonce,
+                share.as_slice(),
+                &dual_key_slot_aad(group, &reg.credential_id),
+            ),
+            _ => aes_gcm_encrypt(&k, &nonce, self.kek.as_slice()),
+        };
 
         if let Some(label) = custom_label {
             reg.label = label.to_owned();
@@ -806,15 +1548,16 @@ impl Vault {
             aaguid: hex32_16(reg.aaguid),
             label: reg.label.clone(),
             key_type: reg.kind,
+            group,
             nonce: base64_encode(&nonce),
             ct: base64_encode(&ct),
         });
         let kind_str = format!("{}", reg.kind);
-        self.record(
-            "key_registered",
-            &format!("fido2:{}", reg.label),
-            &format!("type={kind_str}"),
-        )?;
+        let detail = match group {
+            Some(group) => format!("type={kind_str} group={}", group.as_str()),
+            None => format!("type={kind_str}"),
+        };
+        self.record("key_registered", &format!("fido2:{}", reg.label), &detail)?;
         Ok(reg)
     }
 
@@ -826,13 +1569,18 @@ impl Vault {
             .iter()
             .position(|s| s.credential_id == credential_id_b64)
             .ok_or(VaultError::Fido(FidoError::NoDevice))?;
+        // 雙人版：群組歸零會讓金鑰登入永久失效 → 一律拒絕（不改 header、不寫檔、不記 audit）。
+        if let Some(group) = last_key_in_group(&self.header, credential_id_b64) {
+            return Err(VaultError::LastKeyInGroup(group));
+        }
         let label = self.header.key_slots[idx].label.clone();
+        let group = self.header.key_slots[idx].group;
         self.header.key_slots.remove(idx);
-        self.record(
-            "key_removed",
-            &format!("fido2:{label}"),
-            "金鑰槽已移除（該金鑰無法再解鎖）",
-        )?;
+        let detail = match group {
+            Some(group) => format!("金鑰槽已移除（該金鑰無法再解鎖） group={}", group.as_str()),
+            None => "金鑰槽已移除（該金鑰無法再解鎖）".to_owned(),
+        };
+        self.record("key_removed", &format!("fido2:{label}"), &detail)?;
         Ok(())
     }
 
@@ -905,7 +1653,7 @@ fn read_failure_sidecar(path: &Path) -> Vec<FailureStamp> {
 pub fn record_login_failure(vault_path: &Path, method: &str) -> Result<(), VaultError> {
     let mut list = read_failure_sidecar(vault_path);
     list.push(FailureStamp {
-        ts: now_rfc3339(),
+        ts: now_audit_time(),
         method: method.into(),
     });
     if list.len() > MAX_LOGIN_FAILURES {
@@ -923,6 +1671,132 @@ mod tests {
     use super::*;
     use crate::fido2::{FidoBackend, FidoError, KeyKind, MockBackend};
     use std::env;
+
+    #[test]
+    fn d13_sidecar_events_follow_existing_audit_before_success() {
+        let p = fresh_path("d13-audit-order");
+        let mut v = Vault::create_dual(&p, "Synthetic-Pw-12345").unwrap();
+        v.data.audit[0].ts = "2000-01-01T00:00:00Z".into();
+        v.write_file().unwrap();
+        drop(v);
+        DualPending::for_test(p.clone(), Instant::now())
+            .cancel()
+            .unwrap();
+        DualPending::for_test(p.clone(), Instant::now())
+            .expire()
+            .unwrap();
+        let v = Vault::open_password_with_edition(&p, "Synthetic-Pw-12345", Edition::Dual).unwrap();
+        let methods: Vec<&str> = v.audit().iter().map(|e| e.method.as_str()).collect();
+        assert_eq!(
+            methods,
+            vec![
+                "setup",
+                "fido2-dual-cancel",
+                "fido2-dual-timeout",
+                "password-breakglass"
+            ],
+            "sidecar events must be merged after older audit, before the successful login"
+        );
+        let (_, payload) = Vault::read_file(&p, Edition::Dual).unwrap();
+        let persisted = Vault::decrypt_payload(&v.kek, &payload).unwrap();
+        assert_eq!(
+            persisted
+                .audit
+                .iter()
+                .map(|e| e.method.as_str())
+                .collect::<Vec<_>>(),
+            methods
+        );
+        assert!(!failures_path(&p).exists());
+    }
+
+    #[test]
+    fn d13_new_audit_and_failure_timestamps_use_local_seconds() {
+        let p = fresh_path("d13-audit-local");
+        let before = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let mut v = Vault::create_dual(&p, "Synthetic-Pw-12345").unwrap();
+        v.record("settings_changed", "manual", "synthetic local time test")
+            .unwrap();
+        record_login_failure(&p, "fido2-dual-cancel").unwrap();
+        let after = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let stamps = read_failure_sidecar(&p);
+        let times: Vec<&str> = v
+            .audit()
+            .iter()
+            .map(|e| e.ts.as_str())
+            .chain(stamps.iter().map(|e| e.ts.as_str()))
+            .collect();
+        assert_eq!(times.len(), 3);
+        for ts in times {
+            assert_eq!(
+                ts.len(),
+                19,
+                "audit timestamp must be yyyy-MM-dd HH:mm:ss: {ts}"
+            );
+            assert!(chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S").is_ok());
+            assert!(
+                before.as_str() <= ts && ts <= after.as_str(),
+                "timestamp must be local system time: {ts}"
+            );
+        }
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&v.header.created_at).is_ok(),
+            "non-audit metadata stays RFC3339 for compatibility"
+        );
+        let (_, payload) = Vault::read_file(&p, Edition::Dual).unwrap();
+        let persisted = Vault::decrypt_payload(&v.kek, &payload).unwrap();
+        assert_eq!(persisted.audit.len(), 2);
+        for e in &persisted.audit {
+            assert_eq!(e.ts.len(), 19);
+            assert!(chrono::NaiveDateTime::parse_from_str(&e.ts, "%Y-%m-%d %H:%M:%S").is_ok());
+        }
+        drop(v);
+        let reopened =
+            Vault::open_password_with_edition(&p, "Synthetic-Pw-12345", Edition::Dual).unwrap();
+        assert_eq!(reopened.audit().len(), 4);
+        assert_eq!(reopened.audit().last().unwrap().event, "login_success");
+        assert!(reopened.audit().iter().all(|e| e.ts.len() == 19
+            && chrono::NaiveDateTime::parse_from_str(&e.ts, "%Y-%m-%d %H:%M:%S").is_ok()));
+    }
+
+    #[test]
+    fn d13_sidecar_merge_at_audit_cap_keeps_recent_failure_events() {
+        for edition in [Edition::Single, Edition::Dual] {
+            let p = fresh_path(if edition == Edition::Single {
+                "d13-cap-single"
+            } else {
+                "d13-cap-dual"
+            });
+            let mut v = Vault::create_with_edition(&p, "Synthetic-Pw-12345", edition).unwrap();
+            let old = AuditEvent {
+                ts: "2000-01-01T00:00:00Z".into(),
+                event: "synthetic-old".into(),
+                method: "test".into(),
+                detail: "non-secret".into(),
+            };
+            v.data.audit = vec![old; MAX_AUDIT];
+            v.write_file().unwrap();
+            drop(v);
+            record_login_failure(&p, "fido2-dual-cancel").unwrap();
+            record_login_failure(&p, "fido2-dual-timeout").unwrap();
+            let v = Vault::open_password_with_edition(&p, "Synthetic-Pw-12345", edition).unwrap();
+            assert_eq!(v.audit().len(), MAX_AUDIT);
+            assert_eq!(v.audit()[MAX_AUDIT - 3].method, "fido2-dual-cancel");
+            assert_eq!(v.audit()[MAX_AUDIT - 2].method, "fido2-dual-timeout");
+            assert_eq!(v.audit()[MAX_AUDIT - 1].event, "login_success");
+            assert_eq!(
+                v.audit()[0].ts,
+                "2000-01-01T00:00:00Z",
+                "legacy timestamps are not rewritten"
+            );
+            let (_, payload) = Vault::read_file(&p, edition).unwrap();
+            let persisted = Vault::decrypt_payload(&v.kek, &payload).unwrap();
+            assert_eq!(persisted.audit.len(), MAX_AUDIT);
+            assert_eq!(persisted.audit[MAX_AUDIT - 3].method, "fido2-dual-cancel");
+            assert_eq!(persisted.audit[MAX_AUDIT - 2].method, "fido2-dual-timeout");
+            assert_eq!(persisted.audit[MAX_AUDIT - 1].event, "login_success");
+        }
+    }
 
     /// 不支援 PRF 的金鑰包裝（驗證裁決②：拒絕註冊）。
     struct NoPrfBackend(MockBackend);
@@ -971,6 +1845,2245 @@ mod tests {
         let d = env::temp_dir().join(format!("f2v-test-{tag}-{}", std::process::id()));
         let _ = fs::create_dir_all(&d);
         d
+    }
+
+    // ── D3：v2 header / 版本互斥 ──
+
+    fn raw_header_json(path: &Path) -> serde_json::Value {
+        let buf = fs::read(path).unwrap();
+        let len = u32::from_le_bytes(buf[6..10].try_into().unwrap()) as usize;
+        serde_json::from_slice(&buf[10..10 + len]).unwrap()
+    }
+
+    /// 以新的 header JSON 重寫檔案（payload 原封不動），模擬另一版本產生的檔案。
+    fn rewrite_header(path: &Path, edit: impl FnOnce(&mut serde_json::Value)) {
+        let buf = fs::read(path).unwrap();
+        let len = u32::from_le_bytes(buf[6..10].try_into().unwrap()) as usize;
+        let mut header: serde_json::Value = serde_json::from_slice(&buf[10..10 + len]).unwrap();
+        edit(&mut header);
+        let new_header = serde_json::to_vec(&header).unwrap();
+        let mut out = Vec::new();
+        out.extend_from_slice(&buf[..6]);
+        out.extend_from_slice(&(new_header.len() as u32).to_le_bytes());
+        out.extend_from_slice(&new_header);
+        out.extend_from_slice(&buf[10 + len..]);
+        fs::write(path, out).unwrap();
+    }
+
+    fn as_v2(header: &mut serde_json::Value) {
+        header["v"] = serde_json::json!(2);
+        header["policy"] = serde_json::json!("dual");
+        header["dual_slot"] = header["password_slot"].clone();
+        header["dual_step_timeout_secs"] = serde_json::json!(120);
+    }
+
+    fn sample_slot() -> Slot {
+        Slot {
+            nonce: "bm9uY2U=".into(),
+            ct: "Y3Q=".into(),
+        }
+    }
+
+    fn sample_key_slot(group: Option<KeyGroup>) -> KeySlot {
+        KeySlot {
+            credential_id: "Y3JlZA==".into(),
+            aaguid: "00".repeat(16),
+            label: "k1".into(),
+            key_type: KeyKind::TouchOnly,
+            group,
+            nonce: "bm9uY2U=".into(),
+            ct: "Y3Q=".into(),
+        }
+    }
+
+    fn sample_header(v: u8) -> Header {
+        Header {
+            v,
+            policy: None,
+            argon2: Argon2Params {
+                salt: "c2FsdA==".into(),
+            },
+            password_slot: sample_slot(),
+            dual_slot: None,
+            key_slots: Vec::new(),
+            dual_step_timeout_secs: None,
+            created_at: "2026-10-11T00:00:00Z".into(),
+        }
+    }
+
+    fn valid_v2_header() -> Header {
+        let mut h = sample_header(2);
+        h.policy = Some(VaultPolicy::Dual);
+        h.dual_slot = Some(sample_slot());
+        h.dual_step_timeout_secs = Some(120);
+        h.key_slots = vec![sample_key_slot(Some(KeyGroup::A))];
+        h
+    }
+
+    #[test]
+    fn edition_check_accepts_matching_shapes() {
+        assert!(check_header_edition(&sample_header(1), Edition::Single).is_ok());
+        let mut v1_with_key = sample_header(1);
+        v1_with_key.key_slots = vec![sample_key_slot(None)];
+        assert!(check_header_edition(&v1_with_key, Edition::Single).is_ok());
+        assert!(check_header_edition(&valid_v2_header(), Edition::Dual).is_ok());
+    }
+
+    #[test]
+    fn single_edition_rejects_v2_header() {
+        assert!(matches!(
+            check_header_edition(&valid_v2_header(), Edition::Single),
+            Err(VaultError::WrongEdition {
+                vault: Edition::Dual
+            })
+        ));
+    }
+
+    #[test]
+    fn dual_edition_rejects_v1_header() {
+        assert!(matches!(
+            check_header_edition(&sample_header(1), Edition::Dual),
+            Err(VaultError::WrongEdition {
+                vault: Edition::Single
+            })
+        ));
+    }
+
+    #[test]
+    fn unknown_format_version_is_rejected_by_both_editions() {
+        for edition in [Edition::Single, Edition::Dual] {
+            assert!(matches!(
+                check_header_edition(&sample_header(3), edition),
+                Err(VaultError::Format(_))
+            ));
+            assert!(matches!(
+                check_header_edition(&sample_header(0), edition),
+                Err(VaultError::Format(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn v2_header_missing_required_dual_fields_is_rejected() {
+        let mut no_policy = valid_v2_header();
+        no_policy.policy = None;
+        let mut no_dual_slot = valid_v2_header();
+        no_dual_slot.dual_slot = None;
+        let mut ungrouped_slot = valid_v2_header();
+        ungrouped_slot.key_slots.push(sample_key_slot(None));
+        for header in [no_policy, no_dual_slot, ungrouped_slot] {
+            assert!(matches!(
+                check_header_edition(&header, Edition::Dual),
+                Err(VaultError::Format(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn v1_header_with_dual_fields_is_rejected() {
+        let mut with_policy = sample_header(1);
+        with_policy.policy = Some(VaultPolicy::Dual);
+        let mut with_dual_slot = sample_header(1);
+        with_dual_slot.dual_slot = Some(sample_slot());
+        let mut with_timeout = sample_header(1);
+        with_timeout.dual_step_timeout_secs = Some(120);
+        let mut with_group = sample_header(1);
+        with_group.key_slots = vec![sample_key_slot(Some(KeyGroup::B))];
+        for header in [with_policy, with_dual_slot, with_timeout, with_group] {
+            assert!(matches!(
+                check_header_edition(&header, Edition::Single),
+                Err(VaultError::Format(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn unknown_policy_or_group_value_fails_to_parse() {
+        let mut h = serde_json::to_value(valid_v2_header()).unwrap();
+        h["policy"] = serde_json::json!("triple");
+        assert!(serde_json::from_value::<Header>(h).is_err());
+        let mut h = serde_json::to_value(valid_v2_header()).unwrap();
+        h["key_slots"][0]["group"] = serde_json::json!("C");
+        assert!(serde_json::from_value::<Header>(h).is_err());
+    }
+
+    #[test]
+    fn wrong_edition_message_names_the_right_program() {
+        let to_dual = VaultError::WrongEdition {
+            vault: Edition::Dual,
+        }
+        .to_string();
+        assert!(to_dual.contains("雙群組控管版"), "{to_dual}");
+        assert!(
+            to_dual.contains("portable-fido-vault-dual.exe"),
+            "{to_dual}"
+        );
+        let to_single = VaultError::WrongEdition {
+            vault: Edition::Single,
+        }
+        .to_string();
+        assert!(to_single.contains("單人版"), "{to_single}");
+        assert!(to_single.contains("portable-fido-vault.exe"), "{to_single}");
+    }
+
+    #[test]
+    fn dual_shares_debug_is_redacted() {
+        let shares = DualShares {
+            share_a: "SECRET-SHARE-A".into(),
+            share_b: "SECRET-SHARE-B".into(),
+        };
+        let shown = format!("{shares:?}");
+        assert!(!shown.contains("SECRET-SHARE-A"), "{shown}");
+        assert!(!shown.contains("SECRET-SHARE-B"), "{shown}");
+    }
+
+    /// 既有行為回歸（GREEN→GREEN）：v1 檔案 header/payload 不出現任何 v2 欄位。
+    #[test]
+    fn v1_files_serialize_without_dual_fields() {
+        let d = tmp_dir("d3-v1-shape");
+        let p = d.join("vault.db");
+        let _ = fs::remove_file(&p);
+        let mut v = Vault::create(&p, "Pw-12345").unwrap();
+        let mut backend = MockBackend::new();
+        v.register_key(&mut backend, None).unwrap();
+        let header = raw_header_json(&p);
+        let obj = header.as_object().unwrap();
+        for key in ["policy", "dual_slot", "dual_step_timeout_secs"] {
+            assert!(!obj.contains_key(key), "unexpected {key} in v1 header");
+        }
+        assert_eq!(header["v"], serde_json::json!(1));
+        assert!(!header["key_slots"][0]
+            .as_object()
+            .unwrap()
+            .contains_key("group"));
+        let data = serde_json::to_value(&v.data).unwrap();
+        assert!(!data.as_object().unwrap().contains_key("dual"));
+        assert!(!data["settings"]
+            .as_object()
+            .unwrap()
+            .contains_key("dual_step_timeout_secs"));
+    }
+
+    #[test]
+    fn single_edition_open_rejects_v2_file_without_writing() {
+        let d = tmp_dir("d3-v2-reject");
+        let p = d.join("vault.db");
+        let _ = fs::remove_file(&p);
+        let _ = fs::remove_file(failures_path(&p));
+        drop(Vault::create(&p, "Pw-12345").unwrap());
+        rewrite_header(&p, as_v2);
+        let before = fs::read(&p).unwrap();
+
+        let result = Vault::open_password(&p, "Pw-12345");
+        assert!(
+            matches!(
+                result,
+                Err(VaultError::WrongEdition {
+                    vault: Edition::Dual
+                })
+            ),
+            "single edition must refuse a v2 vault"
+        );
+        assert_eq!(
+            fs::read(&p).unwrap(),
+            before,
+            "v2 file must stay byte-identical"
+        );
+        assert!(
+            !failures_path(&p).exists(),
+            "no failure sidecar for edition mismatch"
+        );
+        assert!(!p.with_extension("db.tmp").exists());
+        assert!(matches!(
+            Vault::read_header(&p, Edition::Single),
+            Err(VaultError::WrongEdition {
+                vault: Edition::Dual
+            })
+        ));
+    }
+
+    // ── D4：建立 v2 / 主密碼 break-glass / payload 形狀 ──
+
+    fn fresh_path(tag: &str) -> PathBuf {
+        let d = tmp_dir(tag);
+        let p = d.join("vault.db");
+        let _ = fs::remove_file(&p);
+        let _ = fs::remove_file(failures_path(&p));
+        let _ = fs::remove_file(p.with_extension("db.tmp"));
+        p
+    }
+
+    fn decode_share(b64: &str) -> [u8; 32] {
+        base64_decode(b64).unwrap().try_into().unwrap()
+    }
+
+    #[test]
+    fn create_dual_writes_v2_header() {
+        let p = fresh_path("d4-create-header");
+        let v = Vault::create_dual(&p, "Pw-12345").unwrap();
+        assert_eq!(v.edition(), Edition::Dual);
+        drop(v);
+        let raw = raw_header_json(&p);
+        assert_eq!(raw["v"], serde_json::json!(2));
+        assert_eq!(raw["policy"], serde_json::json!("dual"));
+        assert!(raw["dual_slot"].is_object(), "dual_slot missing: {raw}");
+        assert_eq!(raw["dual_step_timeout_secs"], serde_json::json!(120));
+        assert_eq!(raw["key_slots"], serde_json::json!([]));
+        assert!(Vault::read_header(&p, Edition::Dual).is_ok());
+        assert!(matches!(
+            Vault::read_header(&p, Edition::Single),
+            Err(VaultError::WrongEdition {
+                vault: Edition::Dual
+            })
+        ));
+    }
+
+    #[test]
+    fn create_dual_payload_holds_distinct_shares_and_timeout() {
+        let p = fresh_path("d4-create-payload");
+        let v = Vault::create_dual(&p, "Pw-12345").unwrap();
+        let shares = v.data.dual.clone();
+        assert!(shares.is_some(), "payload must hold dual shares");
+        let shares = shares.unwrap();
+        let a = decode_share(&shares.share_a);
+        let b = decode_share(&shares.share_b);
+        assert_ne!(a, b);
+        assert_ne!(a, *v.kek);
+        assert_ne!(b, *v.kek);
+        assert_eq!(v.data.settings.dual_step_timeout_secs, Some(120));
+        assert!(v.data.audit[0].detail.contains("edition=dual"));
+    }
+
+    #[test]
+    fn dual_slot_unwraps_to_kek_with_both_shares() {
+        let p = fresh_path("d4-dual-slot");
+        let v = Vault::create_dual(&p, "Pw-12345").unwrap();
+        assert!(v.data.dual.is_some(), "dual shares missing");
+        assert!(v.header.dual_slot.is_some(), "dual slot missing");
+        let shares = v.data.dual.clone().unwrap();
+        let slot = v.header.dual_slot.clone().unwrap();
+        let wrap = crate::crypto::dual_wrap_key_from_shares(
+            &decode_share(&shares.share_a),
+            &decode_share(&shares.share_b),
+        );
+        let kek = crate::crypto::aes_gcm_decrypt_aad(
+            &wrap,
+            &slot_nonce(&slot.nonce).unwrap(),
+            &base64_decode(&slot.ct).unwrap(),
+            crate::crypto::DUAL_SLOT_AAD,
+        )
+        .unwrap();
+        assert_eq!(kek.as_slice(), v.kek.as_slice());
+    }
+
+    #[test]
+    fn dual_password_breakglass_unlocks_and_audits() {
+        let p = fresh_path("d4-breakglass");
+        let mut v = Vault::create_dual(&p, "Pw-12345").unwrap();
+        v.add_entry("example.com", "alice", "s3cret", "").unwrap();
+        drop(v.lock());
+        let reopened = Vault::open_password_dual(&p, "Pw-12345");
+        assert!(
+            reopened.is_ok(),
+            "break-glass login failed: {:?}",
+            reopened.err()
+        );
+        let reopened = reopened.unwrap();
+        assert_eq!(reopened.entries().len(), 1);
+        let last = reopened.audit().last().unwrap();
+        assert_eq!(last.event, "login_success");
+        assert_eq!(last.method, "password-breakglass");
+        assert!(reopened.data.dual.is_some());
+    }
+
+    #[test]
+    fn dual_password_wrong_records_breakglass_failure_without_touching_vault() {
+        let p = fresh_path("d4-breakglass-wrong");
+        drop(Vault::create_dual(&p, "Pw-12345").unwrap());
+        let before = fs::read(&p).unwrap();
+        assert!(matches!(
+            Vault::open_password_dual(&p, "wrong-pass"),
+            Err(VaultError::WrongPassword)
+        ));
+        assert_eq!(fs::read(&p).unwrap(), before);
+        let stamps = read_failure_sidecar(&p);
+        assert_eq!(stamps.len(), 1);
+        assert_eq!(stamps[0].method, "password-breakglass");
+    }
+
+    #[test]
+    fn dual_open_rejects_v1_file_without_writing() {
+        let p = fresh_path("d4-dual-open-v1");
+        drop(Vault::create(&p, "Pw-12345").unwrap());
+        let before = fs::read(&p).unwrap();
+        assert!(matches!(
+            Vault::open_password_dual(&p, "Pw-12345"),
+            Err(VaultError::WrongEdition {
+                vault: Edition::Single
+            })
+        ));
+        assert_eq!(fs::read(&p).unwrap(), before);
+        assert!(!failures_path(&p).exists());
+    }
+
+    #[test]
+    fn dual_payload_missing_shares_is_rejected_without_writing() {
+        let p = fresh_path("d4-missing-shares");
+        let mut v = Vault::create_dual(&p, "Pw-12345").unwrap();
+        v.data.dual = None;
+        v.write_file().unwrap();
+        drop(v);
+        let before = fs::read(&p).unwrap();
+        let result = Vault::open_password_dual(&p, "Pw-12345");
+        assert!(
+            matches!(&result, Err(VaultError::Format(m)) if m.contains("share")),
+            "expected share-shape error, got {:?}",
+            result.err()
+        );
+        assert_eq!(fs::read(&p).unwrap(), before);
+    }
+
+    #[test]
+    fn dual_slot_inconsistent_with_shares_is_rejected_without_writing() {
+        let p = fresh_path("d4-bad-dual-slot");
+        drop(Vault::create_dual(&p, "Pw-12345").unwrap());
+        rewrite_header(&p, |h| {
+            // 以 password_slot 取代 dual_slot：形狀合法但不是 HKDF(shares) 包出的 KEK。
+            h["dual_slot"] = h["password_slot"].clone();
+        });
+        let before = fs::read(&p).unwrap();
+        let result = Vault::open_password_dual(&p, "Pw-12345");
+        assert!(
+            matches!(&result, Err(VaultError::Format(m)) if m.contains("dual_slot")),
+            "expected dual_slot consistency error, got {:?}",
+            result.err()
+        );
+        assert_eq!(fs::read(&p).unwrap(), before);
+    }
+
+    #[test]
+    fn single_payload_with_dual_shares_is_rejected_without_writing() {
+        let p = fresh_path("d4-v1-with-shares");
+        let mut v = Vault::create(&p, "Pw-12345").unwrap();
+        v.data.dual = Some(DualShares {
+            share_a: base64_encode(&[1u8; 32]),
+            share_b: base64_encode(&[2u8; 32]),
+        });
+        v.write_file().unwrap();
+        drop(v);
+        let before = fs::read(&p).unwrap();
+        let result = Vault::open_password(&p, "Pw-12345");
+        assert!(
+            matches!(&result, Err(VaultError::Format(_))),
+            "v1 payload must not carry dual shares, got {:?}",
+            result.as_ref().map(|_| ())
+        );
+        assert_eq!(fs::read(&p).unwrap(), before);
+    }
+
+    #[test]
+    fn edition_dispatch_creates_and_opens_matching_format() {
+        let single = fresh_path("d4-dispatch-single");
+        drop(Vault::create_for(&single, "Pw-12345", Edition::Single).unwrap());
+        assert_eq!(raw_header_json(&single)["v"], serde_json::json!(1));
+        assert!(Vault::open_password_for(&single, "Pw-12345", Edition::Single).is_ok());
+
+        let dual = fresh_path("d4-dispatch-dual");
+        drop(Vault::create_for(&dual, "Pw-12345", Edition::Dual).unwrap());
+        assert_eq!(raw_header_json(&dual)["v"], serde_json::json!(2));
+        let opened = Vault::open_password_for(&dual, "Pw-12345", Edition::Dual);
+        assert!(
+            opened.is_ok(),
+            "dual dispatch open failed: {:?}",
+            opened.err()
+        );
+        assert!(matches!(
+            Vault::open_password_for(&dual, "Pw-12345", Edition::Single),
+            Err(VaultError::WrongEdition {
+                vault: Edition::Dual
+            })
+        ));
+    }
+
+    #[test]
+    fn dual_vault_refuses_ungrouped_key_registration() {
+        let p = fresh_path("d4-dual-register-guard");
+        let mut v = Vault::create_dual(&p, "Pw-12345").unwrap();
+        let mut backend = MockBackend::new();
+        let result = v.register_key(&mut backend, None);
+        assert!(
+            matches!(&result, Err(VaultError::Format(m)) if m.contains("群組")),
+            "dual vault must not register an ungrouped key, got {:?}",
+            result.as_ref().map(|_| ())
+        );
+        assert!(v.header.key_slots.is_empty());
+        let named = v.register_key_with_label(&mut backend, None, "k1");
+        assert!(named.is_err());
+        assert!(v.header.key_slots.is_empty());
+        assert!(Vault::read_header(&p, Edition::Dual).is_ok());
+    }
+
+    // ── D5：雙群組註冊 ──
+
+    /// 計數用後端：記錄 detect/register 呼叫次數（驗證失敗時不碰 authenticator）。
+    struct CountingBackend {
+        inner: MockBackend,
+        detects: u32,
+        registers: u32,
+    }
+
+    impl CountingBackend {
+        fn new() -> Self {
+            Self {
+                inner: MockBackend::new(),
+                detects: 0,
+                registers: 0,
+            }
+        }
+    }
+
+    impl FidoBackend for CountingBackend {
+        fn detect(&mut self) -> Result<crate::fido2::DetectedKey, FidoError> {
+            self.detects += 1;
+            self.inner.detect()
+        }
+        fn register_credential(
+            &mut self,
+            d: &crate::fido2::DetectedKey,
+            pin: Option<&str>,
+        ) -> Result<crate::fido2::RegisteredCredential, FidoError> {
+            self.registers += 1;
+            self.inner.register_credential(d, pin)
+        }
+        fn get_prf_secret(&mut self, id: &[u8], pin: Option<&str>) -> Result<[u8; 32], FidoError> {
+            self.inner.get_prf_secret(id, pin)
+        }
+        fn prf_supported(&self) -> bool {
+            self.inner.prf_supported()
+        }
+    }
+
+    /// 以金鑰 PRF 解開槽位（帶指定群組 AAD），回傳明文。
+    fn unwrap_group_slot(
+        slot: &KeySlot,
+        backend: &mut dyn FidoBackend,
+        aad_group: KeyGroup,
+    ) -> Result<Vec<u8>, CryptoError> {
+        let cred = base64_decode(&slot.credential_id).unwrap();
+        let secret = backend.get_prf_secret(&cred, None).unwrap();
+        let k = kek_from_prf_secret(&secret);
+        crate::crypto::aes_gcm_decrypt_aad(
+            &k,
+            &slot_nonce(&slot.nonce).unwrap(),
+            &base64_decode(&slot.ct).unwrap(),
+            &crate::crypto::dual_key_slot_aad(aad_group, &cred),
+        )
+    }
+
+    #[test]
+    fn dual_register_in_group_wraps_that_groups_share() {
+        let p = fresh_path("d5-register-ab");
+        let mut v = Vault::create_dual(&p, "Pw-12345").unwrap();
+        let mut backend = MockBackend::new();
+        let ra = v.register_key_in_group(&mut backend, None, "王小明", KeyGroup::A);
+        assert!(ra.is_ok(), "register A failed: {:?}", ra.err());
+        // MockBackend 每次 detect 會循環金鑰類型（第二支為 PIN 型）；每支金鑰用新的 mock 實例。
+        // PRF 由 credential_id 決定，任一 mock 實例都能解包。
+        let mut backend_b = MockBackend::new();
+        let rb = v.register_key_in_group(&mut backend_b, None, "李大華", KeyGroup::B);
+        assert!(rb.is_ok(), "register B failed: {:?}", rb.err());
+        assert_eq!(v.header.key_slots.len(), 2);
+
+        let shares = v.data.dual.clone().unwrap();
+        let share_a = decode_share(&shares.share_a);
+        let share_b = decode_share(&shares.share_b);
+        let slot_a = v.header.key_slots[0].clone();
+        let slot_b = v.header.key_slots[1].clone();
+        assert_eq!(slot_a.group, Some(KeyGroup::A));
+        assert_eq!(slot_b.group, Some(KeyGroup::B));
+        assert_eq!(slot_a.label, "王小明");
+
+        let a_plain = unwrap_group_slot(&slot_a, &mut backend, KeyGroup::A).unwrap();
+        assert_eq!(a_plain.as_slice(), share_a.as_slice());
+        assert_ne!(
+            a_plain.as_slice(),
+            v.kek.as_slice(),
+            "slot must not wrap the KEK"
+        );
+        let b_plain = unwrap_group_slot(&slot_b, &mut backend, KeyGroup::B).unwrap();
+        assert_eq!(b_plain.as_slice(), share_b.as_slice());
+        // 群組標記被改：AAD 不符 → 解包失敗。
+        assert!(unwrap_group_slot(&slot_a, &mut backend, KeyGroup::B).is_err());
+        assert!(unwrap_group_slot(&slot_b, &mut backend, KeyGroup::A).is_err());
+    }
+
+    #[test]
+    fn dual_registration_persists_and_audits_group() {
+        let p = fresh_path("d5-persist");
+        let mut v = Vault::create_dual(&p, "Pw-12345").unwrap();
+        let mut backend = MockBackend::new();
+        let r = v.register_key_in_group(&mut backend, None, "k-a", KeyGroup::A);
+        assert!(r.is_ok(), "register failed: {:?}", r.err());
+        let last = v.audit().last().unwrap().clone();
+        assert_eq!(last.event, "key_registered");
+        assert_eq!(last.method, "fido2:k-a");
+        assert!(last.detail.contains("group=A"), "{}", last.detail);
+        drop(v.lock());
+
+        let raw = raw_header_json(&p);
+        assert_eq!(raw["key_slots"][0]["group"], serde_json::json!("A"));
+        assert!(Vault::read_header(&p, Edition::Dual).is_ok());
+        let reopened = Vault::open_password_dual(&p, "Pw-12345");
+        assert!(reopened.is_ok(), "reopen failed: {:?}", reopened.err());
+    }
+
+    #[test]
+    fn dual_registration_validates_label_before_authenticator() {
+        let p = fresh_path("d5-label");
+        let mut v = Vault::create_dual(&p, "Pw-12345").unwrap();
+        let mut backend = CountingBackend::new();
+        assert!(v
+            .register_key_in_group(&mut backend, None, "dup", KeyGroup::A)
+            .is_ok());
+        let detects = backend.detects;
+        for bad in ["", "   ", "DUP", "bad\u{7}name"] {
+            assert!(v
+                .register_key_in_group(&mut backend, None, bad, KeyGroup::B)
+                .is_err());
+        }
+        assert_eq!(
+            backend.detects, detects,
+            "invalid labels must not reach the key"
+        );
+        assert_eq!(v.header.key_slots.len(), 1);
+    }
+
+    #[test]
+    fn dual_registration_rejects_non_prf_key_without_slot() {
+        let p = fresh_path("d5-noprf");
+        let mut v = Vault::create_dual(&p, "Pw-12345").unwrap();
+        let mut bad = NoPrfBackend(MockBackend::new());
+        let r = v.register_key_in_group(&mut bad, None, "k", KeyGroup::A);
+        assert!(
+            matches!(r, Err(VaultError::Fido(FidoError::PrfNotSupported))),
+            "expected PrfNotSupported, got {:?}",
+            r.as_ref().map(|_| ())
+        );
+        assert!(v.header.key_slots.is_empty());
+    }
+
+    #[test]
+    fn single_vault_rejects_group_registration_without_authenticator() {
+        let p = fresh_path("d5-single-group");
+        let mut v = Vault::create(&p, "Pw-12345").unwrap();
+        let mut backend = CountingBackend::new();
+        let r = v.register_key_in_group(&mut backend, None, "k", KeyGroup::A);
+        assert!(
+            matches!(&r, Err(VaultError::Format(m)) if m.contains("單人版")),
+            "single vault must refuse groups, got {:?}",
+            r.as_ref().map(|_| ())
+        );
+        assert_eq!(backend.detects, 0);
+        assert!(v.header.key_slots.is_empty());
+    }
+
+    #[test]
+    fn register_key_for_dispatches_by_vault_edition() {
+        // 單人版：無群組 → 註冊；有群組 → 拒絕
+        let single = fresh_path("d5-dispatch-single");
+        let mut v1 = Vault::create(&single, "Pw-12345").unwrap();
+        let mut backend = CountingBackend::new();
+        assert!(v1.register_key_for(&mut backend, None, "s1", None).is_ok());
+        assert_eq!(v1.header.key_slots[0].group, None);
+        let before = backend.detects;
+        assert!(v1
+            .register_key_for(&mut backend, None, "s2", Some(KeyGroup::A))
+            .is_err());
+        assert_eq!(backend.detects, before);
+        assert_eq!(v1.header.key_slots.len(), 1);
+
+        // 雙人版：有群組 → 註冊；無群組 → 拒絕
+        let dual = fresh_path("d5-dispatch-dual");
+        let mut v2 = Vault::create_dual(&dual, "Pw-12345").unwrap();
+        // 新的 mock 實例：避免 detect 循環到 PIN 型金鑰（與受測行為無關）。
+        let mut backend = CountingBackend::new();
+        let r = v2.register_key_for(&mut backend, None, "d1", Some(KeyGroup::B));
+        assert!(r.is_ok(), "dual dispatch failed: {:?}", r.err());
+        assert_eq!(v2.header.key_slots[0].group, Some(KeyGroup::B));
+        let before = backend.detects;
+        assert!(v2.register_key_for(&mut backend, None, "d2", None).is_err());
+        assert_eq!(backend.detects, before);
+        assert_eq!(v2.header.key_slots.len(), 1);
+    }
+
+    // ── D6：同一支實體金鑰只能註冊一筆 ──
+
+    /// 記錄 vault 呼叫哪一個註冊方法與排除清單。
+    struct RecordingBackend {
+        inner: MockBackend,
+        calls: Vec<Option<Vec<Vec<u8>>>>,
+    }
+
+    impl FidoBackend for RecordingBackend {
+        fn detect(&mut self) -> Result<crate::fido2::DetectedKey, FidoError> {
+            self.inner.detect()
+        }
+        fn register_credential(
+            &mut self,
+            d: &crate::fido2::DetectedKey,
+            pin: Option<&str>,
+        ) -> Result<crate::fido2::RegisteredCredential, FidoError> {
+            self.calls.push(None);
+            self.inner.register_credential(d, pin)
+        }
+        fn register_credential_excluding(
+            &mut self,
+            d: &crate::fido2::DetectedKey,
+            pin: Option<&str>,
+            exclude: &[Vec<u8>],
+        ) -> Result<crate::fido2::RegisteredCredential, FidoError> {
+            self.calls.push(Some(exclude.to_vec()));
+            self.inner.register_credential_excluding(d, pin, exclude)
+        }
+        fn get_prf_secret(&mut self, id: &[u8], pin: Option<&str>) -> Result<[u8; 32], FidoError> {
+            self.inner.get_prf_secret(id, pin)
+        }
+        fn prf_supported(&self) -> bool {
+            self.inner.prf_supported()
+        }
+    }
+
+    #[test]
+    fn dual_registration_excludes_every_registered_credential() {
+        let p = fresh_path("d6-exclude-list");
+        let mut v = Vault::create_dual(&p, "Pw-12345").unwrap();
+        let mut b1 = MockBackend::new();
+        v.register_key_in_group(&mut b1, None, "a1", KeyGroup::A)
+            .unwrap();
+        let mut b2 = MockBackend::new();
+        v.register_key_in_group(&mut b2, None, "b1", KeyGroup::B)
+            .unwrap();
+        let expected: Vec<Vec<u8>> = v
+            .header
+            .key_slots
+            .iter()
+            .map(|s| base64_decode(&s.credential_id).unwrap())
+            .collect();
+
+        let mut rec = RecordingBackend {
+            inner: MockBackend::new(),
+            calls: Vec::new(),
+        };
+        let r = v.register_key_in_group(&mut rec, None, "a2", KeyGroup::A);
+        assert!(r.is_ok(), "third key failed: {:?}", r.err());
+        assert_eq!(
+            rec.calls,
+            vec![Some(expected)],
+            "dual registration must pass all existing credentials (A and B) as excludeCredentials"
+        );
+    }
+
+    #[test]
+    fn dual_same_physical_key_cannot_register_twice_in_any_group() {
+        let p = fresh_path("d6-same-key");
+        let mut v = Vault::create_dual(&p, "Pw-12345").unwrap();
+        let mut key = MockBackend::new();
+        v.register_key_in_group(&mut key, None, "王小明", KeyGroup::A)
+            .unwrap();
+        let audit_len = v.audit().len();
+        for (label, group) in [("同一支-B", KeyGroup::B), ("同一支-A", KeyGroup::A)] {
+            key.reuse_device();
+            let r = v.register_key_in_group(&mut key, None, label, group);
+            assert!(
+                matches!(r, Err(VaultError::Fido(FidoError::CredentialExcluded))),
+                "same physical key must be refused for group {group:?}, got {:?}",
+                r.as_ref().map(|_| ())
+            );
+        }
+        assert_eq!(v.header.key_slots.len(), 1);
+        assert_eq!(
+            v.audit().len(),
+            audit_len,
+            "refused registration must not be audited as registered"
+        );
+        drop(v.lock());
+        assert_eq!(
+            Vault::read_header(&p, Edition::Dual)
+                .unwrap()
+                .key_slots
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn dual_corrupt_slot_credential_fails_before_authenticator() {
+        let p = fresh_path("d6-corrupt-cred");
+        let mut v = Vault::create_dual(&p, "Pw-12345").unwrap();
+        let mut b1 = MockBackend::new();
+        v.register_key_in_group(&mut b1, None, "a1", KeyGroup::A)
+            .unwrap();
+        v.header.key_slots[0].credential_id = "%%not-base64%%".into();
+        let mut counting = CountingBackend::new();
+        let r = v.register_key_in_group(&mut counting, None, "b1", KeyGroup::B);
+        assert!(
+            matches!(&r, Err(VaultError::Format(m)) if m.contains("credential_id")),
+            "got {:?}",
+            r.as_ref().map(|_| ())
+        );
+        assert_eq!(counting.detects, 0);
+        assert_eq!(counting.registers, 0);
+        assert_eq!(v.header.key_slots.len(), 1);
+    }
+
+    #[test]
+    fn removed_key_can_register_again() {
+        let p = fresh_path("d6-remove-reregister");
+        let mut v = Vault::create_dual(&p, "Pw-12345").unwrap();
+        let mut x = MockBackend::new();
+        let first = v
+            .register_key_in_group(&mut x, None, "x-a", KeyGroup::A)
+            .unwrap();
+        let mut y = MockBackend::new();
+        v.register_key_in_group(&mut y, None, "y-a", KeyGroup::A)
+            .unwrap();
+        v.remove_key(&base64_encode(&first.credential_id)).unwrap();
+        x.reuse_device();
+        // mock detect 會循環類型（這次是 PIN 型），提供測試 PIN。
+        let again = v.register_key_in_group(&mut x, Some("1234"), "x-b", KeyGroup::B);
+        assert!(
+            again.is_ok(),
+            "exclude list must only contain current slots, got {:?}",
+            again.err()
+        );
+        assert_eq!(v.header.key_slots.len(), 2);
+    }
+
+    // ── D7：兩步驟登入 ──
+
+    /// 模擬「使用者在 broker 中刷了某一支金鑰」：只有該 credential 在允許清單內才成功
+    /// （Windows broker 只接受 allow-list 內的 credential）；`rogue` 模擬不遵守允許清單的後端。
+    struct TapBackend {
+        tap: Vec<u8>,
+        rogue: bool,
+        offered: Vec<Vec<Vec<u8>>>,
+        /// 設定後，金鑰互動發生時設為 true（驗證時鐘取樣時機）。
+        prompted: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    }
+
+    impl TapBackend {
+        fn tap(cred: &[u8]) -> Self {
+            Self {
+                tap: cred.to_vec(),
+                rogue: false,
+                offered: Vec::new(),
+                prompted: None,
+            }
+        }
+    }
+
+    impl FidoBackend for TapBackend {
+        fn detect(&mut self) -> Result<crate::fido2::DetectedKey, FidoError> {
+            Err(FidoError::NoDevice)
+        }
+        fn register_credential(
+            &mut self,
+            _: &crate::fido2::DetectedKey,
+            _: Option<&str>,
+        ) -> Result<crate::fido2::RegisteredCredential, FidoError> {
+            Err(FidoError::NoDevice)
+        }
+        fn get_prf_secret(&mut self, id: &[u8], _: Option<&str>) -> Result<[u8; 32], FidoError> {
+            Ok(MockBackend::prf_for_credential(id))
+        }
+        fn get_prf_secret_for_any(
+            &mut self,
+            ids: &[Vec<u8>],
+            _: Option<&str>,
+        ) -> Result<(Vec<u8>, [u8; 32]), FidoError> {
+            self.offered.push(ids.to_vec());
+            if let Some(flag) = &self.prompted {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            if self.rogue || ids.contains(&self.tap) {
+                Ok((self.tap.clone(), MockBackend::prf_for_credential(&self.tap)))
+            } else {
+                Err(FidoError::Internal(
+                    "simulated NotAllowed: key not in allow list".into(),
+                ))
+            }
+        }
+    }
+
+    /// 建立雙人版金庫並依序註冊金鑰（每支一個新 mock = 不同實體金鑰）；回傳各 credential。
+    fn dual_vault_with(tag: &str, keys: &[(&str, KeyGroup)]) -> (PathBuf, Vec<Vec<u8>>) {
+        let p = fresh_path(tag);
+        let mut v = Vault::create_dual(&p, "Pw-12345").unwrap();
+        let mut creds = Vec::new();
+        for (label, group) in keys {
+            let mut b = MockBackend::new();
+            let reg = v
+                .register_key_in_group(&mut b, None, label, *group)
+                .unwrap();
+            creds.push(reg.credential_id);
+        }
+        drop(v.lock());
+        (p, creds)
+    }
+
+    fn two_step(p: &Path, first: &[u8], second: &[u8]) -> Result<Vault, VaultError> {
+        let t0 = Instant::now();
+        let mut b1 = TapBackend::tap(first);
+        let pending = Vault::dual_login_begin(p, None, &mut b1, &mut || t0)?;
+        let mut b2 = TapBackend::tap(second);
+        Vault::dual_login_complete(pending, None, &mut b2, &mut || t0 + Duration::from_secs(5))
+    }
+
+    #[test]
+    fn dual_login_a_then_b_unlocks_and_audits_order() {
+        let (p, c) = dual_vault_with("d7-ab", &[("王小明", KeyGroup::A), ("李大華", KeyGroup::B)]);
+        let r = two_step(&p, &c[0], &c[1]);
+        assert!(r.is_ok(), "A→B failed: {:?}", r.err());
+        let v = r.unwrap();
+        let last = v.audit().last().unwrap();
+        assert_eq!(last.event, "login_success");
+        assert_eq!(
+            last.method,
+            format!(
+                "fido2-dual:A:王小明#{}+B:李大華#{}",
+                cred_fp(&c[0]),
+                cred_fp(&c[1])
+            )
+        );
+    }
+
+    #[test]
+    fn dual_login_b_then_a_unlocks_and_audits_order() {
+        let (p, c) = dual_vault_with("d7-ba", &[("a1", KeyGroup::A), ("b1", KeyGroup::B)]);
+        let r = two_step(&p, &c[1], &c[0]);
+        assert!(r.is_ok(), "B→A failed: {:?}", r.err());
+        assert_eq!(
+            r.unwrap().audit().last().unwrap().method,
+            format!("fido2-dual:B:b1#{}+A:a1#{}", cred_fp(&c[1]), cred_fp(&c[0]))
+        );
+    }
+
+    #[test]
+    fn dual_login_begin_reports_first_group_and_timeout() {
+        let (p, c) = dual_vault_with("d7-begin-info", &[("a1", KeyGroup::A), ("b1", KeyGroup::B)]);
+        let t0 = Instant::now();
+        let mut b = TapBackend::tap(&c[1]);
+        let pending = Vault::dual_login_begin(&p, None, &mut b, &mut || t0);
+        assert!(pending.is_ok(), "begin failed: {:?}", pending.err());
+        let pending = pending.unwrap();
+        assert_eq!(pending.first_group(), KeyGroup::B);
+        assert_eq!(pending.first_label(), "b1");
+        assert_eq!(pending.timeout_secs(), DEFAULT_DUAL_STEP_TIMEOUT_SECS);
+        assert_eq!(pending.remaining(t0), Duration::from_secs(120));
+        // 第一步允許清單 = 全部 A+B。
+        assert_eq!(b.offered, vec![c.clone()]);
+        let shown = format!("{pending:?}");
+        assert!(shown.contains("<redacted>"), "{shown}");
+    }
+
+    #[test]
+    fn dual_login_second_step_offers_only_other_group() {
+        let (p, c) = dual_vault_with(
+            "d7-other-group",
+            &[
+                ("a1", KeyGroup::A),
+                ("a2", KeyGroup::A),
+                ("b1", KeyGroup::B),
+            ],
+        );
+        let t0 = Instant::now();
+        let mut b1 = TapBackend::tap(&c[0]);
+        let pending = Vault::dual_login_begin(&p, None, &mut b1, &mut || t0);
+        assert!(pending.is_ok(), "begin failed: {:?}", pending.err());
+        // 第二步刷同群組的 a2：不在允許清單 → 失敗，不可解鎖。
+        let mut b2 = TapBackend::tap(&c[1]);
+        let r = Vault::dual_login_complete(pending.unwrap(), None, &mut b2, &mut || t0);
+        assert!(r.is_err(), "same-group second key must not unlock");
+        assert_eq!(
+            b2.offered,
+            vec![vec![c[2].clone()]],
+            "step 2 allow list must be group B only"
+        );
+    }
+
+    #[test]
+    fn dual_login_rejects_rogue_backend_returning_same_group() {
+        let (p, c) = dual_vault_with(
+            "d7-rogue",
+            &[
+                ("a1", KeyGroup::A),
+                ("a2", KeyGroup::A),
+                ("b1", KeyGroup::B),
+            ],
+        );
+        let t0 = Instant::now();
+        let mut b1 = TapBackend::tap(&c[0]);
+        let pending = Vault::dual_login_begin(&p, None, &mut b1, &mut || t0);
+        assert!(pending.is_ok(), "begin failed: {:?}", pending.err());
+        let mut rogue = TapBackend::tap(&c[1]);
+        rogue.rogue = true; // 無視允許清單，回傳 A 群組的 a2
+        let before = fs::read(&p).unwrap();
+        let r = Vault::dual_login_complete(pending.unwrap(), None, &mut rogue, &mut || t0);
+        assert!(
+            matches!(&r, Err(VaultError::Fido(FidoError::Internal(_)))),
+            "credential outside the required group must be refused, got {:?}",
+            r.as_ref().map(|_| ())
+        );
+        assert_eq!(fs::read(&p).unwrap(), before);
+    }
+
+    #[test]
+    fn dual_login_requires_both_groups() {
+        let (p, c) = dual_vault_with("d7-not-ready", &[("a1", KeyGroup::A)]);
+        let mut b = TapBackend::tap(&c[0]);
+        let r = Vault::dual_login_begin(&p, None, &mut b, &mut Instant::now);
+        assert!(
+            matches!(r, Err(VaultError::DualNotReady)),
+            "got {:?}",
+            r.as_ref().map(|_| ())
+        );
+        assert!(b.offered.is_empty(), "must not prompt for a key");
+        assert!(!failures_path(&p).exists());
+    }
+
+    #[test]
+    fn dual_login_expired_second_step_is_refused_and_recorded() {
+        let (p, c) = dual_vault_with("d7-expired", &[("a1", KeyGroup::A), ("b1", KeyGroup::B)]);
+        let t0 = Instant::now();
+        let mut b1 = TapBackend::tap(&c[0]);
+        let pending = Vault::dual_login_begin(&p, None, &mut b1, &mut || t0);
+        assert!(pending.is_ok(), "begin failed: {:?}", pending.err());
+        let pending = pending.unwrap();
+        let late = t0 + Duration::from_secs(121);
+        assert!(pending.is_expired(late));
+        assert_eq!(pending.remaining(late), Duration::ZERO);
+        let mut b2 = TapBackend::tap(&c[1]);
+        let r = Vault::dual_login_complete(pending, None, &mut b2, &mut || late);
+        assert!(
+            matches!(r, Err(VaultError::DualStepExpired)),
+            "got {:?}",
+            r.as_ref().map(|_| ())
+        );
+        assert!(
+            b2.offered.is_empty(),
+            "expired pending must not prompt for the second key"
+        );
+        let stamps = read_failure_sidecar(&p);
+        assert_eq!(
+            stamps.last().map(|s| s.method.as_str()),
+            Some("fido2-dual-timeout")
+        );
+    }
+
+    #[test]
+    fn dual_login_within_deadline_succeeds() {
+        let (p, c) = dual_vault_with("d7-deadline", &[("a1", KeyGroup::A), ("b1", KeyGroup::B)]);
+        let t0 = Instant::now();
+        let mut b1 = TapBackend::tap(&c[0]);
+        let pending = Vault::dual_login_begin(&p, None, &mut b1, &mut || t0);
+        assert!(pending.is_ok(), "begin failed: {:?}", pending.err());
+        let mut b2 = TapBackend::tap(&c[1]);
+        let r = Vault::dual_login_complete(pending.unwrap(), None, &mut b2, &mut || {
+            t0 + Duration::from_secs(120)
+        });
+        assert!(
+            r.is_ok(),
+            "exactly at the deadline must still succeed: {:?}",
+            r.err()
+        );
+    }
+
+    #[test]
+    fn dual_login_cancel_is_recorded_without_touching_vault() {
+        let (p, c) = dual_vault_with("d7-cancel", &[("a1", KeyGroup::A), ("b1", KeyGroup::B)]);
+        let before = fs::read(&p).unwrap();
+        let mut b1 = TapBackend::tap(&c[0]);
+        let pending = Vault::dual_login_begin(&p, None, &mut b1, &mut Instant::now);
+        assert!(pending.is_ok(), "begin failed: {:?}", pending.err());
+        pending.unwrap().cancel().unwrap();
+        assert_eq!(fs::read(&p).unwrap(), before);
+        let stamps = read_failure_sidecar(&p);
+        assert_eq!(
+            stamps.last().map(|s| s.method.as_str()),
+            Some("fido2-dual-cancel")
+        );
+    }
+
+    #[test]
+    fn dual_login_tampered_first_slot_group_fails_step1() {
+        let (p, c) = dual_vault_with(
+            "d7-tamper1",
+            &[
+                ("a1", KeyGroup::A),
+                ("a2", KeyGroup::A),
+                ("b1", KeyGroup::B),
+            ],
+        );
+        rewrite_header(&p, |h| h["key_slots"][1]["group"] = serde_json::json!("B"));
+        let mut b = TapBackend::tap(&c[1]);
+        let r = Vault::dual_login_begin(&p, None, &mut b, &mut Instant::now);
+        assert!(
+            matches!(r, Err(VaultError::Crypto(CryptoError::DecryptFailed))),
+            "got {:?}",
+            r.as_ref().map(|_| ())
+        );
+        let stamps = read_failure_sidecar(&p);
+        assert_eq!(
+            stamps.last().map(|s| s.method.as_str()),
+            Some("fido2-dual-step1:a2")
+        );
+    }
+
+    #[test]
+    fn dual_login_tampered_second_slot_group_fails_step2() {
+        let (p, c) = dual_vault_with(
+            "d7-tamper2",
+            &[
+                ("a1", KeyGroup::A),
+                ("b1", KeyGroup::B),
+                ("b2", KeyGroup::B),
+            ],
+        );
+        rewrite_header(&p, |h| h["key_slots"][2]["group"] = serde_json::json!("A"));
+        let t0 = Instant::now();
+        let mut b1 = TapBackend::tap(&c[1]); // b1（B）
+        let pending = Vault::dual_login_begin(&p, None, &mut b1, &mut || t0);
+        assert!(pending.is_ok(), "begin failed: {:?}", pending.err());
+        let before = fs::read(&p).unwrap();
+        let mut b2 = TapBackend::tap(&c[2]); // b2 被改標成 A，出現在 A 允許清單
+        let r = Vault::dual_login_complete(pending.unwrap(), None, &mut b2, &mut || t0);
+        assert!(
+            matches!(r, Err(VaultError::Crypto(CryptoError::DecryptFailed))),
+            "got {:?}",
+            r.as_ref().map(|_| ())
+        );
+        assert_eq!(fs::read(&p).unwrap(), before);
+        let stamps = read_failure_sidecar(&p);
+        assert_eq!(
+            stamps.last().map(|s| s.method.as_str()),
+            Some("fido2-dual-step2:b2")
+        );
+    }
+
+    #[test]
+    fn dual_login_refuses_when_vault_replaced_between_steps() {
+        let (p, c) = dual_vault_with("d7-replaced", &[("a1", KeyGroup::A), ("b1", KeyGroup::B)]);
+        let t0 = Instant::now();
+        let mut b1 = TapBackend::tap(&c[0]);
+        let pending = Vault::dual_login_begin(&p, None, &mut b1, &mut || t0);
+        assert!(pending.is_ok(), "begin failed: {:?}", pending.err());
+        // 兩步之間檔案被換成另一個金庫（不同 dual_slot）。
+        let (other, _) = dual_vault_with(
+            "d7-replaced-other",
+            &[("a1", KeyGroup::A), ("b1", KeyGroup::B)],
+        );
+        fs::copy(&other, &p).unwrap();
+        let mut b2 = TapBackend::tap(&c[1]);
+        let r = Vault::dual_login_complete(pending.unwrap(), None, &mut b2, &mut || t0);
+        assert!(
+            matches!(&r, Err(VaultError::Format(m)) if m.contains("已變更")),
+            "got {:?}",
+            r.as_ref().map(|_| ())
+        );
+        assert!(b2.offered.is_empty());
+    }
+
+    #[test]
+    fn dual_login_rejects_single_edition_file() {
+        let p = fresh_path("d7-v1");
+        drop(Vault::create(&p, "Pw-12345").unwrap());
+        let mut b = TapBackend::tap(&[1u8; 32]);
+        assert!(matches!(
+            Vault::dual_login_begin(&p, None, &mut b, &mut Instant::now),
+            Err(VaultError::WrongEdition {
+                vault: Edition::Single
+            })
+        ));
+    }
+
+    fn cred_fp(cred: &[u8]) -> String {
+        let digest = <sha2::Sha256 as sha2::Digest>::digest(cred);
+        digest[..4].iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    // ── D7 追加修正（審查）──
+
+    #[test]
+    fn dual_login_deadline_starts_after_first_key_completes() {
+        let (p, c) = dual_vault_with(
+            "d7r-begin-clock",
+            &[("a1", KeyGroup::A), ("b1", KeyGroup::B)],
+        );
+        let t0 = Instant::now();
+        let prompted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut b = TapBackend::tap(&c[0]);
+        b.prompted = Some(prompted.clone());
+        let mut sampled_after_prompt = Vec::new();
+        let mut clock = || {
+            sampled_after_prompt.push(prompted.load(std::sync::atomic::Ordering::SeqCst));
+            // 第一步耗時 40 秒：截止時間必須以「第一支金鑰完成」為起點。
+            t0 + Duration::from_secs(40)
+        };
+        let pending = Vault::dual_login_begin(&p, None, &mut b, &mut clock);
+        assert!(pending.is_ok(), "begin failed: {:?}", pending.err());
+        assert_eq!(
+            sampled_after_prompt,
+            vec![true],
+            "deadline clock must be sampled once, after the first key completes"
+        );
+        let pending = pending.unwrap();
+        assert_eq!(
+            pending.remaining(t0 + Duration::from_secs(40)),
+            Duration::from_secs(120)
+        );
+    }
+
+    #[test]
+    fn dual_login_second_key_completed_after_deadline_is_refused() {
+        let (p, c) = dual_vault_with(
+            "d7r-post-expiry",
+            &[("a1", KeyGroup::A), ("b1", KeyGroup::B)],
+        );
+        let t0 = Instant::now();
+        let mut b1 = TapBackend::tap(&c[0]);
+        let pending = Vault::dual_login_begin(&p, None, &mut b1, &mut || t0);
+        assert!(pending.is_ok(), "begin failed: {:?}", pending.err());
+        let before = fs::read(&p).unwrap();
+        // 第二步開始時尚未逾時（t0+100），刷完時已逾時（t0+121）。
+        let mut samples = vec![t0 + Duration::from_secs(121), t0 + Duration::from_secs(100)];
+        let mut clock = || samples.pop().unwrap_or(t0 + Duration::from_secs(121));
+        let mut b2 = TapBackend::tap(&c[1]);
+        let r = Vault::dual_login_complete(pending.unwrap(), None, &mut b2, &mut clock);
+        assert!(
+            matches!(r, Err(VaultError::DualStepExpired)),
+            "completion after the deadline must be refused, got {:?}",
+            r.as_ref().map(|_| ())
+        );
+        assert_eq!(
+            b2.offered.len(),
+            1,
+            "the second key was prompted before the deadline"
+        );
+        assert_eq!(fs::read(&p).unwrap(), before);
+        let stamps = read_failure_sidecar(&p);
+        assert_eq!(
+            stamps.last().map(|s| s.method.as_str()),
+            Some("fido2-dual-timeout")
+        );
+    }
+
+    #[test]
+    fn dual_login_just_past_deadline_is_expired() {
+        let (p, c) = dual_vault_with("d7r-just-past", &[("a1", KeyGroup::A), ("b1", KeyGroup::B)]);
+        let t0 = Instant::now();
+        let mut b1 = TapBackend::tap(&c[0]);
+        let pending = Vault::dual_login_begin(&p, None, &mut b1, &mut || t0).unwrap();
+        assert!(pending.is_expired(t0 + Duration::from_secs(120) + Duration::from_nanos(1)));
+        assert!(!pending.is_expired(t0 + Duration::from_secs(120)));
+    }
+
+    #[test]
+    fn dual_login_second_step_same_key_is_refused() {
+        let (p, c) = dual_vault_with("d7r-same-key", &[("a1", KeyGroup::A), ("b1", KeyGroup::B)]);
+        let t0 = Instant::now();
+        let mut b1 = TapBackend::tap(&c[0]);
+        let pending = Vault::dual_login_begin(&p, None, &mut b1, &mut || t0).unwrap();
+        let mut again = TapBackend::tap(&c[0]);
+        again.rogue = true;
+        let r = Vault::dual_login_complete(pending, None, &mut again, &mut || t0);
+        assert!(r.is_err(), "the first key must not satisfy step 2");
+    }
+
+    #[test]
+    fn dual_login_step2_rejected_credential_is_recorded() {
+        let (p, c) = dual_vault_with(
+            "d7r-rogue-recorded",
+            &[
+                ("a1", KeyGroup::A),
+                ("a2", KeyGroup::A),
+                ("b1", KeyGroup::B),
+            ],
+        );
+        let t0 = Instant::now();
+        let mut b1 = TapBackend::tap(&c[0]);
+        let pending = Vault::dual_login_begin(&p, None, &mut b1, &mut || t0).unwrap();
+        let mut rogue = TapBackend::tap(&c[1]);
+        rogue.rogue = true;
+        let _ = Vault::dual_login_complete(pending, None, &mut rogue, &mut || t0);
+        let stamps = read_failure_sidecar(&p);
+        assert_eq!(
+            stamps.last().map(|s| s.method.as_str()),
+            Some("fido2-dual-step2-rejected")
+        );
+    }
+
+    #[test]
+    fn dual_login_step1_unknown_credential_creates_no_pending() {
+        let (p, _c) = dual_vault_with(
+            "d7r-step1-unknown",
+            &[("a1", KeyGroup::A), ("b1", KeyGroup::B)],
+        );
+        let mut rogue = TapBackend::tap(&[9u8; 32]);
+        rogue.rogue = true;
+        let r = Vault::dual_login_begin(&p, None, &mut rogue, &mut Instant::now);
+        assert!(matches!(r, Err(VaultError::Fido(FidoError::Internal(_)))));
+    }
+
+    #[test]
+    fn dual_login_binding_mismatch_is_recorded_without_writing() {
+        let (p, c) = dual_vault_with("d7r-binding", &[("a1", KeyGroup::A), ("b1", KeyGroup::B)]);
+        let t0 = Instant::now();
+        let mut b1 = TapBackend::tap(&c[0]);
+        let pending = Vault::dual_login_begin(&p, None, &mut b1, &mut || t0).unwrap();
+        let (other, _) = dual_vault_with(
+            "d7r-binding-other",
+            &[("a1", KeyGroup::A), ("b1", KeyGroup::B)],
+        );
+        fs::copy(&other, &p).unwrap();
+        let before = fs::read(&p).unwrap();
+        let mut b2 = TapBackend::tap(&c[1]);
+        assert!(Vault::dual_login_complete(pending, None, &mut b2, &mut || t0).is_err());
+        assert_eq!(fs::read(&p).unwrap(), before);
+        let stamps = read_failure_sidecar(&p);
+        assert_eq!(
+            stamps.last().map(|s| s.method.as_str()),
+            Some("fido2-dual-binding-mismatch")
+        );
+    }
+
+    #[test]
+    fn dual_login_tampered_timeout_mirror_is_clamped_end_to_end() {
+        for (raw, expected) in [(5u32, 30u32), (99_999, 600)] {
+            let (p, c) = dual_vault_with(
+                &format!("d7r-timeout-{raw}"),
+                &[("a1", KeyGroup::A), ("b1", KeyGroup::B)],
+            );
+            rewrite_header(&p, |h| h["dual_step_timeout_secs"] = serde_json::json!(raw));
+            let t0 = Instant::now();
+            let mut b = TapBackend::tap(&c[0]);
+            let pending = Vault::dual_login_begin(&p, None, &mut b, &mut || t0).unwrap();
+            assert_eq!(pending.timeout_secs(), expected);
+            assert_eq!(
+                pending.remaining(t0),
+                Duration::from_secs(u64::from(expected))
+            );
+        }
+    }
+
+    #[test]
+    fn same_group_shares_cannot_open_dual_slot() {
+        let p = fresh_path("d7r-same-share");
+        let v = Vault::create_dual(&p, "Pw-12345").unwrap();
+        let shares = v.data.dual.clone().unwrap();
+        let a = decode_share(&shares.share_a);
+        let b = decode_share(&shares.share_b);
+        let slot = v.header.dual_slot.clone().unwrap();
+        let nonce = slot_nonce(&slot.nonce).unwrap();
+        let ct = base64_decode(&slot.ct).unwrap();
+        for (x, y) in [(a, a), (b, b), (b, a)] {
+            let wrap = crate::crypto::dual_wrap_key_from_shares(&x, &y);
+            assert!(aes_gcm_decrypt_aad(&wrap, &nonce, &ct, DUAL_SLOT_AAD).is_err());
+        }
+        let wrap = crate::crypto::dual_wrap_key_from_shares(&a, &b);
+        assert!(aes_gcm_decrypt_aad(&wrap, &nonce, &ct, DUAL_SLOT_AAD).is_ok());
+    }
+
+    #[test]
+    fn dual_pending_debug_never_shows_share_bytes() {
+        let pending = DualPending::for_test(PathBuf::from("x"), Instant::now());
+        let shown = format!("{pending:?}");
+        let hex: String = pending.share.iter().map(|b| format!("{b:02x}")).collect();
+        assert!(!shown.contains(&hex));
+        assert!(!shown.contains("7, 7, 7"), "{shown}");
+    }
+
+    #[test]
+    fn dual_pending_expire_records_timeout() {
+        let p = fresh_path("d7r-expire");
+        let pending = DualPending::for_test(p.clone(), Instant::now());
+        pending.expire().unwrap();
+        let stamps = read_failure_sidecar(&p);
+        assert_eq!(
+            stamps.last().map(|s| s.method.as_str()),
+            Some("fido2-dual-timeout")
+        );
+    }
+
+    #[test]
+    fn audit_party_escapes_separators_and_adds_fingerprint() {
+        let cred = [1u8, 2, 3];
+        assert_eq!(
+            dual_audit_party(KeyGroup::B, "x+B:y#%", &cred),
+            format!("B:x%2BB%3Ay%23%25#{}", cred_fp(&cred))
+        );
+        assert_eq!(escape_audit_label("王小明"), "王小明");
+    }
+
+    #[test]
+    fn dual_login_failure_methods_escape_labels() {
+        let (p, c) = dual_vault_with(
+            "d7r-escape-fail",
+            &[
+                ("a1", KeyGroup::A),
+                ("x+y", KeyGroup::A),
+                ("b1", KeyGroup::B),
+            ],
+        );
+        rewrite_header(&p, |h| h["key_slots"][1]["group"] = serde_json::json!("B"));
+        let mut b = TapBackend::tap(&c[1]);
+        let _ = Vault::dual_login_begin(&p, None, &mut b, &mut Instant::now);
+        let stamps = read_failure_sidecar(&p);
+        assert_eq!(
+            stamps.last().map(|s| s.method.as_str()),
+            Some("fido2-dual-step1:x%2By")
+        );
+    }
+
+    // ── D8：群組最後一支金鑰不可刪除 ──
+
+    fn slot_id(v: &Vault, label: &str) -> String {
+        v.header
+            .key_slots
+            .iter()
+            .find(|s| s.label == label)
+            .unwrap()
+            .credential_id
+            .clone()
+    }
+
+    fn reopen_dual(p: &Path) -> Vault {
+        Vault::open_password_dual(p, "Pw-12345").unwrap()
+    }
+
+    #[test]
+    fn dual_cannot_remove_last_key_of_a_group() {
+        let (p, _) = dual_vault_with("d8-last", &[("a1", KeyGroup::A), ("b1", KeyGroup::B)]);
+        let mut v = reopen_dual(&p);
+        let audit_len = v.audit().len();
+        let before = fs::read(&p).unwrap();
+        for label in ["a1", "b1"] {
+            let id = slot_id(&v, label);
+            let r = v.remove_key(&id);
+            let expected = if label == "a1" {
+                KeyGroup::A
+            } else {
+                KeyGroup::B
+            };
+            assert!(
+                matches!(r, Err(VaultError::LastKeyInGroup(g)) if g == expected),
+                "removing the last {label} must be refused, got {:?}",
+                r
+            );
+        }
+        assert_eq!(v.header.key_slots.len(), 2);
+        assert_eq!(
+            v.audit().len(),
+            audit_len,
+            "refused removal must not be audited"
+        );
+        assert_eq!(
+            fs::read(&p).unwrap(),
+            before,
+            "refused removal must not write"
+        );
+    }
+
+    #[test]
+    fn dual_can_remove_non_last_key_then_blocks_the_last() {
+        let (p, _) = dual_vault_with(
+            "d8-non-last",
+            &[
+                ("a1", KeyGroup::A),
+                ("a2", KeyGroup::A),
+                ("b1", KeyGroup::B),
+            ],
+        );
+        let mut v = reopen_dual(&p);
+        let a1 = slot_id(&v, "a1");
+        let r = v.remove_key(&a1);
+        assert!(r.is_ok(), "removing a1 (A still has a2) failed: {r:?}");
+        let last = v.audit().last().unwrap().clone();
+        assert_eq!(last.event, "key_removed");
+        assert!(last.detail.contains("group=A"), "{}", last.detail);
+        let a2 = slot_id(&v, "a2");
+        assert!(matches!(
+            v.remove_key(&a2),
+            Err(VaultError::LastKeyInGroup(KeyGroup::A))
+        ));
+        drop(v.lock());
+        assert_eq!(
+            Vault::read_header(&p, Edition::Dual)
+                .unwrap()
+                .key_slots
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn dual_single_group_only_key_is_also_protected() {
+        let (p, _) = dual_vault_with("d8-only-a", &[("a1", KeyGroup::A)]);
+        let mut v = reopen_dual(&p);
+        let a1 = slot_id(&v, "a1");
+        assert!(matches!(
+            v.remove_key(&a1),
+            Err(VaultError::LastKeyInGroup(KeyGroup::A))
+        ));
+    }
+
+    #[test]
+    fn single_edition_can_still_remove_its_only_key() {
+        let p = fresh_path("d8-single");
+        let mut v = Vault::create(&p, "Pw-12345").unwrap();
+        let mut b = MockBackend::new();
+        let reg = v.register_key_with_label(&mut b, None, "s1").unwrap();
+        assert!(v.remove_key(&base64_encode(&reg.credential_id)).is_ok());
+        assert!(v.header.key_slots.is_empty());
+        assert_eq!(
+            v.audit().last().unwrap().detail,
+            "金鑰槽已移除（該金鑰無法再解鎖）"
+        );
+    }
+
+    #[test]
+    fn last_key_in_group_reports_only_singletons() {
+        let mut h = valid_v2_header();
+        let mut a2 = sample_key_slot(Some(KeyGroup::A));
+        a2.credential_id = "QTI=".into();
+        let mut b1 = sample_key_slot(Some(KeyGroup::B));
+        b1.credential_id = "QjE=".into();
+        h.key_slots = vec![sample_key_slot(Some(KeyGroup::A)), a2, b1];
+        assert_eq!(last_key_in_group(&h, "Y3JlZA=="), None);
+        assert_eq!(last_key_in_group(&h, "QTI="), None);
+        assert_eq!(last_key_in_group(&h, "QjE="), Some(KeyGroup::B));
+        assert_eq!(last_key_in_group(&h, "bm9uZQ=="), None);
+        let mut single = sample_header(1);
+        single.key_slots = vec![sample_key_slot(None)];
+        assert_eq!(last_key_in_group(&single, "Y3JlZA=="), None);
+    }
+
+    #[test]
+    fn last_key_in_group_error_message_is_clear() {
+        let m = VaultError::LastKeyInGroup(KeyGroup::B).to_string();
+        assert!(m.contains("B 群組的最後一支金鑰"), "{m}");
+    }
+
+    #[test]
+    fn d8_non_last_removal_persists_immediately_in_both_groups() {
+        for (case, group, other) in [
+            ("a-with-b", KeyGroup::A, true),
+            ("b-with-a", KeyGroup::B, true),
+            ("a-only", KeyGroup::A, false),
+            ("b-only", KeyGroup::B, false),
+        ] {
+            let mut keys = vec![("first", group), ("remaining", group)];
+            if other {
+                keys.push(("other", group.other()));
+            }
+            let (p, _) = dual_vault_with(&format!("d8-persist-{case}"), &keys);
+            let mut v = reopen_dual(&p);
+            let removed = slot_id(&v, "first");
+            let expected: Vec<_> = v
+                .header
+                .key_slots
+                .iter()
+                .filter(|s| s.credential_id != removed)
+                .map(|s| (s.credential_id.clone(), s.group))
+                .collect();
+            assert!(v.remove_key(&removed).is_ok());
+            // Read before lock/drop can independently save again.
+            let persisted = Vault::read_header(&p, Edition::Dual).unwrap();
+            let actual: Vec<_> = persisted
+                .key_slots
+                .iter()
+                .map(|s| (s.credential_id.clone(), s.group))
+                .collect();
+            assert_eq!(actual, expected);
+            let disk = reopen_dual(&p);
+            assert!(disk.audit().iter().any(|a| a.event == "key_removed"
+                && a.detail.ends_with(&format!(" group={}", group.as_str()))));
+            let remaining = slot_id(&v, "remaining");
+            assert!(matches!(v.remove_key(&remaining),
+                Err(VaultError::LastKeyInGroup(g)) if g == group));
+        }
+    }
+
+    #[test]
+    fn d8_refusal_preserves_full_state_for_both_groups_and_unknown_ids() {
+        for (case, keys) in [
+            ("a-only", vec![("a1", KeyGroup::A)]),
+            ("b-only", vec![("b1", KeyGroup::B)]),
+            ("both", vec![("a1", KeyGroup::A), ("b1", KeyGroup::B)]),
+        ] {
+            let (p, _) = dual_vault_with(&format!("d8-state-{case}"), &keys);
+            let mut v = reopen_dual(&p);
+            let header = serde_json::to_value(&v.header).unwrap();
+            let data = serde_json::to_value(&v.data).unwrap();
+            let bytes = fs::read(&p).unwrap();
+            let targets: Vec<_> = v
+                .header
+                .key_slots
+                .iter()
+                .map(|s| (s.credential_id.clone(), s.group))
+                .collect();
+            for (id, group) in targets {
+                assert!(matches!(v.remove_key(&id),
+                    Err(VaultError::LastKeyInGroup(g)) if Some(g) == group));
+                // Boolean comparisons avoid dumping synthetic shares on assertion failure.
+                assert!(serde_json::to_value(&v.header).unwrap() == header);
+                assert!(serde_json::to_value(&v.data).unwrap() == data);
+                assert!(fs::read(&p).unwrap() == bytes);
+            }
+            assert!(matches!(
+                v.remove_key("d8-unknown-credential"),
+                Err(VaultError::Fido(FidoError::NoDevice))
+            ));
+            assert!(serde_json::to_value(&v.header).unwrap() == header);
+            assert!(serde_json::to_value(&v.data).unwrap() == data);
+            assert!(fs::read(&p).unwrap() == bytes);
+        }
+    }
+
+    #[test]
+    fn d8_duplicate_ids_remove_one_first_match_without_emptying_a_group() {
+        for cross_group in [false, true] {
+            let (p, _) = dual_vault_with(
+                &format!("d8-duplicate-{cross_group}"),
+                &[("a1", KeyGroup::A), ("a2", KeyGroup::A)],
+            );
+            let mut v = reopen_dual(&p);
+            let id = slot_id(&v, "a1");
+            v.header.key_slots[1].credential_id = id.clone();
+            if cross_group {
+                v.header.key_slots[1].group = Some(KeyGroup::B);
+            }
+            // Existing structural validation accepts duplicate IDs. Do not relax it.
+            assert!(check_header_edition(&v.header, Edition::Dual).is_ok());
+            let before = serde_json::to_value(&v.header).unwrap();
+            if cross_group {
+                assert!(matches!(
+                    v.remove_key(&id),
+                    Err(VaultError::LastKeyInGroup(KeyGroup::A))
+                ));
+                assert!(serde_json::to_value(&v.header).unwrap() == before);
+                assert_eq!(v.header.key_slots.len(), 2);
+            } else {
+                assert!(v.remove_key(&id).is_ok());
+                assert_eq!(v.header.key_slots.len(), 1);
+                assert_eq!(v.header.key_slots[0].label, "a2");
+                assert!(matches!(
+                    v.remove_key(&id),
+                    Err(VaultError::LastKeyInGroup(KeyGroup::A))
+                ));
+                assert_eq!(
+                    Vault::read_header(&p, Edition::Dual)
+                        .unwrap()
+                        .key_slots
+                        .len(),
+                    1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn d9_setting_updates_both_copies_and_persists_audit() {
+        let p = fresh_path("d9-set");
+        let mut v = Vault::create_dual(&p, "Pw-12345").unwrap();
+        for secs in [30, 60, 120, 600] {
+            let r = v.set_dual_step_timeout(secs);
+            assert!(r.is_ok(), "valid timeout must succeed: {r:?}");
+            assert_eq!(v.settings().dual_step_timeout_secs, Some(secs));
+            assert_eq!(
+                Vault::read_header(&p, Edition::Dual)
+                    .unwrap()
+                    .dual_step_timeout_secs,
+                Some(secs)
+            );
+            let disk = reopen_dual(&p);
+            assert_eq!(disk.settings().dual_step_timeout_secs, Some(secs));
+            assert!(disk.audit().iter().any(|a| a.event == "settings_changed"
+                && a.method == "manual"
+                && a.detail == format!("dual_step_timeout_secs={secs}")));
+        }
+    }
+
+    #[test]
+    fn d9_setting_rejects_out_of_range_without_any_mutation() {
+        let p = fresh_path("d9-bounds");
+        let mut v = Vault::create_dual(&p, "Pw-12345").unwrap();
+        let h = serde_json::to_value(&v.header).unwrap();
+        let d = serde_json::to_value(&v.data).unwrap();
+        let b = fs::read(&p).unwrap();
+        for secs in [0, 29, 601, u32::MAX] {
+            assert!(matches!(
+                v.set_dual_step_timeout(secs),
+                Err(VaultError::Format(_))
+            ));
+            assert!(serde_json::to_value(&v.header).unwrap() == h);
+            assert!(serde_json::to_value(&v.data).unwrap() == d);
+            assert!(fs::read(&p).unwrap() == b);
+        }
+    }
+
+    #[test]
+    fn d9_single_edition_refuses_timeout_and_remains_unchanged() {
+        let p = fresh_path("d9-single");
+        let mut v = Vault::create(&p, "Pw-12345").unwrap();
+        let h = serde_json::to_value(&v.header).unwrap();
+        let d = serde_json::to_value(&v.data).unwrap();
+        let b = fs::read(&p).unwrap();
+        assert!(matches!(
+            v.set_dual_step_timeout(60),
+            Err(VaultError::Format(_))
+        ));
+        assert!(serde_json::to_value(&v.header).unwrap() == h);
+        assert!(serde_json::to_value(&v.data).unwrap() == d);
+        assert!(fs::read(&p).unwrap() == b);
+    }
+
+    #[test]
+    fn d9_setting_write_failure_restores_settings_mirror_and_audit() {
+        let p = fresh_path("d9-write-failure");
+        let mut v = Vault::create_dual(&p, "Pw-12345").unwrap();
+        // Exercise rollback after record() has also trimmed the audit cap.
+        while v.data.audit.len() < 1000 {
+            v.data.audit.push(AuditEvent {
+                ts: now_rfc3339(),
+                event: "synthetic".into(),
+                method: "test".into(),
+                detail: String::new(),
+            });
+        }
+        v.write_file().unwrap();
+        let h = serde_json::to_value(&v.header).unwrap();
+        let d = serde_json::to_value(&v.data).unwrap();
+        let b = fs::read(&p).unwrap();
+        let tmp = p.with_extension("db.tmp");
+        assert!(!tmp.exists());
+        fs::create_dir(&tmp).unwrap(); // synthetic obstruction, never a real vault.
+        let result = v.set_dual_step_timeout(60);
+        fs::remove_dir(&tmp).unwrap();
+        assert!(matches!(result, Err(VaultError::Io(_))));
+        assert!(serde_json::to_value(&v.header).unwrap() == h);
+        assert!(serde_json::to_value(&v.data).unwrap() == d);
+        assert!(fs::read(&p).unwrap() == b);
+    }
+
+    #[test]
+    fn d9_password_unlock_repairs_raw_mirror_once_from_authenticated_settings() {
+        for raw in [
+            None,
+            Some(0u32),
+            Some(29),
+            Some(30),
+            Some(60),
+            Some(120),
+            Some(600),
+            Some(u32::MAX),
+        ] {
+            let p = fresh_path(&format!("d9-repair-{raw:?}"));
+            let mut v = Vault::create_dual(&p, "Pw-12345").unwrap();
+            assert!(v.set_dual_step_timeout(90).is_ok());
+            drop(v);
+            rewrite_header(&p, |h| {
+                if let Some(raw) = raw {
+                    h["dual_step_timeout_secs"] = serde_json::json!(raw);
+                } else {
+                    h.as_object_mut().unwrap().remove("dual_step_timeout_secs");
+                }
+            });
+            let v = reopen_dual(&p);
+            assert_eq!(v.settings().dual_step_timeout_secs, Some(90));
+            assert_eq!(
+                Vault::read_header(&p, Edition::Dual)
+                    .unwrap()
+                    .dual_step_timeout_secs,
+                Some(90)
+            );
+            let repair: Vec<_> = v
+                .audit()
+                .iter()
+                .filter(|a| a.event == "settings_tamper_detected")
+                .collect();
+            assert_eq!(repair.len(), 1);
+            assert_eq!(repair[0].method, "system");
+            assert_eq!(
+                repair[0].detail,
+                "dual_step_timeout_secs mirror repaired to 90"
+            );
+            assert_eq!(v.audit().last().unwrap().event, "login_success");
+            let disk = reopen_dual(&p);
+            assert_eq!(
+                disk.audit()
+                    .iter()
+                    .filter(|a| a.event == "settings_tamper_detected")
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn d9_successful_two_key_unlock_repairs_mirror_using_payload() {
+        let (p, c) = dual_vault_with("d9-key-repair", &[("a", KeyGroup::A), ("b", KeyGroup::B)]);
+        let mut v = reopen_dual(&p);
+        assert!(v.set_dual_step_timeout(60).is_ok());
+        drop(v);
+        rewrite_header(&p, |h| h["dual_step_timeout_secs"] = serde_json::json!(600));
+        let before = fs::read(&p).unwrap();
+        let now = Instant::now();
+        let pending =
+            Vault::dual_login_begin(&p, None, &mut TapBackend::tap(&c[0]), &mut || now).unwrap();
+        assert_eq!(pending.timeout_secs(), 600); // locked reads bounded, unauthenticated mirror.
+        assert!(
+            fs::read(&p).unwrap() == before,
+            "begin must not repair before authentication"
+        );
+        let result =
+            Vault::dual_login_complete(pending, None, &mut TapBackend::tap(&c[1]), &mut || now);
+        assert!(result.is_ok(), "two-key login failed: {:?}", result.err());
+        let v = result.unwrap();
+        assert_eq!(v.settings().dual_step_timeout_secs, Some(60));
+        assert_eq!(v.header.dual_step_timeout_secs, Some(60));
+        assert_eq!(
+            v.audit()
+                .iter()
+                .filter(|a| a.event == "settings_tamper_detected")
+                .count(),
+            1
+        );
+        assert_eq!(
+            Vault::read_header(&p, Edition::Dual)
+                .unwrap()
+                .dual_step_timeout_secs,
+            Some(60)
+        );
+        drop(v);
+        let persisted = reopen_dual(&p);
+        assert_eq!(
+            persisted
+                .audit()
+                .iter()
+                .filter(|a| a.event == "settings_tamper_detected")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn d9_matching_mirror_and_single_edition_never_report_tamper() {
+        for (tag, edition) in [("single", Edition::Single), ("dual", Edition::Dual)] {
+            let p = fresh_path(&format!("d9-no-tamper-{tag}"));
+            drop(Vault::create_for(&p, "Pw-12345", edition).unwrap());
+            let result = Vault::open_password_for(&p, "Pw-12345", edition);
+            assert!(result.is_ok(), "matching mirror login failed");
+            let v = result.unwrap();
+            assert!(!v
+                .audit()
+                .iter()
+                .any(|a| a.event == "settings_tamper_detected"));
+            if edition == Edition::Single {
+                assert!(serde_json::to_value(&v.header)
+                    .unwrap()
+                    .get("dual_step_timeout_secs")
+                    .is_none());
+                assert!(serde_json::to_value(v.settings())
+                    .unwrap()
+                    .get("dual_step_timeout_secs")
+                    .is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn d9_failed_authentication_does_not_repair_a_mirror() {
+        let p = fresh_path("d9-failed-auth");
+        drop(Vault::create_dual(&p, "Pw-12345").unwrap());
+        rewrite_header(&p, |h| h["dual_step_timeout_secs"] = serde_json::json!(600));
+        let before = fs::read(&p).unwrap();
+        assert!(Vault::open_password_dual(&p, "synthetic-wrong-password").is_err());
+        assert!(fs::read(&p).unwrap() == before);
+        assert_eq!(
+            Vault::read_header(&p, Edition::Dual)
+                .unwrap()
+                .dual_step_timeout_secs,
+            Some(600)
+        );
+    }
+
+    #[test]
+    fn d9_invalid_authenticated_timeout_fails_before_repair_or_write() {
+        for secs in [0, 29, 601, u32::MAX] {
+            let p = fresh_path(&format!("d9-invalid-payload-{secs}"));
+            let mut v = Vault::create_dual(&p, "Pw-12345").unwrap();
+            v.data.settings.dual_step_timeout_secs = Some(secs);
+            v.write_file().unwrap(); // re-encrypt synthetic invalid payload with fixture KEK.
+            drop(v);
+            rewrite_header(&p, |h| h["dual_step_timeout_secs"] = serde_json::json!(60));
+            let before = fs::read(&p).unwrap();
+            let sidecar = failures_path(&p);
+            assert!(!sidecar.exists());
+            let r = Vault::open_password_dual(&p, "Pw-12345");
+            assert!(
+                matches!(r, Err(VaultError::Format(_))),
+                "invalid payload timeout must fail closed"
+            );
+            assert!(fs::read(&p).unwrap() == before);
+            assert!(!sidecar.exists());
+            assert!(!p.with_extension("db.tmp").exists());
+        }
+    }
+
+    #[test]
+    fn d9_custom_setting_controls_new_pending_deadline() {
+        for secs in [30u32, 60, 120, 600] {
+            let (p, c) = dual_vault_with(
+                &format!("d9-pending-{secs}"),
+                &[("a", KeyGroup::A), ("b", KeyGroup::B)],
+            );
+            let mut v = reopen_dual(&p);
+            v.set_dual_step_timeout(secs).unwrap();
+            drop(v);
+            let now = Instant::now();
+            let pending =
+                Vault::dual_login_begin(&p, None, &mut TapBackend::tap(&c[0]), &mut || now)
+                    .unwrap();
+            assert_eq!(pending.timeout_secs(), secs);
+            assert!(!pending.is_expired(now + Duration::from_secs((secs - 1) as u64)));
+            assert!(!pending.is_expired(now + Duration::from_secs(secs as u64)));
+            assert!(pending
+                .is_expired(now + Duration::from_secs(secs as u64) + Duration::from_nanos(1)));
+            pending.cancel().unwrap();
+        }
+    }
+
+    #[test]
+    fn d9_failed_second_key_does_not_repair_before_full_authentication() {
+        let (p, c) = dual_vault_with(
+            "d9-second-failure",
+            &[("a", KeyGroup::A), ("b", KeyGroup::B)],
+        );
+        rewrite_header(&p, |h| h["dual_step_timeout_secs"] = serde_json::json!(600));
+        let before = fs::read(&p).unwrap();
+        let now = Instant::now();
+        let pending =
+            Vault::dual_login_begin(&p, None, &mut TapBackend::tap(&c[0]), &mut || now).unwrap();
+        let result =
+            Vault::dual_login_complete(pending, None, &mut TapBackend::tap(&c[0]), &mut || now);
+        assert!(result.is_err());
+        assert!(fs::read(&p).unwrap() == before);
+        assert_eq!(
+            Vault::read_header(&p, Edition::Dual)
+                .unwrap()
+                .dual_step_timeout_secs,
+            Some(600)
+        );
+    }
+
+    #[test]
+    fn d9_raw_mismatch_is_repaired_even_when_clamp_matches_authority() {
+        for (secs, mirror) in [(30, Some(0u32)), (600, Some(u32::MAX)), (120, None)] {
+            let p = fresh_path(&format!("d9-raw-not-clamp-{secs}"));
+            let mut v = Vault::create_dual(&p, "Pw-12345").unwrap();
+            v.set_dual_step_timeout(secs).unwrap();
+            drop(v);
+            rewrite_header(&p, |h| {
+                if let Some(raw) = mirror {
+                    h["dual_step_timeout_secs"] = serde_json::json!(raw);
+                } else {
+                    h.as_object_mut().unwrap().remove("dual_step_timeout_secs");
+                }
+            });
+            let h = Vault::read_header(&p, Edition::Dual).unwrap();
+            assert_eq!(effective_dual_step_timeout_secs(&h), secs);
+            let v = reopen_dual(&p);
+            assert_eq!(v.header.dual_step_timeout_secs, Some(secs));
+            assert_eq!(
+                v.audit()
+                    .iter()
+                    .filter(|a| a.event == "settings_tamper_detected")
+                    .count(),
+                1
+            );
+            let persisted = reopen_dual(&p);
+            assert_eq!(
+                persisted
+                    .audit()
+                    .iter()
+                    .filter(|a| a.event == "settings_tamper_detected")
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn d9_missing_authoritative_setting_fails_without_repair_or_write() {
+        let p = fresh_path("d9-missing-authority");
+        let mut v = Vault::create_dual(&p, "Pw-12345").unwrap();
+        v.data.settings.dual_step_timeout_secs = None;
+        v.write_file().unwrap();
+        drop(v);
+        rewrite_header(&p, |h| h["dual_step_timeout_secs"] = serde_json::json!(60));
+        let before = fs::read(&p).unwrap();
+        assert!(!failures_path(&p).exists());
+        assert!(matches!(
+            Vault::open_password_dual(&p, "Pw-12345"),
+            Err(VaultError::Format(_))
+        ));
+        assert!(fs::read(&p).unwrap() == before);
+        assert!(!failures_path(&p).exists());
+        assert!(!p.with_extension("db.tmp").exists());
+    }
+
+    #[test]
+    fn d9_non_u32_header_values_keep_existing_fail_closed_parse() {
+        for value in [
+            serde_json::json!("120"),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!(4294967296u64),
+        ] {
+            let p = fresh_path("d9-malformed-header");
+            drop(Vault::create_dual(&p, "Pw-12345").unwrap());
+            rewrite_header(&p, |h| h["dual_step_timeout_secs"] = value);
+            let before = fs::read(&p).unwrap();
+            assert!(Vault::read_header(&p, Edition::Dual).is_err());
+            assert!(Vault::open_password_dual(&p, "Pw-12345").is_err());
+            assert!(fs::read(&p).unwrap() == before);
+            assert!(!p.with_extension("db.tmp").exists());
+            assert!(!failures_path(&p).exists());
+        }
+    }
+
+    #[test]
+    fn d9_setting_rename_failure_restores_state_and_keeps_original_vault() {
+        let p = fresh_path("d9-rename-failure");
+        let mut v = Vault::create_dual(&p, "Pw-12345").unwrap();
+        let h = serde_json::to_value(&v.header).unwrap();
+        let d = serde_json::to_value(&v.data).unwrap();
+        let before = fs::read(&p).unwrap();
+        // Synthetic directory destination makes write(tmp) succeed, rename fail.
+        let blocked = p.with_extension("synthetic-blocked");
+        fs::create_dir(&blocked).unwrap();
+        v.path = blocked.clone();
+        let result = v.set_dual_step_timeout(60);
+        let tmp = blocked.with_extension("db.tmp");
+        let temp_was_written = tmp.is_file();
+        if temp_was_written {
+            fs::remove_file(&tmp).unwrap();
+        }
+        fs::remove_dir(&blocked).unwrap();
+        v.path = p.clone();
+        assert!(
+            temp_was_written,
+            "failure must occur AFTER temporary ciphertext write"
+        );
+        assert!(matches!(result, Err(VaultError::Io(_))));
+        assert!(serde_json::to_value(&v.header).unwrap() == h);
+        assert!(serde_json::to_value(&v.data).unwrap() == d);
+        assert!(fs::read(&p).unwrap() == before);
+    }
+
+    #[test]
+    fn d9_repair_save_failure_preserves_vault_and_failure_sidecar() {
+        let p = fresh_path("d9-repair-save-failure");
+        drop(Vault::create_dual(&p, "Pw-12345").unwrap());
+        rewrite_header(&p, |h| h["dual_step_timeout_secs"] = serde_json::json!(600));
+        record_login_failure(&p, "synthetic-existing-failure").unwrap();
+        let before = fs::read(&p).unwrap();
+        let failure_before = fs::read(failures_path(&p)).unwrap();
+        let tmp = p.with_extension("db.tmp");
+        fs::create_dir(&tmp).unwrap();
+        let result = Vault::open_password_dual(&p, "Pw-12345");
+        fs::remove_dir(&tmp).unwrap();
+        assert!(matches!(result, Err(VaultError::Io(_))));
+        assert!(fs::read(&p).unwrap() == before);
+        assert!(fs::read(failures_path(&p)).unwrap() == failure_before);
+        let v = reopen_dual(&p);
+        assert_eq!(v.header.dual_step_timeout_secs, Some(120));
+        assert_eq!(
+            v.audit()
+                .iter()
+                .filter(|a| a.event == "settings_tamper_detected")
+                .count(),
+            1
+        );
+        assert!(v
+            .audit()
+            .iter()
+            .any(|a| a.event == "login_failed" && a.method == "synthetic-existing-failure"));
+        assert!(!failures_path(&p).exists());
+    }
+
+    #[test]
+    fn d11_mirror_mismatch_with_corrupted_payload_tag_does_not_repair() {
+        let p = fresh_path("d11-corrupt-tag");
+        drop(Vault::create_dual(&p, "Pw-12345").unwrap());
+        rewrite_header(&p, |h| h["dual_step_timeout_secs"] = serde_json::json!(600));
+        let mut bytes = fs::read(&p).unwrap();
+        *bytes.last_mut().unwrap() ^= 0x01; // synthetic payload GCM tag corruption.
+        fs::write(&p, &bytes).unwrap();
+        record_login_failure(&p, "synthetic-existing-failure").unwrap();
+        let before = fs::read(&p).unwrap();
+        let failure_before = fs::read(failures_path(&p)).unwrap();
+        let r = Vault::open_password_dual(&p, "Pw-12345");
+        // Password slot opens; payload decrypt fails via `?` in unlock(), which records no failure.
+        assert!(
+            matches!(r, Err(VaultError::Crypto(CryptoError::DecryptFailed))),
+            "corrupted payload tag must fail closed: {:?}",
+            r.err()
+        );
+        assert!(fs::read(&p).unwrap() == before);
+        assert!(!p.with_extension("db.tmp").exists());
+        assert!(fs::read(failures_path(&p)).unwrap() == failure_before);
+        assert_eq!(
+            Vault::read_header(&p, Edition::Dual)
+                .unwrap()
+                .dual_step_timeout_secs,
+            Some(600)
+        );
+    }
+
+    #[test]
+    fn d11_dual_key_login_rejects_missing_or_out_of_range_authority_with_sidecar() {
+        for authority in [None, Some(29u32), Some(601)] {
+            let (p, c) = dual_vault_with(
+                &format!("d11-key-authority-{authority:?}"),
+                &[("a", KeyGroup::A), ("b", KeyGroup::B)],
+            );
+            let mut v = reopen_dual(&p);
+            v.data.settings.dual_step_timeout_secs = authority;
+            v.write_file().unwrap(); // re-encrypt synthetic invalid payload with fixture KEK.
+            drop(v);
+            assert_eq!(
+                Vault::read_header(&p, Edition::Dual)
+                    .unwrap()
+                    .dual_step_timeout_secs,
+                Some(120)
+            );
+            record_login_failure(&p, "synthetic-existing-failure").unwrap();
+            let before = fs::read(&p).unwrap();
+            let failure_before = fs::read(failures_path(&p)).unwrap();
+            let r = two_step(&p, &c[0], &c[1]);
+            assert!(
+                matches!(r, Err(VaultError::Format(_))),
+                "authority {authority:?} must fail closed: {:?}",
+                r.err()
+            );
+            assert!(fs::read(&p).unwrap() == before);
+            assert!(!p.with_extension("db.tmp").exists());
+            assert!(fs::read(failures_path(&p)).unwrap() == failure_before);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn d11_repair_login_rename_failure_preserves_vault_and_failure_sidecar() {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x1;
+        let p = fresh_path("d11-repair-rename-failure");
+        drop(Vault::create_dual(&p, "Pw-12345").unwrap());
+        rewrite_header(&p, |h| h["dual_step_timeout_secs"] = serde_json::json!(600));
+        record_login_failure(&p, "synthetic-existing-failure").unwrap();
+        let before = fs::read(&p).unwrap();
+        let failure_before = fs::read(failures_path(&p)).unwrap();
+        let tmp = p.with_extension("db.tmp");
+        assert!(!tmp.exists());
+        // Synthetic reader that denies delete sharing: reads still work, replacing vault.db fails.
+        let guard = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&p)
+            .unwrap();
+        assert!(
+            fs::read(&p).unwrap() == before,
+            "login read must work with guard open"
+        );
+        let result = Vault::open_password_dual(&p, "Pw-12345");
+        let temp_was_written = tmp.is_file();
+        drop(guard);
+        if temp_was_written {
+            fs::remove_file(&tmp).unwrap();
+        }
+        assert!(
+            temp_was_written,
+            "failure must occur AFTER temporary ciphertext write"
+        );
+        assert!(
+            matches!(result, Err(VaultError::Io(_))),
+            "rename failure must surface as Io: {:?}",
+            result.err()
+        );
+        assert!(fs::read(&p).unwrap() == before);
+        assert!(fs::read(failures_path(&p)).unwrap() == failure_before);
+        let v = reopen_dual(&p);
+        assert_eq!(v.header.dual_step_timeout_secs, Some(120));
+        assert_eq!(
+            v.audit()
+                .iter()
+                .filter(|a| a.event == "settings_tamper_detected")
+                .count(),
+            1
+        );
+        assert!(v
+            .audit()
+            .iter()
+            .any(|a| a.event == "login_failed" && a.method == "synthetic-existing-failure"));
+        assert!(!failures_path(&p).exists());
+        assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn dual_step_timeout_mirror_is_clamped() {
+        let mut h = valid_v2_header();
+        h.dual_step_timeout_secs = None;
+        assert_eq!(effective_dual_step_timeout_secs(&h), 120);
+        h.dual_step_timeout_secs = Some(5);
+        assert_eq!(effective_dual_step_timeout_secs(&h), 30);
+        h.dual_step_timeout_secs = Some(99_999);
+        assert_eq!(effective_dual_step_timeout_secs(&h), 600);
+        h.dual_step_timeout_secs = Some(90);
+        assert_eq!(effective_dual_step_timeout_secs(&h), 90);
+    }
+
+    #[test]
+    fn single_registration_keeps_legacy_call_without_exclusion() {
+        let p = fresh_path("d6-single-legacy");
+        let mut v = Vault::create(&p, "Pw-12345").unwrap();
+        let mut rec = RecordingBackend {
+            inner: MockBackend::new(),
+            calls: Vec::new(),
+        };
+        v.register_key_with_label(&mut rec, None, "s1").unwrap();
+        let mut rec2 = RecordingBackend {
+            inner: MockBackend::new(),
+            calls: Vec::new(),
+        };
+        v.register_key_with_label(&mut rec2, None, "s2").unwrap();
+        assert_eq!(rec.calls, vec![None]);
+        assert_eq!(rec2.calls, vec![None]);
+    }
+
+    #[test]
+    fn read_header_for_dual_edition_rejects_v1_file() {
+        let d = tmp_dir("d3-v1-reject");
+        let p = d.join("vault.db");
+        let _ = fs::remove_file(&p);
+        drop(Vault::create(&p, "Pw-12345").unwrap());
+        assert!(matches!(
+            Vault::read_header(&p, Edition::Dual),
+            Err(VaultError::WrongEdition {
+                vault: Edition::Single
+            })
+        ));
+        assert!(Vault::read_header(&p, Edition::Single).is_ok());
     }
 
     #[test]

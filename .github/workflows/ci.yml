@@ -47,6 +47,15 @@ jobs:
           CARGO_INCREMENTAL: 0
         run: cargo test --lib --locked --features real-ctap -j 1
 
+      - name: Run Rust unit tests (dual-control edition, no hardware)
+        working-directory: src-tauri
+        env:
+          CARGO_BUILD_JOBS: 1
+          CARGO_PROFILE_TEST_DEBUG: 0
+          CARGO_PROFILE_DEV_DEBUG: 0
+          CARGO_INCREMENTAL: 0
+        run: cargo test --lib --locked --features real-ctap,dual-control -j 1
+
       - name: Build mock CLI for offline Gate E2E
         working-directory: src-tauri
         run: cargo build --release --locked --example vault_cli
@@ -62,6 +71,25 @@ jobs:
             throw "Refusing to use a pre-existing test directory: $gateRoot"
           }
           python ../scripts/gate_e2e.py $gateRoot
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+      - name: Build dual-control mock CLI for offline Gate E2E
+        working-directory: src-tauri
+        run: cargo build --release --locked --features dual-control --example dual_vault_cli
+
+      - name: Run dual-control mock Gate E2E
+        working-directory: src-tauri
+        shell: pwsh
+        env:
+          PYTHONUTF8: '1'
+        run: |
+          $gateRoot = Join-Path $env:RUNNER_TEMP "fido-vault-dual-gate-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          if (Test-Path -LiteralPath $gateRoot) {
+            throw "Refusing to use a pre-existing test directory: $gateRoot"
+          }
+          python ../scripts/gate_e2e_dual.py $gateRoot
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
           }
