@@ -12,6 +12,17 @@ path = "src/lib.rs"
 name = "vault_cli"
 path = "examples/vault_cli.rs"
 
+# 單人版（預設）。明確宣告以免自動探索規則改變時漏掉。
+[[bin]]
+name = "portable-fido-vault"
+path = "src/main.rs"
+
+# 雙群組控管版：只在啟用 dual-control 時編譯（docs/plans/dual-control.md §5）。
+[[bin]]
+name = "portable-fido-vault-dual"
+path = "src/bin/portable-fido-vault-dual.rs"
+required-features = ["dual-control"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -51,6 +62,8 @@ default = ["mock-fido"]
 mock-fido = []
 # real-ctap: 實體 FIDO2 後端；CLI/診斷用 raw CTAP，Windows GUI 走系統 WebAuthn API
 real-ctap = ["dep:authenticator"]
+# dual-control: 雙群組（A/B）金鑰控管版；只用於 portable-fido-vault-dual 執行檔
+dual-control = []
 
 [profile.release]
 strip = true

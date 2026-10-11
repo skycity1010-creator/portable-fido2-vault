@@ -217,4 +217,17 @@ KEK（隨機 256-bit，加解密 payload；與 v1 相同）
 ## 10. 進度
 
 - [x] 需求確認（Q1–Q6）與設計文件
-- [ ] D1–D13（待使用者明確指示開始實作）
+- [x] D1 edition feature / 第二執行檔 / `get_edition()`（見 §11）
+- [ ] D2–D13
+
+## 11. 驗證紀錄
+
+### D1（2026-10-11）
+
+- 變更：`Cargo.toml` 新增 feature `dual-control`，並明確宣告兩個 `[[bin]]`：`portable-fido-vault`、`portable-fido-vault-dual`（後者 `required-features = ["dual-control"]`）；新增 `src/edition.rs`（`Edition` / `edition_for` / `current`）與 Tauri IPC `get_edition()`；`main.rs` 在啟用 `dual-control` 時以 `compile_error!` 拒絕編譯；CI 新增 dual-control 單元測試步驟。
+- TDD：RED 為 2 個 assertion 失敗（`edition_for(true)` 回 `Single`；序列化結果是 `"Single"` 而非 `"single"`）→ GREEN。
+- Rust MSVC lib 測試：單人版 `real-ctap` 204/204（baseline 200 + 4）；雙人版 `real-ctap,dual-control` 204/204。
+- Node 65/65；`node --check src/app.js`、`git diff --check` 通過。
+- GNU Release：`--features real-ctap` 8m00s 成功（未編出 dual bin）；`--features real-ctap,dual-control --bin portable-fido-vault-dual` 成功。兩者都是 non-deployable scratch 產物，不部署。
+- 反向防護（預期失敗）：單人版 bin 加 `dual-control` → 出現自訂的 `compile_error`；dual bin 不加 feature → Cargo 回 `requires the features: dual-control`。
+- 既有 warning（`windows_webauthn.rs` `try_lock`、`yk_open_test`）是 baseline 就有的，D1 沒有新增 warning。

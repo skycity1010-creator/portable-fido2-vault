@@ -21,6 +21,7 @@ use crate::windows_webauthn::WindowsWebAuthnBackend;
 
 pub mod crypto;
 pub mod csv_import;
+pub mod edition;
 #[cfg(feature = "real-ctap")]
 pub mod diag_log;
 pub mod fido2;
@@ -391,6 +392,12 @@ fn raise_key_operation_window(
 }
 
 // ─────────────────────────── commands ───────────────────────────
+
+/// 產品版本（"single" / "dual"），前端依此切換雙群組控管 UI。
+#[tauri::command]
+fn get_edition() -> edition::Edition {
+    edition::current()
+}
 
 /// 啟動畫面資訊：是否有金庫、已註冊金鑰清單（供登入畫面）。
 #[tauri::command]
@@ -835,6 +842,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            get_edition,
             boot_info,
             create_vault,
             login_password,

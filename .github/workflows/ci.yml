@@ -47,6 +47,15 @@ jobs:
           CARGO_INCREMENTAL: 0
         run: cargo test --lib --locked --features real-ctap -j 1
 
+      - name: Run Rust unit tests (dual-control edition, no hardware)
+        working-directory: src-tauri
+        env:
+          CARGO_BUILD_JOBS: 1
+          CARGO_PROFILE_TEST_DEBUG: 0
+          CARGO_PROFILE_DEV_DEBUG: 0
+          CARGO_INCREMENTAL: 0
+        run: cargo test --lib --locked --features real-ctap,dual-control -j 1
+
       - name: Build mock CLI for offline Gate E2E
         working-directory: src-tauri
         run: cargo build --release --locked --example vault_cli
