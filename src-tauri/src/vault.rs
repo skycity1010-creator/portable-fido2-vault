@@ -15,9 +15,9 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::crypto::{
     aes_gcm_decrypt, aes_gcm_decrypt_aad, aes_gcm_encrypt, aes_gcm_encrypt_aad, argon2id_derive,
-    base64_decode, base64_encode, dual_wrap_key_from_shares, kek_from_prf_secret, random_kek,
-    random_nonce, CryptoError, KeyGroup, DUAL_SLOT_AAD, FORMAT_VERSION, FORMAT_VERSION_DUAL,
-    VAULT_MAGIC,
+    base64_decode, base64_encode, dual_key_slot_aad, dual_wrap_key_from_shares,
+    kek_from_prf_secret, random_kek, random_nonce, CryptoError, KeyGroup, DUAL_SLOT_AAD,
+    FORMAT_VERSION, FORMAT_VERSION_DUAL, VAULT_MAGIC,
 };
 use crate::csv_import::{ImportAction, ImportPlan, ImportPreview};
 use crate::edition::Edition;
@@ -997,7 +997,7 @@ impl Vault {
         backend: &mut (dyn FidoBackend + 'static),
         pin: Option<&str>,
     ) -> Result<RegisteredCredential, VaultError> {
-        self.register_key_internal(backend, pin, None)
+        self.register_key_internal(backend, pin, None, None)
     }
 
     /// Register with a FidoVault-local alias. Validate it before querying the authenticator.
@@ -1008,7 +1008,49 @@ impl Vault {
         candidate_label: &str,
     ) -> Result<RegisteredCredential, VaultError> {
         let label = self.validate_new_key_label(candidate_label)?;
-        self.register_key_internal(backend, pin, Some(&label))
+        self.register_key_internal(backend, pin, Some(&label), None)
+    }
+
+    /// 雙群組控管版：註冊金鑰並指定群組（§4.2）。以該群組 share 包裝槽位，AAD 綁定群組與 credential。
+    pub fn register_key_in_group(
+        &mut self,
+        backend: &mut (dyn FidoBackend + 'static),
+        pin: Option<&str>,
+        candidate_label: &str,
+        group: KeyGroup,
+    ) -> Result<RegisteredCredential, VaultError> {
+        if self.edition() != Edition::Dual {
+            return Err(VaultError::Format("單人版金庫不支援金鑰群組".into()));
+        }
+        let label = self.validate_new_key_label(candidate_label)?;
+        self.register_key_internal(backend, pin, Some(&label), Some(group))
+    }
+
+    /// 依金庫版本分派註冊：單人版不可帶群組；雙人版必須帶群組。
+    pub fn register_key_for(
+        &mut self,
+        backend: &mut (dyn FidoBackend + 'static),
+        pin: Option<&str>,
+        candidate_label: &str,
+        group: Option<KeyGroup>,
+    ) -> Result<RegisteredCredential, VaultError> {
+        match group {
+            None => self.register_key_with_label(backend, pin, candidate_label),
+            Some(group) => self.register_key_in_group(backend, pin, candidate_label, group),
+        }
+    }
+
+    /// 已解鎖 session 的群組 share（只在雙人版有；payload 形狀已於解鎖時驗證）。
+    fn group_share(&self, group: KeyGroup) -> Result<Zeroizing<[u8; 32]>, VaultError> {
+        let shares = self
+            .data
+            .dual
+            .as_ref()
+            .ok_or_else(|| VaultError::Format("v2 金庫 payload 缺少 share".into()))?;
+        match group {
+            KeyGroup::A => decode_share(&shares.share_a),
+            KeyGroup::B => decode_share(&shares.share_b),
+        }
     }
 
     /// Validate a proposed local alias against every slot already stored in this vault.
@@ -1038,13 +1080,21 @@ impl Vault {
         backend: &mut (dyn FidoBackend + 'static),
         pin: Option<&str>,
         custom_label: Option<&str>,
+        group: Option<KeyGroup>,
     ) -> Result<RegisteredCredential, VaultError> {
-        // 雙群組控管版必須走指定群組的註冊路徑（D5）；這裡 fail closed，不呼叫 authenticator。
-        if self.edition() == Edition::Dual {
-            return Err(VaultError::Format(
-                "雙群組控管版註冊金鑰須指定群組（A 或 B）".into(),
-            ));
-        }
+        // 版本與群組必須一致；不一致時 fail closed，不呼叫 authenticator。
+        let share = match (self.edition(), group) {
+            (Edition::Dual, None) => {
+                return Err(VaultError::Format(
+                    "雙群組控管版註冊金鑰須指定群組（A 或 B）".into(),
+                ));
+            }
+            (Edition::Single, Some(_)) => {
+                return Err(VaultError::Format("單人版金庫不支援金鑰群組".into()));
+            }
+            (Edition::Dual, Some(group)) => Some(self.group_share(group)?),
+            (Edition::Single, None) => None,
+        };
         // 裁決②：不支援 hmac-secret/PRF 的金鑰拒絕註冊。
         // 順序：先 detect()（real 後端需 getInfo 才能知 PRF 能力；mock 的 detect 為無害循環），
         // 再 prf_supported()（依 detect 快取的資訊判定）。
@@ -1056,7 +1106,16 @@ impl Vault {
         let secret = backend.get_prf_secret(&reg.credential_id, pin)?;
         let k = kek_from_prf_secret(&secret);
         let nonce = random_nonce();
-        let ct = aes_gcm_encrypt(&k, &nonce, self.kek.as_slice());
+        // 單人版：槽位包 KEK。雙人版：槽位只包該群組 share，AAD 綁定群組與 credential_id。
+        let ct = match (group, share.as_ref()) {
+            (Some(group), Some(share)) => aes_gcm_encrypt_aad(
+                &k,
+                &nonce,
+                share.as_slice(),
+                &dual_key_slot_aad(group, &reg.credential_id),
+            ),
+            _ => aes_gcm_encrypt(&k, &nonce, self.kek.as_slice()),
+        };
 
         if let Some(label) = custom_label {
             reg.label = label.to_owned();
@@ -1066,16 +1125,16 @@ impl Vault {
             aaguid: hex32_16(reg.aaguid),
             label: reg.label.clone(),
             key_type: reg.kind,
-            group: None,
+            group,
             nonce: base64_encode(&nonce),
             ct: base64_encode(&ct),
         });
         let kind_str = format!("{}", reg.kind);
-        self.record(
-            "key_registered",
-            &format!("fido2:{}", reg.label),
-            &format!("type={kind_str}"),
-        )?;
+        let detail = match group {
+            Some(group) => format!("type={kind_str} group={group:?}"),
+            None => format!("type={kind_str}"),
+        };
+        self.record("key_registered", &format!("fido2:{}", reg.label), &detail)?;
         Ok(reg)
     }
 
@@ -1708,6 +1767,199 @@ mod tests {
         assert!(named.is_err());
         assert!(v.header.key_slots.is_empty());
         assert!(Vault::read_header(&p, Edition::Dual).is_ok());
+    }
+
+    // ── D5：雙群組註冊 ──
+
+    /// 計數用後端：記錄 detect/register 呼叫次數（驗證失敗時不碰 authenticator）。
+    struct CountingBackend {
+        inner: MockBackend,
+        detects: u32,
+        registers: u32,
+    }
+
+    impl CountingBackend {
+        fn new() -> Self {
+            Self {
+                inner: MockBackend::new(),
+                detects: 0,
+                registers: 0,
+            }
+        }
+    }
+
+    impl FidoBackend for CountingBackend {
+        fn detect(&mut self) -> Result<crate::fido2::DetectedKey, FidoError> {
+            self.detects += 1;
+            self.inner.detect()
+        }
+        fn register_credential(
+            &mut self,
+            d: &crate::fido2::DetectedKey,
+            pin: Option<&str>,
+        ) -> Result<crate::fido2::RegisteredCredential, FidoError> {
+            self.registers += 1;
+            self.inner.register_credential(d, pin)
+        }
+        fn get_prf_secret(&mut self, id: &[u8], pin: Option<&str>) -> Result<[u8; 32], FidoError> {
+            self.inner.get_prf_secret(id, pin)
+        }
+        fn prf_supported(&self) -> bool {
+            self.inner.prf_supported()
+        }
+    }
+
+    /// 以金鑰 PRF 解開槽位（帶指定群組 AAD），回傳明文。
+    fn unwrap_group_slot(
+        slot: &KeySlot,
+        backend: &mut dyn FidoBackend,
+        aad_group: KeyGroup,
+    ) -> Result<Vec<u8>, CryptoError> {
+        let cred = base64_decode(&slot.credential_id).unwrap();
+        let secret = backend.get_prf_secret(&cred, None).unwrap();
+        let k = kek_from_prf_secret(&secret);
+        crate::crypto::aes_gcm_decrypt_aad(
+            &k,
+            &slot_nonce(&slot.nonce).unwrap(),
+            &base64_decode(&slot.ct).unwrap(),
+            &crate::crypto::dual_key_slot_aad(aad_group, &cred),
+        )
+    }
+
+    #[test]
+    fn dual_register_in_group_wraps_that_groups_share() {
+        let p = fresh_path("d5-register-ab");
+        let mut v = Vault::create_dual(&p, "Pw-12345").unwrap();
+        let mut backend = MockBackend::new();
+        let ra = v.register_key_in_group(&mut backend, None, "王小明", KeyGroup::A);
+        assert!(ra.is_ok(), "register A failed: {:?}", ra.err());
+        // MockBackend 每次 detect 會循環金鑰類型（第二支為 PIN 型）；每支金鑰用新的 mock 實例。
+        // PRF 由 credential_id 決定，任一 mock 實例都能解包。
+        let mut backend_b = MockBackend::new();
+        let rb = v.register_key_in_group(&mut backend_b, None, "李大華", KeyGroup::B);
+        assert!(rb.is_ok(), "register B failed: {:?}", rb.err());
+        assert_eq!(v.header.key_slots.len(), 2);
+
+        let shares = v.data.dual.clone().unwrap();
+        let share_a = decode_share(&shares.share_a);
+        let share_b = decode_share(&shares.share_b);
+        let slot_a = v.header.key_slots[0].clone();
+        let slot_b = v.header.key_slots[1].clone();
+        assert_eq!(slot_a.group, Some(KeyGroup::A));
+        assert_eq!(slot_b.group, Some(KeyGroup::B));
+        assert_eq!(slot_a.label, "王小明");
+
+        let a_plain = unwrap_group_slot(&slot_a, &mut backend, KeyGroup::A).unwrap();
+        assert_eq!(a_plain.as_slice(), share_a.as_slice());
+        assert_ne!(
+            a_plain.as_slice(),
+            v.kek.as_slice(),
+            "slot must not wrap the KEK"
+        );
+        let b_plain = unwrap_group_slot(&slot_b, &mut backend, KeyGroup::B).unwrap();
+        assert_eq!(b_plain.as_slice(), share_b.as_slice());
+        // 群組標記被改：AAD 不符 → 解包失敗。
+        assert!(unwrap_group_slot(&slot_a, &mut backend, KeyGroup::B).is_err());
+        assert!(unwrap_group_slot(&slot_b, &mut backend, KeyGroup::A).is_err());
+    }
+
+    #[test]
+    fn dual_registration_persists_and_audits_group() {
+        let p = fresh_path("d5-persist");
+        let mut v = Vault::create_dual(&p, "Pw-12345").unwrap();
+        let mut backend = MockBackend::new();
+        let r = v.register_key_in_group(&mut backend, None, "k-a", KeyGroup::A);
+        assert!(r.is_ok(), "register failed: {:?}", r.err());
+        let last = v.audit().last().unwrap().clone();
+        assert_eq!(last.event, "key_registered");
+        assert_eq!(last.method, "fido2:k-a");
+        assert!(last.detail.contains("group=A"), "{}", last.detail);
+        drop(v.lock());
+
+        let raw = raw_header_json(&p);
+        assert_eq!(raw["key_slots"][0]["group"], serde_json::json!("A"));
+        assert!(Vault::read_header(&p, Edition::Dual).is_ok());
+        let reopened = Vault::open_password_dual(&p, "Pw-12345");
+        assert!(reopened.is_ok(), "reopen failed: {:?}", reopened.err());
+    }
+
+    #[test]
+    fn dual_registration_validates_label_before_authenticator() {
+        let p = fresh_path("d5-label");
+        let mut v = Vault::create_dual(&p, "Pw-12345").unwrap();
+        let mut backend = CountingBackend::new();
+        assert!(v
+            .register_key_in_group(&mut backend, None, "dup", KeyGroup::A)
+            .is_ok());
+        let detects = backend.detects;
+        for bad in ["", "   ", "DUP", "bad\u{7}name"] {
+            assert!(v
+                .register_key_in_group(&mut backend, None, bad, KeyGroup::B)
+                .is_err());
+        }
+        assert_eq!(
+            backend.detects, detects,
+            "invalid labels must not reach the key"
+        );
+        assert_eq!(v.header.key_slots.len(), 1);
+    }
+
+    #[test]
+    fn dual_registration_rejects_non_prf_key_without_slot() {
+        let p = fresh_path("d5-noprf");
+        let mut v = Vault::create_dual(&p, "Pw-12345").unwrap();
+        let mut bad = NoPrfBackend(MockBackend::new());
+        let r = v.register_key_in_group(&mut bad, None, "k", KeyGroup::A);
+        assert!(
+            matches!(r, Err(VaultError::Fido(FidoError::PrfNotSupported))),
+            "expected PrfNotSupported, got {:?}",
+            r.as_ref().map(|_| ())
+        );
+        assert!(v.header.key_slots.is_empty());
+    }
+
+    #[test]
+    fn single_vault_rejects_group_registration_without_authenticator() {
+        let p = fresh_path("d5-single-group");
+        let mut v = Vault::create(&p, "Pw-12345").unwrap();
+        let mut backend = CountingBackend::new();
+        let r = v.register_key_in_group(&mut backend, None, "k", KeyGroup::A);
+        assert!(
+            matches!(&r, Err(VaultError::Format(m)) if m.contains("單人版")),
+            "single vault must refuse groups, got {:?}",
+            r.as_ref().map(|_| ())
+        );
+        assert_eq!(backend.detects, 0);
+        assert!(v.header.key_slots.is_empty());
+    }
+
+    #[test]
+    fn register_key_for_dispatches_by_vault_edition() {
+        // 單人版：無群組 → 註冊；有群組 → 拒絕
+        let single = fresh_path("d5-dispatch-single");
+        let mut v1 = Vault::create(&single, "Pw-12345").unwrap();
+        let mut backend = CountingBackend::new();
+        assert!(v1.register_key_for(&mut backend, None, "s1", None).is_ok());
+        assert_eq!(v1.header.key_slots[0].group, None);
+        let before = backend.detects;
+        assert!(v1
+            .register_key_for(&mut backend, None, "s2", Some(KeyGroup::A))
+            .is_err());
+        assert_eq!(backend.detects, before);
+        assert_eq!(v1.header.key_slots.len(), 1);
+
+        // 雙人版：有群組 → 註冊；無群組 → 拒絕
+        let dual = fresh_path("d5-dispatch-dual");
+        let mut v2 = Vault::create_dual(&dual, "Pw-12345").unwrap();
+        // 新的 mock 實例：避免 detect 循環到 PIN 型金鑰（與受測行為無關）。
+        let mut backend = CountingBackend::new();
+        let r = v2.register_key_for(&mut backend, None, "d1", Some(KeyGroup::B));
+        assert!(r.is_ok(), "dual dispatch failed: {:?}", r.err());
+        assert_eq!(v2.header.key_slots[0].group, Some(KeyGroup::B));
+        let before = backend.detects;
+        assert!(v2.register_key_for(&mut backend, None, "d2", None).is_err());
+        assert_eq!(backend.detects, before);
+        assert_eq!(v2.header.key_slots.len(), 1);
     }
 
     #[test]

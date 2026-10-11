@@ -713,6 +713,7 @@ fn register_key(
     state: tauri::State<VaultState>,
     pin: Option<String>,
     label: String,
+    group: Option<crypto::KeyGroup>,
 ) -> Result<fido2::RegisteredCredential> {
     let require_foreground = state.with_lock(|g| Ok(g.backend.uses_brokered_key_selection()))?;
     let owner_hwnd = raise_key_operation_window(&window, require_foreground)?;
@@ -720,7 +721,8 @@ fn register_key(
     state.with_lock(|g| match g.vault.as_mut() {
         Some(v) => {
             g.backend.set_webauthn_parent_hwnd(owner_hwnd);
-            v.register_key_with_label(g.backend.as_mut(), pin.as_deref(), &label)
+            // 單人版不可帶群組、雙人版必須帶群組（vault 層 fail closed，不碰 authenticator）。
+            v.register_key_for(g.backend.as_mut(), pin.as_deref(), &label, group)
                 .map_err(|e| e.to_string())
         }
         None => Err("金庫未解鎖".to_string()),

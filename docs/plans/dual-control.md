@@ -221,7 +221,8 @@ KEK（隨機 256-bit，加解密 payload；與 v1 相同）
 - [x] D2 crypto：AAD 版 AES-GCM、`KeyGroup`、金鑰槽 AAD、`dual_wrap_key_from_shares`（見 §11）
 - [x] D3 Header v2 資料模型與版本互斥（見 §11）
 - [x] D4 建立 v2 金庫、主密碼 break-glass、payload 形狀與 dual_slot 一致性檢查（見 §11）
-- [ ] D5–D13
+- [x] D5 雙群組註冊：槽位只包該群組 share、AAD 綁定群組與 credential（見 §11）
+- [ ] D6–D13
 
 ## 11. 驗證紀錄
 
@@ -286,3 +287,18 @@ KEK（隨機 256-bit，加解密 payload；與 v1 相同）
 - `lib.rs`：`create_vault` 改呼叫 `create_for`，`login_password` 改呼叫 `open_password_for`，兩者都帶 `edition::current()`。dual 執行檔現在會建立 v2 金庫，並能用主密碼登入。
 - 過渡防護：v2 金庫呼叫既有的 `register_key*` 會直接拒絕（「須指定群組」），不呼叫 authenticator、不新增槽位，等 D5 補上指定群組的註冊路徑。
 - TDD：11 個 assertion RED（含自訂訊息的 assert）→ GREEN，新增 11 個測試。Rust MSVC lib：單人版 236/236、雙人版 236/236，無 warning；跑測試前後原始碼 SHA-256 不變；rustfmt 通過。
+
+### D5（2026-10-11）
+
+- `Vault::register_key_in_group(backend, pin, label, group)`：
+  - 只限 v2 使用；先驗證名稱（規則同單人版），再呼叫 authenticator。
+  - 槽位密文 = `AES-GCM(HKDF(prf_secret), share_<group>, AAD = dual_key_slot_aad(group, credential_id))`，**不包 KEK**。
+  - header 寫入 `group`；audit `key_registered` 的 detail 附加 ` group=A|B`。
+- `Vault::register_key_for(…, group: Option<KeyGroup>)`：依金庫版本分派。單人版 + 有群組，或雙人版 + 無群組，都在呼叫 authenticator 之前 fail closed（有計數後端驗證 detect 次數為 0）。
+- `register_key_internal` 加上 `group` 參數，版本與群組的一致性檢查移到這裡集中處理。單人版路徑仍包 KEK，audit detail 不變。
+- `lib.rs` 的 `register_key` IPC 新增選用參數 `group`（`"A"`/`"B"`，serde 嚴格大小寫），改呼叫 `register_key_for`。前端目前不傳 `group`，單人版行為不變；雙人版要等 D10 的 UI 補上群組選擇才能註冊。
+- TDD：6 個 assertion RED → GREEN，新增 6 個測試。
+  - 第一次 GREEN 有 2 個測試失敗，原因在測試 fixture：`MockBackend` 每次 `detect` 會循環金鑰類型，第二支是 PIN 型 → `PinRequired`。
+  - 修正方式是每支金鑰改用新的 mock 實例，assertion 不變，也沒改 production code。
+  - 那次失敗的 log 保留為 `02/03-FAIL-fixture-pin-cycle-*.log`。
+- Rust MSVC lib：單人版 242/242、雙人版 242/242，無 warning；跑測試前後原始碼 SHA-256 不變；rustfmt 通過；Node 65/65。
