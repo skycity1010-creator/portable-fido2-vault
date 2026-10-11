@@ -1,6 +1,6 @@
 # 雙群組金鑰控管版（Dual-Control Edition）設計文件
 
-> 狀態：**D1–D12 已完成；D13 未開始，實機驗收待 D13**。PR #29 維持 draft，未合併／未部署。
+> 狀態：**D1–D12 已完成；D13 進行中，軌跡排序／本地時間新候選待實機補驗**。PR #29 維持 draft，未合併／未正式部署。
 > 分支：`feature/dual-control-20261011`（base `main` `656ac95`）。
 > 需求來源：使用者 2026-10-11 Hermes desktop 對話（Q1–Q6 已裁決，見 §1）。
 
@@ -508,3 +508,16 @@ KEK（隨機 256-bit，加解密 payload；與 v1 相同）
 - GNU Release `real-ctap,dual-control` 實際 build exit 0；194 個 tracked build input 在生成 schema 還原後 hashes 不變、三檔與 reviewed snapshot 相符。EXE `9e6e5f55ed052e3d80fcadc3df8847f051945a2bff94a704d9f1ed2f0acdce9b`，7301632 bytes、x64 PE／subsystem 與原候選一致，配同一 verified loader。產物建置於 `ed87a80` 加 frozen frontend delta，並非後續 publication commit 的重建。
 - 窄範圍原始證據 `D:/scratch/dual-control-20261011/d13-feedback-parent/`；durable archive `D:/project/_archives/portable-fido2-vault/d13-feedback-9e6e5f55/`。打包時新候選實機狀態 NOT_TESTED，後續 CI 與獨立 staging 以額外 readback 記錄為準，不修改 frozen manifest。
 - D13 尚未完成；PR #29 維持 Draft、整體卡 blocked，不合併／不替換正式程式／不覆寫原候選或其測試金庫。
+
+### D13 軌跡排序與本地時間補修（2026-10-12）
+
+- 新回報：`D13-feedback-9e6e5f55` 的 V10 結果提示、60 秒逾時後重新登入、V11 均 USER_REPORTED_PASS；V12 起初回報缺少紀錄，補問後使用者確認新候選已重新執行取消，`fido2-dual-cancel`／`fido2-dual-timeout` 均位於最底部。紀錄存在；問題是排序位置誤導，不冒稱未產生或未寫檔。
+- 使用者明確追加需求：軌跡最新在上；時間為本地 `yyyy-MM-dd HH:mm:ss`，不要 UTC。前端依有效事件時間降冪，秒級同時刻以原陣列較後追加者優先，修正舊版 sidecar prepend 所造成的歷史亂序；無效時間保留 escaped 原文並置底，不修改輸入紀錄。舊 RFC3339 時間依 offset 轉成本地顯示；新本地字串不得重複加時差。
+- Rust 的六個 audit／FailureStamp 寫入點使用獨立 `now_audit_time()`，寫入本機本地時間、無 offset／小數秒；header、entry、password-history 的非 audit metadata 仍保持 RFC3339，不改版本、加密格式、登入驗證或 KEK/share。unlock 合併 sidecar 改 append，保護新取消／逾時事件不被 oldest-first 的 1000 筆 cap 當成最舊事件裁掉。
+- Baseline：Rust single／dual 各 327/327，Node 102/102。order、local storage、UI order、UI local format、混合格式同秒 tie 均實際 assertion RED→GREEN。第一個 Rust 測試誤寫 dual 密碼 method 為 `password`，更正為已存在的 `password-breakglass` 後，在未改 production 下再次確認排序 assertion RED；兩份 log 保留，不放寬其他斷言。另加 cap／持久化／無效輸入控制。
+- 首次 Reviewer 完整唯讀審查指出 legacy 無效日曆日期會被 JavaScript Date 正規化；補 UTC／offset 的 2/30、非閏年 2/29、4/31 與 24:00 回歸，實際 RED→GREEN；增加日曆 roundtrip 與時分秒界限檢查。第二次完整審查 `passed=true`、`coverage_complete=true`、security／logic 空；parent 核對 immutable manifest SHA256 `845e4c5e2534f43f039fee7161af51278b246236e961c23d3c7a7efbbb27d14b`、patch 與三檔 source hashes。
+- 最終 Rust single／dual 各 **330/330**，Node **108/108**，`node --check`、`git diff --check` PASS。native Python subprocess 的 explicit TZ env 先核對 offset，再測台北／UTC／紐約各 **6/6**，固定 oracle 分別為 `2026-10-12 00:00:00`／`2026-10-11 16:00:00`／`2026-10-11 12:00:00`。早期 Bash 傳入含斜線 TZ 時變數遺失，不以未驗證環境的舊 matrix 冒稱時區 PASS。
+- GNU Release `real-ctap,dual-control` build exit 0；195 個 tracked inputs 在允許的 generated schema 還原後 hashes 相符。Package PE checker 初次錯誤假設 subsystem=2；實際對照原已驗收候選兩者均 x64／subsystem=3，修正驗收 oracle，不修改 binary。最終 EXE SHA256 `805e8f348b238717e337d397aa27fb9ef31c3e0086d3e4bea53534bd899ca3cc`，7303168 bytes；建於 `07f8f22` 加 reviewed source delta，非 publication commit 重建。
+- 新候選 exclusive-create 到 Win11-NB `C:\FIDOVAULT-RdpTest\D13-audit-805e8f34`；四檔獨立讀回 name／size／SHA256 全符合、loader 簽章 Valid、無 DB／暫存／FIDO client／override，正式 EXE／DLL hashes 與正式 DB length／mtime 不變。未啟動 GUI、操作金鑰、讀／hash／copy 正式或實機測試金庫內容；舊候選與測試金庫不動。
+- 工作證據 `D:/scratch/dual-control-20261011/d13-audit-local/`；durable archive `D:/project/_archives/portable-fido2-vault/d13-audit-805e8f34/`。新候選排序／時間／取消／逾時／重登入仍 NOT_TESTED，不將舊候選回報擴大成新候選實機 PASS。V13 選測仍未 stage；PR Draft、card blocked，等待人工補驗後才評估合併。
+- 格式取捨：無 offset 的本地 timestamp 無法重建來源時區；跨時區搬移、時區切換或 DST／系統時鐘回撥時，絕對時序不可保證。同秒保留追加順序而非舊小數秒精度，符合本次明確秒級格式需求。

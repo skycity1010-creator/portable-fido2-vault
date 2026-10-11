@@ -1003,12 +1003,43 @@ async function setDualStepTimeout() {
 }
 
 // ─────────────── 軌跡 ───────────────
+function formatLocalAuditDate(date) {
+  const pad = (value, width = 2) => String(value).padStart(width, "0");
+  return `${pad(date.getFullYear(), 4)}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+function parseAuditDate(value) {
+  if (typeof value !== "string") return null;
+  const local = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(value);
+  const legacy = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value);
+  if (!local && !legacy) return null;
+  // Date normalizes nonexistent calendar days and permits 24:00. Reject those
+  // explicitly instead of inventing a different timestamp for an invalid record.
+  const day = new Date(`${value.slice(0, 10)}T00:00:00Z`);
+  if (!Number.isFinite(day.getTime()) || day.toISOString().slice(0, 10) !== value.slice(0, 10)) return null;
+  if (Number(value.slice(11, 13)) > 23 || Number(value.slice(14, 16)) > 59 || Number(value.slice(17, 19)) > 59) return null;
+  // ISO local date-time (without an offset) is interpreted in the current timezone.
+  // Legacy RFC3339 includes its own offset and must be converted exactly once.
+  const date = new Date(local ? value.replace(" ", "T") : value);
+  if (!Number.isFinite(date.getTime())) return null;
+  if (local && formatLocalAuditDate(date) !== value) return null;
+  return date;
+}
+
 async function renderAudit(audit) {
   const tb = document.querySelector("#audit-table tbody");
   tb.innerHTML = "";
-  for (const a of [...audit].reverse()) {
+  const ordered = audit.map((event, index) => {
+    const date = parseAuditDate(event.ts);
+    // Display resolution is one second. At that resolution, later append wins;
+    // legacy fractional seconds must not outrank a newer local-format event.
+    const time = date ? Math.floor(date.getTime() / 1000) : -Infinity;
+    return { event, index, date, time };
+  }).sort((a, b) => b.time - a.time || b.index - a.index);
+  for (const { event: a, date } of ordered) {
     const tr = document.createElement("tr");
-    tr.innerHTML = `<td class="mono">${esc(a.ts)}</td><td>${esc(a.event)}</td><td>${esc(a.method)}</td><td>${esc(a.detail)}</td>`;
+    const timestamp = date ? formatLocalAuditDate(date) : a.ts;
+    tr.innerHTML = `<td class="mono">${esc(timestamp)}</td><td>${esc(a.event)}</td><td>${esc(a.method)}</td><td>${esc(a.detail)}</td>`;
     tb.appendChild(tr);
   }
 }

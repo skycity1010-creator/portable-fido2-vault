@@ -570,6 +570,12 @@ fn now_rfc3339() -> String {
     Utc::now().to_rfc3339()
 }
 
+/// Audit and locked-login sidecar timestamps use the system's local wall clock.
+/// Non-audit metadata retains RFC3339 so existing format and bindings stay unchanged.
+fn now_audit_time() -> String {
+    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
 // ─────────────────────────── Vault ───────────────────────────
 
 pub struct Vault {
@@ -656,7 +662,7 @@ impl Vault {
         let data = VaultData {
             entries: Vec::new(),
             audit: vec![AuditEvent {
-                ts: now_rfc3339(),
+                ts: now_audit_time(),
                 event: "vault_created".into(),
                 method: "setup".into(),
                 detail: created_detail,
@@ -1006,7 +1012,7 @@ impl Vault {
             if header.dual_step_timeout_secs != Some(secs) {
                 header.dual_step_timeout_secs = Some(secs);
                 data.audit.push(AuditEvent {
-                    ts: now_rfc3339(),
+                    ts: now_audit_time(),
                     event: "settings_tamper_detected".into(),
                     method: "system".into(),
                     detail: format!("dual_step_timeout_secs mirror repaired to {secs}"),
@@ -1026,7 +1032,9 @@ impl Vault {
                     detail: "decrypt_failed".into(),
                 })
                 .collect();
-            data.audit.splice(0..0, events);
+            // Sidecar events occurred after the previous unlocked session. Append them
+            // before login_success so reverse display and oldest-first trimming agree.
+            data.audit.extend(events);
         }
 
         let mut vault = Self {
@@ -1036,7 +1044,7 @@ impl Vault {
             kek,
         };
         vault.data.audit.push(AuditEvent {
-            ts: now_rfc3339(),
+            ts: now_audit_time(),
             event: "login_success".into(),
             method: method.into(),
             detail: "金庫解鎖".into(),
@@ -1114,7 +1122,7 @@ impl Vault {
     /// 記一筆軌跡並落盤（detail 僅非機密資訊；永不記錄密碼/PIN/金流）。
     pub fn record(&mut self, event: &str, method: &str, detail: &str) -> Result<(), VaultError> {
         self.data.audit.push(AuditEvent {
-            ts: now_rfc3339(),
+            ts: now_audit_time(),
             event: event.into(),
             method: method.into(),
             detail: detail.into(),
@@ -1307,7 +1315,7 @@ impl Vault {
         }
 
         next_data.audit.push(AuditEvent {
-            ts: now_rfc3339(),
+            ts: now_audit_time(),
             event: "entries_imported".into(),
             method: "csv".into(),
             detail: format!(
@@ -1645,7 +1653,7 @@ fn read_failure_sidecar(path: &Path) -> Vec<FailureStamp> {
 pub fn record_login_failure(vault_path: &Path, method: &str) -> Result<(), VaultError> {
     let mut list = read_failure_sidecar(vault_path);
     list.push(FailureStamp {
-        ts: now_rfc3339(),
+        ts: now_audit_time(),
         method: method.into(),
     });
     if list.len() > MAX_LOGIN_FAILURES {
@@ -1663,6 +1671,132 @@ mod tests {
     use super::*;
     use crate::fido2::{FidoBackend, FidoError, KeyKind, MockBackend};
     use std::env;
+
+    #[test]
+    fn d13_sidecar_events_follow_existing_audit_before_success() {
+        let p = fresh_path("d13-audit-order");
+        let mut v = Vault::create_dual(&p, "Synthetic-Pw-12345").unwrap();
+        v.data.audit[0].ts = "2000-01-01T00:00:00Z".into();
+        v.write_file().unwrap();
+        drop(v);
+        DualPending::for_test(p.clone(), Instant::now())
+            .cancel()
+            .unwrap();
+        DualPending::for_test(p.clone(), Instant::now())
+            .expire()
+            .unwrap();
+        let v = Vault::open_password_with_edition(&p, "Synthetic-Pw-12345", Edition::Dual).unwrap();
+        let methods: Vec<&str> = v.audit().iter().map(|e| e.method.as_str()).collect();
+        assert_eq!(
+            methods,
+            vec![
+                "setup",
+                "fido2-dual-cancel",
+                "fido2-dual-timeout",
+                "password-breakglass"
+            ],
+            "sidecar events must be merged after older audit, before the successful login"
+        );
+        let (_, payload) = Vault::read_file(&p, Edition::Dual).unwrap();
+        let persisted = Vault::decrypt_payload(&v.kek, &payload).unwrap();
+        assert_eq!(
+            persisted
+                .audit
+                .iter()
+                .map(|e| e.method.as_str())
+                .collect::<Vec<_>>(),
+            methods
+        );
+        assert!(!failures_path(&p).exists());
+    }
+
+    #[test]
+    fn d13_new_audit_and_failure_timestamps_use_local_seconds() {
+        let p = fresh_path("d13-audit-local");
+        let before = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let mut v = Vault::create_dual(&p, "Synthetic-Pw-12345").unwrap();
+        v.record("settings_changed", "manual", "synthetic local time test")
+            .unwrap();
+        record_login_failure(&p, "fido2-dual-cancel").unwrap();
+        let after = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let stamps = read_failure_sidecar(&p);
+        let times: Vec<&str> = v
+            .audit()
+            .iter()
+            .map(|e| e.ts.as_str())
+            .chain(stamps.iter().map(|e| e.ts.as_str()))
+            .collect();
+        assert_eq!(times.len(), 3);
+        for ts in times {
+            assert_eq!(
+                ts.len(),
+                19,
+                "audit timestamp must be yyyy-MM-dd HH:mm:ss: {ts}"
+            );
+            assert!(chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S").is_ok());
+            assert!(
+                before.as_str() <= ts && ts <= after.as_str(),
+                "timestamp must be local system time: {ts}"
+            );
+        }
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&v.header.created_at).is_ok(),
+            "non-audit metadata stays RFC3339 for compatibility"
+        );
+        let (_, payload) = Vault::read_file(&p, Edition::Dual).unwrap();
+        let persisted = Vault::decrypt_payload(&v.kek, &payload).unwrap();
+        assert_eq!(persisted.audit.len(), 2);
+        for e in &persisted.audit {
+            assert_eq!(e.ts.len(), 19);
+            assert!(chrono::NaiveDateTime::parse_from_str(&e.ts, "%Y-%m-%d %H:%M:%S").is_ok());
+        }
+        drop(v);
+        let reopened =
+            Vault::open_password_with_edition(&p, "Synthetic-Pw-12345", Edition::Dual).unwrap();
+        assert_eq!(reopened.audit().len(), 4);
+        assert_eq!(reopened.audit().last().unwrap().event, "login_success");
+        assert!(reopened.audit().iter().all(|e| e.ts.len() == 19
+            && chrono::NaiveDateTime::parse_from_str(&e.ts, "%Y-%m-%d %H:%M:%S").is_ok()));
+    }
+
+    #[test]
+    fn d13_sidecar_merge_at_audit_cap_keeps_recent_failure_events() {
+        for edition in [Edition::Single, Edition::Dual] {
+            let p = fresh_path(if edition == Edition::Single {
+                "d13-cap-single"
+            } else {
+                "d13-cap-dual"
+            });
+            let mut v = Vault::create_with_edition(&p, "Synthetic-Pw-12345", edition).unwrap();
+            let old = AuditEvent {
+                ts: "2000-01-01T00:00:00Z".into(),
+                event: "synthetic-old".into(),
+                method: "test".into(),
+                detail: "non-secret".into(),
+            };
+            v.data.audit = vec![old; MAX_AUDIT];
+            v.write_file().unwrap();
+            drop(v);
+            record_login_failure(&p, "fido2-dual-cancel").unwrap();
+            record_login_failure(&p, "fido2-dual-timeout").unwrap();
+            let v = Vault::open_password_with_edition(&p, "Synthetic-Pw-12345", edition).unwrap();
+            assert_eq!(v.audit().len(), MAX_AUDIT);
+            assert_eq!(v.audit()[MAX_AUDIT - 3].method, "fido2-dual-cancel");
+            assert_eq!(v.audit()[MAX_AUDIT - 2].method, "fido2-dual-timeout");
+            assert_eq!(v.audit()[MAX_AUDIT - 1].event, "login_success");
+            assert_eq!(
+                v.audit()[0].ts,
+                "2000-01-01T00:00:00Z",
+                "legacy timestamps are not rewritten"
+            );
+            let (_, payload) = Vault::read_file(&p, edition).unwrap();
+            let persisted = Vault::decrypt_payload(&v.kek, &payload).unwrap();
+            assert_eq!(persisted.audit.len(), MAX_AUDIT);
+            assert_eq!(persisted.audit[MAX_AUDIT - 3].method, "fido2-dual-cancel");
+            assert_eq!(persisted.audit[MAX_AUDIT - 2].method, "fido2-dual-timeout");
+            assert_eq!(persisted.audit[MAX_AUDIT - 1].event, "login_success");
+        }
+    }
 
     /// 不支援 PRF 的金鑰包裝（驗證裁決②：拒絕註冊）。
     struct NoPrfBackend(MockBackend);
