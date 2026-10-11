@@ -218,7 +218,8 @@ KEK（隨機 256-bit，加解密 payload；與 v1 相同）
 
 - [x] 需求確認（Q1–Q6）與設計文件
 - [x] D1 edition feature / 第二執行檔 / `get_edition()`（見 §11）
-- [ ] D2–D13
+- [x] D2 crypto：AAD 版 AES-GCM、`KeyGroup`、金鑰槽 AAD、`dual_wrap_key_from_shares`（見 §11）
+- [ ] D3–D13
 
 ## 11. 驗證紀錄
 
@@ -231,3 +232,16 @@ KEK（隨機 256-bit，加解密 payload；與 v1 相同）
 - GNU Release：`--features real-ctap` 8m00s 成功（未編出 dual bin）；`--features real-ctap,dual-control --bin portable-fido-vault-dual` 成功。兩者都是 non-deployable scratch 產物，不部署。
 - 反向防護（預期失敗）：單人版 bin 加 `dual-control` → 出現自訂的 `compile_error`；dual bin 不加 feature → Cargo 回 `requires the features: dual-control`。
 - 既有 warning（`windows_webauthn.rs` `try_lock`、`yk_open_test`）是 baseline 就有的，D1 沒有新增 warning。
+
+### D2（2026-10-11）
+
+- 變更只有 `src-tauri/src/crypto.rs`，v1 既有函式與常數不變：
+  - 常數 `HKDF_INFO_DUAL_KEK = "f2vlt-dual-v2"`、`DUAL_KEY_SLOT_AAD_PREFIX = "f2vlt-v2|"`。
+  - `KeyGroup { A, B }`（serde 為 `"A"`/`"B"`，大小寫嚴格；`aad_tag()`、`other()`）。D3 header 直接使用這個型別。
+  - `aes_gcm_encrypt_aad` / `aes_gcm_decrypt_aad`：AAD 為空時與 v1 `aes_gcm_encrypt` 輸出逐位元組相同。
+  - `dual_key_slot_aad(group, credential_id)` = `"f2vlt-v2|" ‖ tag ‖ "|" ‖ credential_id`；tag 固定 1 byte，不會有串接歧義。
+  - `dual_wrap_key_from_shares(share_a, share_b)` = HKDF-SHA256(salt=`f2vlt-domain-v1`, ikm=share_A‖share_B, info=`f2vlt-dual-v2`)；參數順序固定 A、B；64B ikm 以 `Zeroizing` 清零。
+- TDD：stub 先讓 6 個測試出現 assertion RED（AAD 被忽略、AAD 版面、share_B 未參與、KAT 不符）→ GREEN。新增 9 個測試，其中 KAT 期望值由 Python `hmac`/`hashlib` 依 RFC 5869 獨立計算。
+- Rust MSVC lib：單人版 213/213、雙人版 213/213（204 + 9），無編譯 warning。第一輪測試與 rustfmt 寫入重疊，標為 SUPERSEDED；最終數據取自鎖定 `crypto.rs` SHA-256 後的重跑。
+- `rustfmt --check --config skip_children=true`：`crypto.rs`、`edition.rs` 通過（baseline `crypto.rs` 本來就符合格式）。`git diff --check` 通過。
+- 給 D3 的注意事項：`aes_gcm_decrypt_aad` 回傳的明文 `Vec<u8>`（share/KEK）呼叫端要立刻複製進 `Zeroizing<[u8;32]>`，並清零原本的 Vec。

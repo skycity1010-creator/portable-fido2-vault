@@ -2,7 +2,7 @@
 //! 參數與 domain separation 字串定義於 docs/spec.md §4。
 
 use aes_gcm::{
-    aead::{Aead, KeyInit},
+    aead::{Aead, KeyInit, Payload},
     Aes256Gcm, Nonce,
 };
 use argon2::{Algorithm, Argon2, Version};
@@ -25,6 +25,10 @@ pub const PRF_SALT: &[u8] = b"f2vlt-prf-salt-v1";
 /// HKDF domain 字串。
 pub const HKDF_SALT_DOMAIN: &[u8] = b"f2vlt-domain-v1";
 pub const HKDF_INFO_KEK_WRAP: &[u8] = b"f2vlt-kek-wrap-v1";
+/// 雙群組控管版：由 share_A ‖ share_B 派生 dual_slot 包裝金鑰（docs/plans/dual-control.md §2.2）。
+pub const HKDF_INFO_DUAL_KEK: &[u8] = b"f2vlt-dual-v2";
+/// 雙群組控管版：金鑰槽 AES-GCM AAD 前綴；後接群組標記、`|`、credential_id 原始位元組。
+pub const DUAL_KEY_SLOT_AAD_PREFIX: &[u8] = b"f2vlt-v2|";
 
 #[derive(Debug)]
 pub enum CryptoError {
@@ -128,6 +132,90 @@ pub fn prf_salt_bytes() -> [u8; 32] {
     s
 }
 
+// ─────────────────────────── 雙群組控管（dual-control） ───────────────────────────
+
+/// 金鑰群組。header 以 "A" / "B" 存放；群組綁定於金鑰槽 AAD，竄改即解包失敗。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum KeyGroup {
+    A,
+    B,
+}
+
+impl KeyGroup {
+    /// AAD 用的單一位元組標記（固定長度，避免與 credential_id 串接產生歧義）。
+    pub const fn aad_tag(self) -> u8 {
+        match self {
+            Self::A => b'A',
+            Self::B => b'B',
+        }
+    }
+
+    /// 另一個群組（兩步驟登入第二步要求的群組）。
+    pub const fn other(self) -> Self {
+        match self {
+            Self::A => Self::B,
+            Self::B => Self::A,
+        }
+    }
+}
+
+/// AES-256-GCM 加密（含 AAD）；回傳 ciphertext(含 16B tag)。
+pub fn aes_gcm_encrypt_aad(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    plaintext: &[u8],
+    aad: &[u8],
+) -> Vec<u8> {
+    let cipher = Aes256Gcm::new_from_slice(key).expect("32-byte key");
+    cipher
+        .encrypt(
+            Nonce::from_slice(nonce),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
+        .expect("GCM encrypt cannot fail")
+}
+
+/// AES-256-GCM 解密（含 AAD）；AAD 或 ciphertext 不符 → DecryptFailed。
+pub fn aes_gcm_decrypt_aad(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    ciphertext_with_tag: &[u8],
+    aad: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
+    let cipher = Aes256Gcm::new_from_slice(key).expect("32-byte key");
+    cipher
+        .decrypt(
+            Nonce::from_slice(nonce),
+            Payload {
+                msg: ciphertext_with_tag,
+                aad,
+            },
+        )
+        .map_err(|_| CryptoError::DecryptFailed)
+}
+
+/// 金鑰槽 AAD：`"f2vlt-v2|" ‖ group_tag ‖ "|" ‖ credential_id`。
+pub fn dual_key_slot_aad(group: KeyGroup, credential_id: &[u8]) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(DUAL_KEY_SLOT_AAD_PREFIX.len() + 2 + credential_id.len());
+    aad.extend_from_slice(DUAL_KEY_SLOT_AAD_PREFIX);
+    aad.push(group.aad_tag());
+    aad.push(b'|');
+    aad.extend_from_slice(credential_id);
+    aad
+}
+
+/// 由兩群組 share 派生 dual_slot 包裝金鑰：HKDF(share_A ‖ share_B, "f2vlt-dual-v2")。
+/// 參數順序固定為 A、B（與登入時哪一群組先驗證無關）。
+pub fn dual_wrap_key_from_shares(share_a: &[u8; 32], share_b: &[u8; 32]) -> Zeroizing<[u8; 32]> {
+    let mut ikm = Zeroizing::new([0u8; 64]);
+    ikm[..32].copy_from_slice(share_a);
+    ikm[32..].copy_from_slice(share_b);
+    Zeroizing::new(hkdf_derive(ikm.as_slice(), HKDF_INFO_DUAL_KEK))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,5 +253,118 @@ mod tests {
         let a = hkdf_derive(b"ikm", HKDF_INFO_KEK_WRAP);
         let b = hkdf_derive(b"ikm", HKDF_INFO_KEK_WRAP);
         assert_eq!(a, b);
+    }
+
+    // ── dual-control（D2）──
+
+    #[test]
+    fn gcm_aad_roundtrip() {
+        let key = [7u8; 32];
+        let nonce = [1u8; 12];
+        let ct = aes_gcm_encrypt_aad(&key, &nonce, b"share", b"aad-1");
+        let pt = aes_gcm_decrypt_aad(&key, &nonce, &ct, b"aad-1").unwrap();
+        assert_eq!(pt, b"share");
+    }
+
+    #[test]
+    fn gcm_aad_mismatch_fails() {
+        let key = [7u8; 32];
+        let nonce = [1u8; 12];
+        let ct = aes_gcm_encrypt_aad(&key, &nonce, b"share", b"aad-1");
+        assert!(matches!(
+            aes_gcm_decrypt_aad(&key, &nonce, &ct, b"aad-2"),
+            Err(CryptoError::DecryptFailed)
+        ));
+        assert!(matches!(
+            aes_gcm_decrypt_aad(&key, &nonce, &ct, b""),
+            Err(CryptoError::DecryptFailed)
+        ));
+    }
+
+    #[test]
+    fn gcm_aad_empty_is_compatible_with_v1_gcm() {
+        let key = [7u8; 32];
+        let nonce = [1u8; 12];
+        let v1 = aes_gcm_encrypt(&key, &nonce, b"kek");
+        assert_eq!(aes_gcm_encrypt_aad(&key, &nonce, b"kek", b""), v1);
+        assert_eq!(aes_gcm_decrypt_aad(&key, &nonce, &v1, b"").unwrap(), b"kek");
+    }
+
+    #[test]
+    fn dual_key_slot_aad_layout_is_prefix_group_separator_credential() {
+        let aad = dual_key_slot_aad(KeyGroup::A, &[0x01, 0x02, 0xff]);
+        assert_eq!(aad, b"f2vlt-v2|A|\x01\x02\xff".to_vec());
+        let aad_b = dual_key_slot_aad(KeyGroup::B, &[0x01, 0x02, 0xff]);
+        assert_eq!(aad_b, b"f2vlt-v2|B|\x01\x02\xff".to_vec());
+    }
+
+    #[test]
+    fn dual_key_slot_aad_binds_group_and_credential() {
+        let cred = [9u8; 16];
+        assert_ne!(
+            dual_key_slot_aad(KeyGroup::A, &cred),
+            dual_key_slot_aad(KeyGroup::B, &cred)
+        );
+        assert_ne!(
+            dual_key_slot_aad(KeyGroup::A, &cred),
+            dual_key_slot_aad(KeyGroup::A, &[8u8; 16])
+        );
+    }
+
+    #[test]
+    fn relabeled_group_slot_fails_to_unwrap() {
+        let wrap = [5u8; 32];
+        let nonce = [2u8; 12];
+        let cred = [3u8; 20];
+        let ct = aes_gcm_encrypt_aad(
+            &wrap,
+            &nonce,
+            &[0x11; 32],
+            &dual_key_slot_aad(KeyGroup::A, &cred),
+        );
+        assert!(
+            aes_gcm_decrypt_aad(&wrap, &nonce, &ct, &dual_key_slot_aad(KeyGroup::B, &cred))
+                .is_err()
+        );
+        assert!(
+            aes_gcm_decrypt_aad(&wrap, &nonce, &ct, &dual_key_slot_aad(KeyGroup::A, &cred)).is_ok()
+        );
+    }
+
+    #[test]
+    fn dual_wrap_key_known_answer() {
+        // 獨立計算（Python hmac/hashlib RFC 5869）：salt=f2vlt-domain-v1, ikm=0x11*32‖0x22*32, info=f2vlt-dual-v2
+        let k = dual_wrap_key_from_shares(&[0x11; 32], &[0x22; 32]);
+        let hex: String = k.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex,
+            "a1d775d82fcbede061f7786fd7f05b29c02287767fd1c06e71d64e29feaa988b"
+        );
+    }
+
+    #[test]
+    fn dual_wrap_key_depends_on_both_shares_and_order() {
+        let a = [0x11u8; 32];
+        let b = [0x22u8; 32];
+        let base = dual_wrap_key_from_shares(&a, &b);
+        assert_ne!(*base, *dual_wrap_key_from_shares(&a, &[0x23; 32]));
+        assert_ne!(*base, *dual_wrap_key_from_shares(&[0x12; 32], &b));
+        assert_ne!(*base, *dual_wrap_key_from_shares(&b, &a));
+        assert_ne!(*base, kek_from_prf_secret(&a));
+    }
+
+    #[test]
+    fn key_group_tags_other_and_serde() {
+        assert_eq!(KeyGroup::A.aad_tag(), b'A');
+        assert_eq!(KeyGroup::B.aad_tag(), b'B');
+        assert_eq!(KeyGroup::A.other(), KeyGroup::B);
+        assert_eq!(KeyGroup::B.other(), KeyGroup::A);
+        assert_eq!(serde_json::to_value(KeyGroup::A).unwrap(), "A");
+        assert_eq!(
+            serde_json::from_str::<KeyGroup>("\"B\"").unwrap(),
+            KeyGroup::B
+        );
+        assert!(serde_json::from_str::<KeyGroup>("\"C\"").is_err());
+        assert!(serde_json::from_str::<KeyGroup>("\"a\"").is_err());
     }
 }
