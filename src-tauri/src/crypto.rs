@@ -14,6 +14,8 @@ use zeroize::Zeroizing;
 /// 金庫檔案魔數（magic）與格式版本。
 pub const VAULT_MAGIC: &[u8; 6] = b"F2VLT\x01";
 pub const FORMAT_VERSION: u8 = 1;
+/// 雙群組控管版（dual-control）金庫格式版本。
+pub const FORMAT_VERSION_DUAL: u8 = 2;
 
 /// Argon2id 參數（OWASP 建議量級；t=3, m=19MiB, p=4）。
 pub const ARGON2_T_COST: u32 = 3;

@@ -219,7 +219,8 @@ KEK（隨機 256-bit，加解密 payload；與 v1 相同）
 - [x] 需求確認（Q1–Q6）與設計文件
 - [x] D1 edition feature / 第二執行檔 / `get_edition()`（見 §11）
 - [x] D2 crypto：AAD 版 AES-GCM、`KeyGroup`、金鑰槽 AAD、`dual_wrap_key_from_shares`（見 §11）
-- [ ] D3–D13
+- [x] D3 Header v2 資料模型與版本互斥（見 §11）
+- [ ] D4–D13
 
 ## 11. 驗證紀錄
 
@@ -245,3 +246,24 @@ KEK（隨機 256-bit，加解密 payload；與 v1 相同）
 - Rust MSVC lib：單人版 213/213、雙人版 213/213（204 + 9），無編譯 warning。第一輪測試與 rustfmt 寫入重疊，標為 SUPERSEDED；最終數據取自鎖定 `crypto.rs` SHA-256 後的重跑。
 - `rustfmt --check --config skip_children=true`：`crypto.rs`、`edition.rs` 通過（baseline `crypto.rs` 本來就符合格式）。`git diff --check` 通過。
 - 給 D3 的注意事項：`aes_gcm_decrypt_aad` 回傳的明文 `Vec<u8>`（share/KEK）呼叫端要立刻複製進 `Zeroizing<[u8;32]>`，並清零原本的 Vec。
+
+### D3（2026-10-11）
+
+- **設計補充：vault 核心 API 明確指定版本。** `read_file(path, edition)` 一律先呼叫 `check_header_edition`，再做任何解密或寫檔。
+  - 既有的 `Vault::create/open_password/open_key/open_any_key` 固定為**單人版**語意（`Edition::Single`），所以 `vault_cli` 與既有測試在兩種 feature 下行為都不變。
+  - 雙人版的入口在 D4/D7 另外新增；由 `lib.rs` 依 `edition::current()` 分派。
+  - D3 到 D4 之間，dual 執行檔仍會建立 v1 檔並拒絕開啟它。這是過渡狀態，dual 執行檔在 D13 之前都不是可部署產物。
+- 資料模型（v1 序列化不變，新欄位都是 `Option` + `skip_serializing_if`）：
+  - `Header.policy: Option<VaultPolicy>`（v2 只有 `"dual"`，未知值反序列化失敗）、`Header.dual_slot`、`Header.dual_step_timeout_secs`。
+  - `KeySlot.group: Option<KeyGroup>`；`Settings.dual_step_timeout_secs`；`VaultData.dual: Option<DualShares>`。
+  - `DualShares` 為 `ZeroizeOnDrop`，Debug 輸出遮蔽。
+  - `crypto::FORMAT_VERSION_DUAL = 2`。
+- `check_header_edition` 規則：
+  - v1 → Single、v2 → Dual，其他版本 → `Format` 錯誤。
+  - 版本不符 → `VaultError::WrongEdition`，訊息指出應改用哪一個 exe。
+  - v1 帶任何雙群組欄位 → 拒絕；v2 缺 `policy=dual`、`dual_slot`，或有槽位沒有群組 → 拒絕。
+- `Vault::read_header(path, edition)`：登入畫面 `lib.rs::read_keys_from_file` 改用這個共用 reader，順便修掉原本 `10 + header_len` 沒做邊界檢查、可能 panic 的問題。
+- 版本不符時不解密、不寫 sidecar、不產生 `.db.tmp`，檔案逐位元組不變（有測試驗證）。
+- TDD：9 個 assertion RED → GREEN。新增 12 個測試，其中 `v1_files_serialize_without_dual_fields` 是既有行為回歸（GREEN→GREEN），`unknown_policy_or_group_value_fails_to_parse` 由型別本身保證，兩者都不算 RED。
+- Rust MSVC lib：單人版 225/225、雙人版 225/225（213 + 12），無 warning；跑測試前後原始碼 SHA-256 不變。`rustfmt --check`（`lib.rs`/`vault.rs`/`crypto.rs`/`edition.rs`，skip_children）通過。也順便修正了 D1 在 `lib.rs` 造成的 mod 排序格式差異。
+- 留給 D4 的事項：解密 payload 後還要檢查 payload 形狀（v2 必須有 `dual` shares 與 `settings.dual_step_timeout_secs`；v1 必須沒有）。

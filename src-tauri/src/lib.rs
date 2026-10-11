@@ -21,9 +21,9 @@ use crate::windows_webauthn::WindowsWebAuthnBackend;
 
 pub mod crypto;
 pub mod csv_import;
-pub mod edition;
 #[cfg(feature = "real-ctap")]
 pub mod diag_log;
+pub mod edition;
 pub mod fido2;
 pub mod vault;
 #[cfg(all(windows, feature = "real-ctap"))]
@@ -420,13 +420,8 @@ fn boot_info(state: tauri::State<VaultState>) -> Result<LoginScreenInfo> {
 
 /// 讀取 vault.db 的 header（不需 KEK）→ 金鑰清單。
 fn read_keys_from_file(path: &std::path::Path) -> Result<Vec<KeyInfo>> {
-    let buf = std::fs::read(path).map_err(|e| e.to_string())?;
-    if buf.len() < 10 || &buf[..6] != crypto::VAULT_MAGIC {
-        return Err("非 vault.db".into());
-    }
-    let header_len = u32::from_le_bytes(buf[6..10].try_into().map_err(|_| "bad len")?) as usize;
-    let header_json = std::str::from_utf8(&buf[10..10 + header_len]).map_err(|e| e.to_string())?;
-    let h: vault::Header = serde_json::from_str(header_json).map_err(|e| e.to_string())?;
+    // 與解鎖路徑共用同一個 reader：magic/長度邊界/版本互斥都在 vault 層檢查。
+    let h = vault::Vault::read_header(path, edition::current()).map_err(|e| e.to_string())?;
     Ok(h.key_slots
         .iter()
         .map(|s| KeyInfo {

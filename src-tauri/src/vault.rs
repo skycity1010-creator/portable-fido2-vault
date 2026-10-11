@@ -15,9 +15,11 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::crypto::{
     aes_gcm_decrypt, aes_gcm_encrypt, argon2id_derive, base64_decode, base64_encode,
-    kek_from_prf_secret, random_kek, random_nonce, CryptoError, VAULT_MAGIC,
+    kek_from_prf_secret, random_kek, random_nonce, CryptoError, KeyGroup, FORMAT_VERSION,
+    FORMAT_VERSION_DUAL, VAULT_MAGIC,
 };
 use crate::csv_import::{ImportAction, ImportPlan, ImportPreview};
+use crate::edition::Edition;
 use crate::fido2::{FidoBackend, FidoError, KeyKind, RegisteredCredential};
 
 #[derive(Debug)]
@@ -28,6 +30,10 @@ pub enum VaultError {
     WrongPassword,
     Fido(FidoError),
     Json(serde_json::Error),
+    /// 金庫檔的版本（單人版 v1 / 雙群組控管版 v2）與執行檔版本不符；未解密、未寫檔。
+    WrongEdition {
+        vault: Edition,
+    },
 }
 
 impl std::fmt::Display for VaultError {
@@ -42,6 +48,18 @@ impl std::fmt::Display for VaultError {
             Self::WrongPassword => write!(f, "密碼不正確"),
             Self::Fido(e) => write!(f, "{e}"),
             Self::Json(e) => write!(f, "JSON 錯誤：{e}"),
+            Self::WrongEdition {
+                vault: Edition::Dual,
+            } => write!(
+                f,
+                "此為雙群組控管版金庫，請改用雙群組控管版程式（portable-fido-vault-dual.exe）"
+            ),
+            Self::WrongEdition {
+                vault: Edition::Single,
+            } => write!(
+                f,
+                "此為單人版金庫，請改用單人版程式（portable-fido-vault.exe）"
+            ),
         }
     }
 }
@@ -86,16 +104,35 @@ pub struct KeySlot {
     pub aaguid: String,        // hex 32
     pub label: String,
     pub key_type: KeyKind,
+    /// 雙群組控管版（v2）必填；單人版（v1）必為 None，且不序列化（v1 檔案格式不變）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<KeyGroup>,
     pub nonce: String,
     pub ct: String,
+}
+
+/// 金庫解鎖政策。v2 目前只有 `dual`；未知值在反序列化時即失敗（fail closed）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VaultPolicy {
+    Dual,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Header {
     pub v: u8,
+    /// v2：必為 `dual`。v1：None（不序列化）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<VaultPolicy>,
     pub argon2: Argon2Params,
     pub password_slot: Slot,
+    /// v2：AES-GCM(HKDF(share_A ‖ share_B), KEK)。v1：None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dual_slot: Option<Slot>,
     pub key_slots: Vec<KeySlot>,
+    /// v2：第一步等待時限的明文鏡像（登入前可讀；權威值在加密 payload settings）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dual_step_timeout_secs: Option<u32>,
     pub created_at: String,
 }
 
@@ -143,6 +180,9 @@ pub struct Settings {
     pub idle_lock_minutes: u32,
     #[serde(default = "default_password_history_limit")]
     pub password_history_limit: u32,
+    /// v2：第一步等待時限權威值（秒）。v1：None（不序列化）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dual_step_timeout_secs: Option<u32>,
 }
 
 const DEFAULT_PASSWORD_HISTORY_LIMIT: u32 = 3;
@@ -195,6 +235,62 @@ pub struct VaultData {
     pub entries: Vec<Entry>,
     pub audit: Vec<AuditEvent>,
     pub settings: Settings,
+    /// v2：兩群組 share（只存在加密 payload）。v1：None（不序列化）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dual: Option<DualShares>,
+}
+
+/// 雙群組 share（各 32B，b64）。只存在加密 payload；Debug 遮蔽，drop 時清零。
+#[derive(Clone, serde::Serialize, serde::Deserialize, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
+pub struct DualShares {
+    pub share_a: String,
+    pub share_b: String,
+}
+
+impl std::fmt::Debug for DualShares {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DualShares { share_a: <redacted>, share_b: <redacted> }")
+    }
+}
+
+/// 檢查 header 是否符合執行檔版本與該版本的欄位形狀（docs/plans/dual-control.md §3）。
+/// 在任何解密或寫檔之前呼叫；不符 → fail closed。
+pub fn check_header_edition(header: &Header, edition: Edition) -> Result<(), VaultError> {
+    let vault_edition = match header.v {
+        FORMAT_VERSION => Edition::Single,
+        FORMAT_VERSION_DUAL => Edition::Dual,
+        other => {
+            return Err(VaultError::Format(format!("不支援的格式版本 v{other}")));
+        }
+    };
+    if vault_edition != edition {
+        return Err(VaultError::WrongEdition {
+            vault: vault_edition,
+        });
+    }
+    match edition {
+        Edition::Single => {
+            if header.policy.is_some()
+                || header.dual_slot.is_some()
+                || header.dual_step_timeout_secs.is_some()
+                || header.key_slots.iter().any(|slot| slot.group.is_some())
+            {
+                return Err(VaultError::Format("v1 金庫不應含雙群組控管欄位".into()));
+            }
+        }
+        Edition::Dual => {
+            if header.policy != Some(VaultPolicy::Dual) {
+                return Err(VaultError::Format("v2 金庫缺少 policy=dual".into()));
+            }
+            if header.dual_slot.is_none() {
+                return Err(VaultError::Format("v2 金庫缺少 dual_slot".into()));
+            }
+            if header.key_slots.iter().any(|slot| slot.group.is_none()) {
+                return Err(VaultError::Format("v2 金庫的金鑰槽缺少群組".into()));
+            }
+        }
+    }
+    Ok(())
 }
 
 const MAX_AUDIT: usize = 1000;
@@ -229,7 +325,8 @@ impl Vault {
         let ct = aes_gcm_encrypt(&pw_key, &nonce, kek.as_slice());
 
         let header = Header {
-            v: 1,
+            v: FORMAT_VERSION,
+            policy: None,
             argon2: Argon2Params {
                 salt: base64_encode(&salt),
             },
@@ -237,7 +334,9 @@ impl Vault {
                 nonce: base64_encode(&nonce),
                 ct: base64_encode(&ct),
             },
+            dual_slot: None,
             key_slots: Vec::new(),
+            dual_step_timeout_secs: None,
             created_at: now_rfc3339(),
         };
 
@@ -257,7 +356,9 @@ impl Vault {
             settings: Settings {
                 idle_lock_minutes: 5,
                 password_history_limit: DEFAULT_PASSWORD_HISTORY_LIMIT,
+                dual_step_timeout_secs: None,
             },
+            dual: None,
         };
 
         let vault = Self {
@@ -274,7 +375,7 @@ impl Vault {
 
     /// 主密碼登入。失敗 → sidecar 記一筆 login_failed。
     pub fn open_password(path: &Path, password: &str) -> Result<Self, VaultError> {
-        let (header, payload) = Self::read_file(path)?;
+        let (header, payload) = Self::read_file(path, Edition::Single)?;
         let salt = base64_decode(&header.argon2.salt)
             .map_err(|_| VaultError::Format("argon2 salt 解碼失敗".into()))?;
         let k = argon2id_derive(password.as_bytes(), &salt).map_err(VaultError::Crypto)?;
@@ -302,7 +403,7 @@ impl Vault {
         pin: Option<&str>,
         backend: &mut (dyn FidoBackend + 'static),
     ) -> Result<Self, VaultError> {
-        let (header, payload) = Self::read_file(path)?;
+        let (header, payload) = Self::read_file(path, Edition::Single)?;
         let slot = header
             .key_slots
             .iter()
@@ -323,7 +424,7 @@ impl Vault {
         pin: Option<&str>,
         backend: &mut (dyn FidoBackend + 'static),
     ) -> Result<Self, VaultError> {
-        let (header, payload) = Self::read_file(path)?;
+        let (header, payload) = Self::read_file(path, Edition::Single)?;
         let credential_ids = header
             .key_slots
             .iter()
@@ -427,8 +528,8 @@ impl Vault {
 
     // ── 檔案 I/O ──
 
-    /// 讀檔 → (header, (payload_nonce, ciphertext))。
-    fn read_file(path: &Path) -> Result<VaultFileContents, VaultError> {
+    /// 讀檔 → (header, (payload_nonce, ciphertext))。先檢查版本，不符即 fail closed。
+    fn read_file(path: &Path, edition: Edition) -> Result<VaultFileContents, VaultError> {
         let buf = fs::read(path)?;
         if buf.len() < 6 + 4 + 12 {
             return Err(VaultError::Format("檔案過小".into()));
@@ -443,16 +544,16 @@ impl Vault {
         let header_json = std::str::from_utf8(&buf[10..10 + header_len])
             .map_err(|_| VaultError::Format("header 非 UTF-8".into()))?;
         let header: Header = serde_json::from_str(header_json).map_err(VaultError::Json)?;
-        if header.v != 1 {
-            return Err(VaultError::Format(format!(
-                "不支援的格式版本 v{}",
-                header.v
-            )));
-        }
+        check_header_edition(&header, edition)?;
         let off = 10 + header_len;
         let nonce: [u8; 12] = buf[off..off + 12].try_into().unwrap();
         let ciphertext = buf[off + 12..].to_vec();
         Ok((header, (nonce, ciphertext)))
+    }
+
+    /// 只讀 header（不需 KEK），供登入畫面列出金鑰；同樣先檢查版本。
+    pub fn read_header(path: &Path, edition: Edition) -> Result<Header, VaultError> {
+        Self::read_file(path, edition).map(|(header, _)| header)
     }
 
     fn decrypt_payload(
@@ -806,6 +907,7 @@ impl Vault {
             aaguid: hex32_16(reg.aaguid),
             label: reg.label.clone(),
             key_type: reg.kind,
+            group: None,
             nonce: base64_encode(&nonce),
             ct: base64_encode(&ct),
         });
@@ -971,6 +1073,276 @@ mod tests {
         let d = env::temp_dir().join(format!("f2v-test-{tag}-{}", std::process::id()));
         let _ = fs::create_dir_all(&d);
         d
+    }
+
+    // ── D3：v2 header / 版本互斥 ──
+
+    fn raw_header_json(path: &Path) -> serde_json::Value {
+        let buf = fs::read(path).unwrap();
+        let len = u32::from_le_bytes(buf[6..10].try_into().unwrap()) as usize;
+        serde_json::from_slice(&buf[10..10 + len]).unwrap()
+    }
+
+    /// 以新的 header JSON 重寫檔案（payload 原封不動），模擬另一版本產生的檔案。
+    fn rewrite_header(path: &Path, edit: impl FnOnce(&mut serde_json::Value)) {
+        let buf = fs::read(path).unwrap();
+        let len = u32::from_le_bytes(buf[6..10].try_into().unwrap()) as usize;
+        let mut header: serde_json::Value = serde_json::from_slice(&buf[10..10 + len]).unwrap();
+        edit(&mut header);
+        let new_header = serde_json::to_vec(&header).unwrap();
+        let mut out = Vec::new();
+        out.extend_from_slice(&buf[..6]);
+        out.extend_from_slice(&(new_header.len() as u32).to_le_bytes());
+        out.extend_from_slice(&new_header);
+        out.extend_from_slice(&buf[10 + len..]);
+        fs::write(path, out).unwrap();
+    }
+
+    fn as_v2(header: &mut serde_json::Value) {
+        header["v"] = serde_json::json!(2);
+        header["policy"] = serde_json::json!("dual");
+        header["dual_slot"] = header["password_slot"].clone();
+        header["dual_step_timeout_secs"] = serde_json::json!(120);
+    }
+
+    fn sample_slot() -> Slot {
+        Slot {
+            nonce: "bm9uY2U=".into(),
+            ct: "Y3Q=".into(),
+        }
+    }
+
+    fn sample_key_slot(group: Option<KeyGroup>) -> KeySlot {
+        KeySlot {
+            credential_id: "Y3JlZA==".into(),
+            aaguid: "00".repeat(16),
+            label: "k1".into(),
+            key_type: KeyKind::TouchOnly,
+            group,
+            nonce: "bm9uY2U=".into(),
+            ct: "Y3Q=".into(),
+        }
+    }
+
+    fn sample_header(v: u8) -> Header {
+        Header {
+            v,
+            policy: None,
+            argon2: Argon2Params {
+                salt: "c2FsdA==".into(),
+            },
+            password_slot: sample_slot(),
+            dual_slot: None,
+            key_slots: Vec::new(),
+            dual_step_timeout_secs: None,
+            created_at: "2026-10-11T00:00:00Z".into(),
+        }
+    }
+
+    fn valid_v2_header() -> Header {
+        let mut h = sample_header(2);
+        h.policy = Some(VaultPolicy::Dual);
+        h.dual_slot = Some(sample_slot());
+        h.dual_step_timeout_secs = Some(120);
+        h.key_slots = vec![sample_key_slot(Some(KeyGroup::A))];
+        h
+    }
+
+    #[test]
+    fn edition_check_accepts_matching_shapes() {
+        assert!(check_header_edition(&sample_header(1), Edition::Single).is_ok());
+        let mut v1_with_key = sample_header(1);
+        v1_with_key.key_slots = vec![sample_key_slot(None)];
+        assert!(check_header_edition(&v1_with_key, Edition::Single).is_ok());
+        assert!(check_header_edition(&valid_v2_header(), Edition::Dual).is_ok());
+    }
+
+    #[test]
+    fn single_edition_rejects_v2_header() {
+        assert!(matches!(
+            check_header_edition(&valid_v2_header(), Edition::Single),
+            Err(VaultError::WrongEdition {
+                vault: Edition::Dual
+            })
+        ));
+    }
+
+    #[test]
+    fn dual_edition_rejects_v1_header() {
+        assert!(matches!(
+            check_header_edition(&sample_header(1), Edition::Dual),
+            Err(VaultError::WrongEdition {
+                vault: Edition::Single
+            })
+        ));
+    }
+
+    #[test]
+    fn unknown_format_version_is_rejected_by_both_editions() {
+        for edition in [Edition::Single, Edition::Dual] {
+            assert!(matches!(
+                check_header_edition(&sample_header(3), edition),
+                Err(VaultError::Format(_))
+            ));
+            assert!(matches!(
+                check_header_edition(&sample_header(0), edition),
+                Err(VaultError::Format(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn v2_header_missing_required_dual_fields_is_rejected() {
+        let mut no_policy = valid_v2_header();
+        no_policy.policy = None;
+        let mut no_dual_slot = valid_v2_header();
+        no_dual_slot.dual_slot = None;
+        let mut ungrouped_slot = valid_v2_header();
+        ungrouped_slot.key_slots.push(sample_key_slot(None));
+        for header in [no_policy, no_dual_slot, ungrouped_slot] {
+            assert!(matches!(
+                check_header_edition(&header, Edition::Dual),
+                Err(VaultError::Format(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn v1_header_with_dual_fields_is_rejected() {
+        let mut with_policy = sample_header(1);
+        with_policy.policy = Some(VaultPolicy::Dual);
+        let mut with_dual_slot = sample_header(1);
+        with_dual_slot.dual_slot = Some(sample_slot());
+        let mut with_timeout = sample_header(1);
+        with_timeout.dual_step_timeout_secs = Some(120);
+        let mut with_group = sample_header(1);
+        with_group.key_slots = vec![sample_key_slot(Some(KeyGroup::B))];
+        for header in [with_policy, with_dual_slot, with_timeout, with_group] {
+            assert!(matches!(
+                check_header_edition(&header, Edition::Single),
+                Err(VaultError::Format(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn unknown_policy_or_group_value_fails_to_parse() {
+        let mut h = serde_json::to_value(valid_v2_header()).unwrap();
+        h["policy"] = serde_json::json!("triple");
+        assert!(serde_json::from_value::<Header>(h).is_err());
+        let mut h = serde_json::to_value(valid_v2_header()).unwrap();
+        h["key_slots"][0]["group"] = serde_json::json!("C");
+        assert!(serde_json::from_value::<Header>(h).is_err());
+    }
+
+    #[test]
+    fn wrong_edition_message_names_the_right_program() {
+        let to_dual = VaultError::WrongEdition {
+            vault: Edition::Dual,
+        }
+        .to_string();
+        assert!(to_dual.contains("雙群組控管版"), "{to_dual}");
+        assert!(
+            to_dual.contains("portable-fido-vault-dual.exe"),
+            "{to_dual}"
+        );
+        let to_single = VaultError::WrongEdition {
+            vault: Edition::Single,
+        }
+        .to_string();
+        assert!(to_single.contains("單人版"), "{to_single}");
+        assert!(to_single.contains("portable-fido-vault.exe"), "{to_single}");
+    }
+
+    #[test]
+    fn dual_shares_debug_is_redacted() {
+        let shares = DualShares {
+            share_a: "SECRET-SHARE-A".into(),
+            share_b: "SECRET-SHARE-B".into(),
+        };
+        let shown = format!("{shares:?}");
+        assert!(!shown.contains("SECRET-SHARE-A"), "{shown}");
+        assert!(!shown.contains("SECRET-SHARE-B"), "{shown}");
+    }
+
+    /// 既有行為回歸（GREEN→GREEN）：v1 檔案 header/payload 不出現任何 v2 欄位。
+    #[test]
+    fn v1_files_serialize_without_dual_fields() {
+        let d = tmp_dir("d3-v1-shape");
+        let p = d.join("vault.db");
+        let _ = fs::remove_file(&p);
+        let mut v = Vault::create(&p, "Pw-12345").unwrap();
+        let mut backend = MockBackend::new();
+        v.register_key(&mut backend, None).unwrap();
+        let header = raw_header_json(&p);
+        let obj = header.as_object().unwrap();
+        for key in ["policy", "dual_slot", "dual_step_timeout_secs"] {
+            assert!(!obj.contains_key(key), "unexpected {key} in v1 header");
+        }
+        assert_eq!(header["v"], serde_json::json!(1));
+        assert!(!header["key_slots"][0]
+            .as_object()
+            .unwrap()
+            .contains_key("group"));
+        let data = serde_json::to_value(&v.data).unwrap();
+        assert!(!data.as_object().unwrap().contains_key("dual"));
+        assert!(!data["settings"]
+            .as_object()
+            .unwrap()
+            .contains_key("dual_step_timeout_secs"));
+    }
+
+    #[test]
+    fn single_edition_open_rejects_v2_file_without_writing() {
+        let d = tmp_dir("d3-v2-reject");
+        let p = d.join("vault.db");
+        let _ = fs::remove_file(&p);
+        let _ = fs::remove_file(failures_path(&p));
+        drop(Vault::create(&p, "Pw-12345").unwrap());
+        rewrite_header(&p, as_v2);
+        let before = fs::read(&p).unwrap();
+
+        let result = Vault::open_password(&p, "Pw-12345");
+        assert!(
+            matches!(
+                result,
+                Err(VaultError::WrongEdition {
+                    vault: Edition::Dual
+                })
+            ),
+            "single edition must refuse a v2 vault"
+        );
+        assert_eq!(
+            fs::read(&p).unwrap(),
+            before,
+            "v2 file must stay byte-identical"
+        );
+        assert!(
+            !failures_path(&p).exists(),
+            "no failure sidecar for edition mismatch"
+        );
+        assert!(!p.with_extension("db.tmp").exists());
+        assert!(matches!(
+            Vault::read_header(&p, Edition::Single),
+            Err(VaultError::WrongEdition {
+                vault: Edition::Dual
+            })
+        ));
+    }
+
+    #[test]
+    fn read_header_for_dual_edition_rejects_v1_file() {
+        let d = tmp_dir("d3-v1-reject");
+        let p = d.join("vault.db");
+        let _ = fs::remove_file(&p);
+        drop(Vault::create(&p, "Pw-12345").unwrap());
+        assert!(matches!(
+            Vault::read_header(&p, Edition::Dual),
+            Err(VaultError::WrongEdition {
+                vault: Edition::Single
+            })
+        ));
+        assert!(Vault::read_header(&p, Edition::Single).is_ok());
     }
 
     #[test]
