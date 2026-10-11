@@ -220,7 +220,8 @@ KEK（隨機 256-bit，加解密 payload；與 v1 相同）
 - [x] D1 edition feature / 第二執行檔 / `get_edition()`（見 §11）
 - [x] D2 crypto：AAD 版 AES-GCM、`KeyGroup`、金鑰槽 AAD、`dual_wrap_key_from_shares`（見 §11）
 - [x] D3 Header v2 資料模型與版本互斥（見 §11）
-- [ ] D4–D13
+- [x] D4 建立 v2 金庫、主密碼 break-glass、payload 形狀與 dual_slot 一致性檢查（見 §11）
+- [ ] D5–D13
 
 ## 11. 驗證紀錄
 
@@ -267,3 +268,21 @@ KEK（隨機 256-bit，加解密 payload；與 v1 相同）
 - TDD：9 個 assertion RED → GREEN。新增 12 個測試，其中 `v1_files_serialize_without_dual_fields` 是既有行為回歸（GREEN→GREEN），`unknown_policy_or_group_value_fails_to_parse` 由型別本身保證，兩者都不算 RED。
 - Rust MSVC lib：單人版 225/225、雙人版 225/225（213 + 12），無 warning；跑測試前後原始碼 SHA-256 不變。`rustfmt --check`（`lib.rs`/`vault.rs`/`crypto.rs`/`edition.rs`，skip_children）通過。也順便修正了 D1 在 `lib.rs` 造成的 mod 排序格式差異。
 - 留給 D4 的事項：解密 payload 後還要檢查 payload 形狀（v2 必須有 `dual` shares 與 `settings.dual_step_timeout_secs`；v1 必須沒有）。
+
+### D4（2026-10-11）
+
+- `Vault::create_dual` / `create_for(path, pw, edition)`（內部共用 `create_with_edition`；單人版建立流程與 audit detail 逐字不變）：
+  - v2 另外產生隨機 `share_A`、`share_B`。
+  - `dual_slot = AES-GCM(HKDF(share_A‖share_B), KEK, AAD="f2vlt-v2|dual-slot")`。`crypto::DUAL_SLOT_AAD` 是本步新增的 domain separation 常數。
+  - header/payload 的等待時限都寫入 `DEFAULT_DUAL_STEP_TIMEOUT_SECS = 120`。
+  - audit `vault_created` 的 detail 附加 ` edition=dual`。
+- `Vault::open_password_dual` / `open_password_for(path, pw, edition)`：
+  - 雙人版主密碼登入就是 break-glass，成功與失敗（sidecar）的 method 都記為 `password-breakglass`；單人版仍是 `password`。
+  - `Vault::edition()` 依 header.v 判斷版本。
+- **payload 形狀檢查（`check_payload_edition`）**：在解密後、合併 sidecar 與寫檔之前執行，所有解鎖路徑都會經過。
+  - v1 payload 不可含 `dual` 或等待時限設定。
+  - v2 必須有兩份 32B share 和等待時限設定，而且 `dual_slot` 用 HKDF(shares) 解開後必須等於目前的 KEK。這樣可以防止 header 被竄改後，主密碼仍能登入、金鑰登入卻默默失效。
+  - 檢查不通過 → `Format` 錯誤，不寫檔、不記錄登入失敗。
+- `lib.rs`：`create_vault` 改呼叫 `create_for`，`login_password` 改呼叫 `open_password_for`，兩者都帶 `edition::current()`。dual 執行檔現在會建立 v2 金庫，並能用主密碼登入。
+- 過渡防護：v2 金庫呼叫既有的 `register_key*` 會直接拒絕（「須指定群組」），不呼叫 authenticator、不新增槽位，等 D5 補上指定群組的註冊路徑。
+- TDD：11 個 assertion RED（含自訂訊息的 assert）→ GREEN，新增 11 個測試。Rust MSVC lib：單人版 236/236、雙人版 236/236，無 warning；跑測試前後原始碼 SHA-256 不變；rustfmt 通過。

@@ -31,6 +31,8 @@ pub const HKDF_INFO_KEK_WRAP: &[u8] = b"f2vlt-kek-wrap-v1";
 pub const HKDF_INFO_DUAL_KEK: &[u8] = b"f2vlt-dual-v2";
 /// 雙群組控管版：金鑰槽 AES-GCM AAD 前綴；後接群組標記、`|`、credential_id 原始位元組。
 pub const DUAL_KEY_SLOT_AAD_PREFIX: &[u8] = b"f2vlt-v2|";
+/// 雙群組控管版：dual_slot（包裝 KEK）的 AES-GCM AAD（domain separation）。
+pub const DUAL_SLOT_AAD: &[u8] = b"f2vlt-v2|dual-slot";
 
 #[derive(Debug)]
 pub enum CryptoError {

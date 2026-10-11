@@ -14,9 +14,10 @@ use chrono::Utc;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::crypto::{
-    aes_gcm_decrypt, aes_gcm_encrypt, argon2id_derive, base64_decode, base64_encode,
-    kek_from_prf_secret, random_kek, random_nonce, CryptoError, KeyGroup, FORMAT_VERSION,
-    FORMAT_VERSION_DUAL, VAULT_MAGIC,
+    aes_gcm_decrypt, aes_gcm_decrypt_aad, aes_gcm_encrypt, aes_gcm_encrypt_aad, argon2id_derive,
+    base64_decode, base64_encode, dual_wrap_key_from_shares, kek_from_prf_secret, random_kek,
+    random_nonce, CryptoError, KeyGroup, DUAL_SLOT_AAD, FORMAT_VERSION, FORMAT_VERSION_DUAL,
+    VAULT_MAGIC,
 };
 use crate::csv_import::{ImportAction, ImportPlan, ImportPreview};
 use crate::edition::Edition;
@@ -186,6 +187,8 @@ pub struct Settings {
 }
 
 const DEFAULT_PASSWORD_HISTORY_LIMIT: u32 = 3;
+/// 雙群組控管版：第一步完成後等待第二群組的預設時限（秒，§4.3）。
+pub const DEFAULT_DUAL_STEP_TIMEOUT_SECS: u32 = 120;
 const MAX_KEY_LABEL_CHARS: usize = 64;
 
 fn default_password_history_limit() -> u32 {
@@ -293,6 +296,75 @@ pub fn check_header_edition(header: &Header, edition: Edition) -> Result<(), Vau
     Ok(())
 }
 
+/// header 已通過 `check_header_edition` 後，由版本號推得的版本。
+fn edition_of(header: &Header) -> Edition {
+    if header.v == FORMAT_VERSION_DUAL {
+        Edition::Dual
+    } else {
+        Edition::Single
+    }
+}
+
+fn decode_share(b64: &str) -> Result<Zeroizing<[u8; 32]>, VaultError> {
+    let raw = Zeroizing::new(
+        base64_decode(b64).map_err(|_| VaultError::Format("v2 share 解碼失敗".into()))?,
+    );
+    if raw.len() != 32 {
+        return Err(VaultError::Format("v2 share 長度錯誤".into()));
+    }
+    let mut out = Zeroizing::new([0u8; 32]);
+    out.copy_from_slice(&raw);
+    Ok(out)
+}
+
+/// 解密後、寫檔前檢查 payload 形狀；v2 另驗證 dual_slot 確實是 HKDF(shares) 包出的同一把 KEK，
+/// 避免 header 被竄改後主密碼仍可登入、金鑰登入卻默默失效。
+fn check_payload_edition(
+    header: &Header,
+    data: &VaultData,
+    kek: &[u8; 32],
+) -> Result<(), VaultError> {
+    match edition_of(header) {
+        Edition::Single => {
+            if data.dual.is_some() || data.settings.dual_step_timeout_secs.is_some() {
+                return Err(VaultError::Format(
+                    "v1 金庫 payload 不應含雙群組控管資料".into(),
+                ));
+            }
+        }
+        Edition::Dual => {
+            let shares = data
+                .dual
+                .as_ref()
+                .ok_or_else(|| VaultError::Format("v2 金庫 payload 缺少 share".into()))?;
+            let share_a = decode_share(&shares.share_a)?;
+            let share_b = decode_share(&shares.share_b)?;
+            if data.settings.dual_step_timeout_secs.is_none() {
+                return Err(VaultError::Format(
+                    "v2 金庫 payload 缺少等待時限設定".into(),
+                ));
+            }
+            let slot = header
+                .dual_slot
+                .as_ref()
+                .ok_or_else(|| VaultError::Format("v2 金庫缺少 dual_slot".into()))?;
+            let inconsistent =
+                || VaultError::Format("dual_slot 與 share 不一致（金庫可能遭竄改）".into());
+            let nonce = slot_nonce(&slot.nonce).map_err(|_| inconsistent())?;
+            let ct = base64_decode(&slot.ct).map_err(|_| inconsistent())?;
+            let wrap = dual_wrap_key_from_shares(&share_a, &share_b);
+            let unwrapped = Zeroizing::new(
+                aes_gcm_decrypt_aad(&wrap, &nonce, &ct, DUAL_SLOT_AAD)
+                    .map_err(|_| inconsistent())?,
+            );
+            if unwrapped.as_slice() != kek.as_slice() {
+                return Err(inconsistent());
+            }
+        }
+    }
+    Ok(())
+}
+
 const MAX_AUDIT: usize = 1000;
 const MAX_LOGIN_FAILURES: usize = 10;
 
@@ -312,8 +384,16 @@ pub struct Vault {
 impl Vault {
     // ── 建立 ──
 
-    /// 首次執行：以主密碼建立金庫。
+    /// 首次執行：以主密碼建立金庫（單人版 v1）。
     pub fn create(path: &Path, password: &str) -> Result<Self, VaultError> {
+        Self::create_with_edition(path, password, Edition::Single)
+    }
+
+    fn create_with_edition(
+        path: &Path,
+        password: &str,
+        edition: Edition,
+    ) -> Result<Self, VaultError> {
         if path.exists() {
             return Err(VaultError::Format("vault.db 已存在".into()));
         }
@@ -324,9 +404,44 @@ impl Vault {
         let nonce = random_nonce();
         let ct = aes_gcm_encrypt(&pw_key, &nonce, kek.as_slice());
 
+        // v2：兩群組 share 各自隨機；dual_slot = AES-GCM(HKDF(share_A ‖ share_B), KEK)。
+        let (version, policy, dual_slot, dual_timeout, dual_shares) = match edition {
+            Edition::Single => (FORMAT_VERSION, None, None, None, None),
+            Edition::Dual => {
+                let share_a = random_kek();
+                let share_b = random_kek();
+                let wrap = dual_wrap_key_from_shares(&share_a, &share_b);
+                let dual_nonce = random_nonce();
+                let dual_ct =
+                    aes_gcm_encrypt_aad(&wrap, &dual_nonce, kek.as_slice(), DUAL_SLOT_AAD);
+                (
+                    FORMAT_VERSION_DUAL,
+                    Some(VaultPolicy::Dual),
+                    Some(Slot {
+                        nonce: base64_encode(&dual_nonce),
+                        ct: base64_encode(&dual_ct),
+                    }),
+                    Some(DEFAULT_DUAL_STEP_TIMEOUT_SECS),
+                    Some(DualShares {
+                        share_a: base64_encode(share_a.as_slice()),
+                        share_b: base64_encode(share_b.as_slice()),
+                    }),
+                )
+            }
+        };
+        let mut created_detail = format!(
+            "argon2id m={}KiB t={} p={}",
+            crate::crypto::ARGON2_M_COST,
+            crate::crypto::ARGON2_T_COST,
+            crate::crypto::ARGON2_P_COST
+        );
+        if edition == Edition::Dual {
+            created_detail.push_str(" edition=dual");
+        }
+
         let header = Header {
-            v: FORMAT_VERSION,
-            policy: None,
+            v: version,
+            policy,
             argon2: Argon2Params {
                 salt: base64_encode(&salt),
             },
@@ -334,9 +449,9 @@ impl Vault {
                 nonce: base64_encode(&nonce),
                 ct: base64_encode(&ct),
             },
-            dual_slot: None,
+            dual_slot,
             key_slots: Vec::new(),
-            dual_step_timeout_secs: None,
+            dual_step_timeout_secs: dual_timeout,
             created_at: now_rfc3339(),
         };
 
@@ -346,19 +461,14 @@ impl Vault {
                 ts: now_rfc3339(),
                 event: "vault_created".into(),
                 method: "setup".into(),
-                detail: format!(
-                    "argon2id m={}KiB t={} p={}",
-                    crate::crypto::ARGON2_M_COST,
-                    crate::crypto::ARGON2_T_COST,
-                    crate::crypto::ARGON2_P_COST
-                ),
+                detail: created_detail,
             }],
             settings: Settings {
                 idle_lock_minutes: 5,
                 password_history_limit: DEFAULT_PASSWORD_HISTORY_LIMIT,
-                dual_step_timeout_secs: None,
+                dual_step_timeout_secs: dual_timeout,
             },
-            dual: None,
+            dual: dual_shares,
         };
 
         let vault = Self {
@@ -371,11 +481,53 @@ impl Vault {
         Ok(vault)
     }
 
+    /// 雙群組控管版：以主密碼建立 v2 金庫（docs/plans/dual-control.md §4.1）。
+    pub fn create_dual(path: &Path, password: &str) -> Result<Self, VaultError> {
+        Self::create_with_edition(path, password, Edition::Dual)
+    }
+
+    /// 依執行檔版本建立金庫（lib.rs 以 `edition::current()` 呼叫）。
+    pub fn create_for(path: &Path, password: &str, edition: Edition) -> Result<Self, VaultError> {
+        Self::create_with_edition(path, password, edition)
+    }
+
+    /// 這個金庫的版本（由 header.v 決定，read_file 已驗證過形狀）。
+    pub fn edition(&self) -> Edition {
+        edition_of(&self.header)
+    }
+
     // ── 開啟（解鎖）──
+
+    /// 雙群組控管版：主密碼緊急登入（break-glass，§4.4）。
+    pub fn open_password_dual(path: &Path, password: &str) -> Result<Self, VaultError> {
+        Self::open_password_with_edition(path, password, Edition::Dual)
+    }
+
+    /// 依執行檔版本以主密碼登入。
+    pub fn open_password_for(
+        path: &Path,
+        password: &str,
+        edition: Edition,
+    ) -> Result<Self, VaultError> {
+        Self::open_password_with_edition(path, password, edition)
+    }
 
     /// 主密碼登入。失敗 → sidecar 記一筆 login_failed。
     pub fn open_password(path: &Path, password: &str) -> Result<Self, VaultError> {
-        let (header, payload) = Self::read_file(path, Edition::Single)?;
+        Self::open_password_with_edition(path, password, Edition::Single)
+    }
+
+    fn open_password_with_edition(
+        path: &Path,
+        password: &str,
+        edition: Edition,
+    ) -> Result<Self, VaultError> {
+        // 雙群組控管版的主密碼登入是 break-glass，稽核 method 與一般登入區分。
+        let method = match edition {
+            Edition::Single => "password",
+            Edition::Dual => "password-breakglass",
+        };
+        let (header, payload) = Self::read_file(path, edition)?;
         let salt = base64_decode(&header.argon2.salt)
             .map_err(|_| VaultError::Format("argon2 salt 解碼失敗".into()))?;
         let k = argon2id_derive(password.as_bytes(), &salt).map_err(VaultError::Crypto)?;
@@ -387,10 +539,10 @@ impl Vault {
             Ok(kek_bytes) if kek_bytes.len() == 32 => {
                 let mut kek = [0u8; 32];
                 kek.copy_from_slice(&kek_bytes);
-                Self::unlock(path, header, payload, Zeroizing::new(kek), "password")
+                Self::unlock(path, header, payload, Zeroizing::new(kek), method)
             }
             _ => {
-                record_login_failure(path, "password")?;
+                record_login_failure(path, method)?;
                 Err(VaultError::WrongPassword)
             }
         }
@@ -492,6 +644,7 @@ impl Vault {
         method: &str,
     ) -> Result<Self, VaultError> {
         let mut data = Self::decrypt_payload(&kek, &payload)?;
+        check_payload_edition(&header, &data, &kek)?;
 
         // 合併 sidecar（僅時間戳的失敗記錄）進加密 audit。
         let failures = read_failure_sidecar(path);
@@ -886,6 +1039,12 @@ impl Vault {
         pin: Option<&str>,
         custom_label: Option<&str>,
     ) -> Result<RegisteredCredential, VaultError> {
+        // 雙群組控管版必須走指定群組的註冊路徑（D5）；這裡 fail closed，不呼叫 authenticator。
+        if self.edition() == Edition::Dual {
+            return Err(VaultError::Format(
+                "雙群組控管版註冊金鑰須指定群組（A 或 B）".into(),
+            ));
+        }
         // 裁決②：不支援 hmac-secret/PRF 的金鑰拒絕註冊。
         // 順序：先 detect()（real 後端需 getInfo 才能知 PRF 能力；mock 的 detect 為無害循環），
         // 再 prf_supported()（依 detect 快取的資訊判定）。
@@ -1328,6 +1487,227 @@ mod tests {
                 vault: Edition::Dual
             })
         ));
+    }
+
+    // ── D4：建立 v2 / 主密碼 break-glass / payload 形狀 ──
+
+    fn fresh_path(tag: &str) -> PathBuf {
+        let d = tmp_dir(tag);
+        let p = d.join("vault.db");
+        let _ = fs::remove_file(&p);
+        let _ = fs::remove_file(failures_path(&p));
+        let _ = fs::remove_file(p.with_extension("db.tmp"));
+        p
+    }
+
+    fn decode_share(b64: &str) -> [u8; 32] {
+        base64_decode(b64).unwrap().try_into().unwrap()
+    }
+
+    #[test]
+    fn create_dual_writes_v2_header() {
+        let p = fresh_path("d4-create-header");
+        let v = Vault::create_dual(&p, "Pw-12345").unwrap();
+        assert_eq!(v.edition(), Edition::Dual);
+        drop(v);
+        let raw = raw_header_json(&p);
+        assert_eq!(raw["v"], serde_json::json!(2));
+        assert_eq!(raw["policy"], serde_json::json!("dual"));
+        assert!(raw["dual_slot"].is_object(), "dual_slot missing: {raw}");
+        assert_eq!(raw["dual_step_timeout_secs"], serde_json::json!(120));
+        assert_eq!(raw["key_slots"], serde_json::json!([]));
+        assert!(Vault::read_header(&p, Edition::Dual).is_ok());
+        assert!(matches!(
+            Vault::read_header(&p, Edition::Single),
+            Err(VaultError::WrongEdition {
+                vault: Edition::Dual
+            })
+        ));
+    }
+
+    #[test]
+    fn create_dual_payload_holds_distinct_shares_and_timeout() {
+        let p = fresh_path("d4-create-payload");
+        let v = Vault::create_dual(&p, "Pw-12345").unwrap();
+        let shares = v.data.dual.clone();
+        assert!(shares.is_some(), "payload must hold dual shares");
+        let shares = shares.unwrap();
+        let a = decode_share(&shares.share_a);
+        let b = decode_share(&shares.share_b);
+        assert_ne!(a, b);
+        assert_ne!(a, *v.kek);
+        assert_ne!(b, *v.kek);
+        assert_eq!(v.data.settings.dual_step_timeout_secs, Some(120));
+        assert!(v.data.audit[0].detail.contains("edition=dual"));
+    }
+
+    #[test]
+    fn dual_slot_unwraps_to_kek_with_both_shares() {
+        let p = fresh_path("d4-dual-slot");
+        let v = Vault::create_dual(&p, "Pw-12345").unwrap();
+        assert!(v.data.dual.is_some(), "dual shares missing");
+        assert!(v.header.dual_slot.is_some(), "dual slot missing");
+        let shares = v.data.dual.clone().unwrap();
+        let slot = v.header.dual_slot.clone().unwrap();
+        let wrap = crate::crypto::dual_wrap_key_from_shares(
+            &decode_share(&shares.share_a),
+            &decode_share(&shares.share_b),
+        );
+        let kek = crate::crypto::aes_gcm_decrypt_aad(
+            &wrap,
+            &slot_nonce(&slot.nonce).unwrap(),
+            &base64_decode(&slot.ct).unwrap(),
+            crate::crypto::DUAL_SLOT_AAD,
+        )
+        .unwrap();
+        assert_eq!(kek.as_slice(), v.kek.as_slice());
+    }
+
+    #[test]
+    fn dual_password_breakglass_unlocks_and_audits() {
+        let p = fresh_path("d4-breakglass");
+        let mut v = Vault::create_dual(&p, "Pw-12345").unwrap();
+        v.add_entry("example.com", "alice", "s3cret", "").unwrap();
+        drop(v.lock());
+        let reopened = Vault::open_password_dual(&p, "Pw-12345");
+        assert!(
+            reopened.is_ok(),
+            "break-glass login failed: {:?}",
+            reopened.err()
+        );
+        let reopened = reopened.unwrap();
+        assert_eq!(reopened.entries().len(), 1);
+        let last = reopened.audit().last().unwrap();
+        assert_eq!(last.event, "login_success");
+        assert_eq!(last.method, "password-breakglass");
+        assert!(reopened.data.dual.is_some());
+    }
+
+    #[test]
+    fn dual_password_wrong_records_breakglass_failure_without_touching_vault() {
+        let p = fresh_path("d4-breakglass-wrong");
+        drop(Vault::create_dual(&p, "Pw-12345").unwrap());
+        let before = fs::read(&p).unwrap();
+        assert!(matches!(
+            Vault::open_password_dual(&p, "wrong-pass"),
+            Err(VaultError::WrongPassword)
+        ));
+        assert_eq!(fs::read(&p).unwrap(), before);
+        let stamps = read_failure_sidecar(&p);
+        assert_eq!(stamps.len(), 1);
+        assert_eq!(stamps[0].method, "password-breakglass");
+    }
+
+    #[test]
+    fn dual_open_rejects_v1_file_without_writing() {
+        let p = fresh_path("d4-dual-open-v1");
+        drop(Vault::create(&p, "Pw-12345").unwrap());
+        let before = fs::read(&p).unwrap();
+        assert!(matches!(
+            Vault::open_password_dual(&p, "Pw-12345"),
+            Err(VaultError::WrongEdition {
+                vault: Edition::Single
+            })
+        ));
+        assert_eq!(fs::read(&p).unwrap(), before);
+        assert!(!failures_path(&p).exists());
+    }
+
+    #[test]
+    fn dual_payload_missing_shares_is_rejected_without_writing() {
+        let p = fresh_path("d4-missing-shares");
+        let mut v = Vault::create_dual(&p, "Pw-12345").unwrap();
+        v.data.dual = None;
+        v.write_file().unwrap();
+        drop(v);
+        let before = fs::read(&p).unwrap();
+        let result = Vault::open_password_dual(&p, "Pw-12345");
+        assert!(
+            matches!(&result, Err(VaultError::Format(m)) if m.contains("share")),
+            "expected share-shape error, got {:?}",
+            result.err()
+        );
+        assert_eq!(fs::read(&p).unwrap(), before);
+    }
+
+    #[test]
+    fn dual_slot_inconsistent_with_shares_is_rejected_without_writing() {
+        let p = fresh_path("d4-bad-dual-slot");
+        drop(Vault::create_dual(&p, "Pw-12345").unwrap());
+        rewrite_header(&p, |h| {
+            // 以 password_slot 取代 dual_slot：形狀合法但不是 HKDF(shares) 包出的 KEK。
+            h["dual_slot"] = h["password_slot"].clone();
+        });
+        let before = fs::read(&p).unwrap();
+        let result = Vault::open_password_dual(&p, "Pw-12345");
+        assert!(
+            matches!(&result, Err(VaultError::Format(m)) if m.contains("dual_slot")),
+            "expected dual_slot consistency error, got {:?}",
+            result.err()
+        );
+        assert_eq!(fs::read(&p).unwrap(), before);
+    }
+
+    #[test]
+    fn single_payload_with_dual_shares_is_rejected_without_writing() {
+        let p = fresh_path("d4-v1-with-shares");
+        let mut v = Vault::create(&p, "Pw-12345").unwrap();
+        v.data.dual = Some(DualShares {
+            share_a: base64_encode(&[1u8; 32]),
+            share_b: base64_encode(&[2u8; 32]),
+        });
+        v.write_file().unwrap();
+        drop(v);
+        let before = fs::read(&p).unwrap();
+        let result = Vault::open_password(&p, "Pw-12345");
+        assert!(
+            matches!(&result, Err(VaultError::Format(_))),
+            "v1 payload must not carry dual shares, got {:?}",
+            result.as_ref().map(|_| ())
+        );
+        assert_eq!(fs::read(&p).unwrap(), before);
+    }
+
+    #[test]
+    fn edition_dispatch_creates_and_opens_matching_format() {
+        let single = fresh_path("d4-dispatch-single");
+        drop(Vault::create_for(&single, "Pw-12345", Edition::Single).unwrap());
+        assert_eq!(raw_header_json(&single)["v"], serde_json::json!(1));
+        assert!(Vault::open_password_for(&single, "Pw-12345", Edition::Single).is_ok());
+
+        let dual = fresh_path("d4-dispatch-dual");
+        drop(Vault::create_for(&dual, "Pw-12345", Edition::Dual).unwrap());
+        assert_eq!(raw_header_json(&dual)["v"], serde_json::json!(2));
+        let opened = Vault::open_password_for(&dual, "Pw-12345", Edition::Dual);
+        assert!(
+            opened.is_ok(),
+            "dual dispatch open failed: {:?}",
+            opened.err()
+        );
+        assert!(matches!(
+            Vault::open_password_for(&dual, "Pw-12345", Edition::Single),
+            Err(VaultError::WrongEdition {
+                vault: Edition::Dual
+            })
+        ));
+    }
+
+    #[test]
+    fn dual_vault_refuses_ungrouped_key_registration() {
+        let p = fresh_path("d4-dual-register-guard");
+        let mut v = Vault::create_dual(&p, "Pw-12345").unwrap();
+        let mut backend = MockBackend::new();
+        let result = v.register_key(&mut backend, None);
+        assert!(
+            matches!(&result, Err(VaultError::Format(m)) if m.contains("群組")),
+            "dual vault must not register an ungrouped key, got {:?}",
+            result.as_ref().map(|_| ())
+        );
+        assert!(v.header.key_slots.is_empty());
+        let named = v.register_key_with_label(&mut backend, None, "k1");
+        assert!(named.is_err());
+        assert!(v.header.key_slots.is_empty());
+        assert!(Vault::read_header(&p, Edition::Dual).is_ok());
     }
 
     #[test]

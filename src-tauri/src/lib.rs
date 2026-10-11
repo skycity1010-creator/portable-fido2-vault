@@ -443,7 +443,8 @@ fn create_vault(state: tauri::State<VaultState>, password: String) -> Result<()>
     if path.exists() {
         return Err("vault.db 已存在（請改走登入）".into());
     }
-    let v = vault::Vault::create(&path, &password).map_err(|e| e.to_string())?;
+    let v = vault::Vault::create_for(&path, &password, edition::current())
+        .map_err(|e| e.to_string())?;
     state.with_lock(|g| {
         g.vault = Some(v);
         Ok(())
@@ -455,7 +456,8 @@ fn create_vault(state: tauri::State<VaultState>, password: String) -> Result<()>
 #[tauri::command]
 fn login_password(state: tauri::State<VaultState>, password: String) -> Result<Vec<vault::Entry>> {
     let path = path_from_state_or_default();
-    let v = vault::Vault::open_password(&path, &password).map_err(|e| e.to_string())?;
+    let v = vault::Vault::open_password_for(&path, &password, edition::current())
+        .map_err(|e| e.to_string())?;
     let entries = v.entries().to_vec();
     state.with_lock(|g| {
         g.vault = Some(v);
