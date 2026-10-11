@@ -533,9 +533,13 @@ fn check_payload_edition(
                 .ok_or_else(|| VaultError::Format("v2 金庫 payload 缺少 share".into()))?;
             let share_a = decode_share(&shares.share_a)?;
             let share_b = decode_share(&shares.share_b)?;
-            if data.settings.dual_step_timeout_secs.is_none() {
+            let secs = data
+                .settings
+                .dual_step_timeout_secs
+                .ok_or_else(|| VaultError::Format("v2 金庫 payload 缺少等待時限設定".into()))?;
+            if !(MIN_DUAL_STEP_TIMEOUT_SECS..=MAX_DUAL_STEP_TIMEOUT_SECS).contains(&secs) {
                 return Err(VaultError::Format(
-                    "v2 金庫 payload 缺少等待時限設定".into(),
+                    "v2 金庫 payload 等待時限超出 30–600 秒".into(),
                 ));
             }
             let slot = header
@@ -992,6 +996,23 @@ impl Vault {
     ) -> Result<Self, VaultError> {
         let mut data = Self::decrypt_payload(&kek, &payload)?;
         check_payload_edition(&header, &data, &kek)?;
+        let mut header = header;
+        if edition_of(&header) == Edition::Dual {
+            // The encrypted payload is authoritative; compare the RAW mirror, not its clamp.
+            let secs = data
+                .settings
+                .dual_step_timeout_secs
+                .ok_or_else(|| VaultError::Format("v2 金庫 payload 缺少等待時限設定".into()))?;
+            if header.dual_step_timeout_secs != Some(secs) {
+                header.dual_step_timeout_secs = Some(secs);
+                data.audit.push(AuditEvent {
+                    ts: now_rfc3339(),
+                    event: "settings_tamper_detected".into(),
+                    method: "system".into(),
+                    detail: format!("dual_step_timeout_secs mirror repaired to {secs}"),
+                });
+            }
+        }
 
         // 合併 sidecar（僅時間戳的失敗記錄）進加密 audit。
         let failures = read_failure_sidecar(path);
@@ -1308,6 +1329,33 @@ impl Vault {
         }
         self.record("entry_deleted", "manual", "（條目已刪除）")?;
         Ok(())
+    }
+
+    /// Change the authenticated timeout and its login-screen mirror together.
+    /// Only an unlocked dual vault may call this; invalid input never mutates state.
+    pub fn set_dual_step_timeout(&mut self, secs: u32) -> Result<(), VaultError> {
+        if self.edition() != Edition::Dual {
+            return Err(VaultError::Format("單人版不支援雙群組等待時限".into()));
+        }
+        if !(MIN_DUAL_STEP_TIMEOUT_SECS..=MAX_DUAL_STEP_TIMEOUT_SECS).contains(&secs) {
+            return Err(VaultError::Format("等待時限須介於 30–600 秒".into()));
+        }
+        let previous_setting = self.data.settings.dual_step_timeout_secs;
+        let previous_mirror = self.header.dual_step_timeout_secs;
+        let previous_audit = self.data.audit.clone();
+        self.data.settings.dual_step_timeout_secs = Some(secs);
+        self.header.dual_step_timeout_secs = Some(secs);
+        let result = self.record(
+            "settings_changed",
+            "manual",
+            &format!("dual_step_timeout_secs={secs}"),
+        );
+        if result.is_err() {
+            self.data.settings.dual_step_timeout_secs = previous_setting;
+            self.header.dual_step_timeout_secs = previous_mirror;
+            self.data.audit = previous_audit;
+        }
+        result
     }
 
     pub fn set_idle_lock(&mut self, minutes: u32) -> Result<(), VaultError> {
@@ -3307,6 +3355,437 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn d9_setting_updates_both_copies_and_persists_audit() {
+        let p = fresh_path("d9-set");
+        let mut v = Vault::create_dual(&p, "Pw-12345").unwrap();
+        for secs in [30, 60, 120, 600] {
+            let r = v.set_dual_step_timeout(secs);
+            assert!(r.is_ok(), "valid timeout must succeed: {r:?}");
+            assert_eq!(v.settings().dual_step_timeout_secs, Some(secs));
+            assert_eq!(
+                Vault::read_header(&p, Edition::Dual)
+                    .unwrap()
+                    .dual_step_timeout_secs,
+                Some(secs)
+            );
+            let disk = reopen_dual(&p);
+            assert_eq!(disk.settings().dual_step_timeout_secs, Some(secs));
+            assert!(disk.audit().iter().any(|a| a.event == "settings_changed"
+                && a.method == "manual"
+                && a.detail == format!("dual_step_timeout_secs={secs}")));
+        }
+    }
+
+    #[test]
+    fn d9_setting_rejects_out_of_range_without_any_mutation() {
+        let p = fresh_path("d9-bounds");
+        let mut v = Vault::create_dual(&p, "Pw-12345").unwrap();
+        let h = serde_json::to_value(&v.header).unwrap();
+        let d = serde_json::to_value(&v.data).unwrap();
+        let b = fs::read(&p).unwrap();
+        for secs in [0, 29, 601, u32::MAX] {
+            assert!(matches!(
+                v.set_dual_step_timeout(secs),
+                Err(VaultError::Format(_))
+            ));
+            assert!(serde_json::to_value(&v.header).unwrap() == h);
+            assert!(serde_json::to_value(&v.data).unwrap() == d);
+            assert!(fs::read(&p).unwrap() == b);
+        }
+    }
+
+    #[test]
+    fn d9_single_edition_refuses_timeout_and_remains_unchanged() {
+        let p = fresh_path("d9-single");
+        let mut v = Vault::create(&p, "Pw-12345").unwrap();
+        let h = serde_json::to_value(&v.header).unwrap();
+        let d = serde_json::to_value(&v.data).unwrap();
+        let b = fs::read(&p).unwrap();
+        assert!(matches!(
+            v.set_dual_step_timeout(60),
+            Err(VaultError::Format(_))
+        ));
+        assert!(serde_json::to_value(&v.header).unwrap() == h);
+        assert!(serde_json::to_value(&v.data).unwrap() == d);
+        assert!(fs::read(&p).unwrap() == b);
+    }
+
+    #[test]
+    fn d9_setting_write_failure_restores_settings_mirror_and_audit() {
+        let p = fresh_path("d9-write-failure");
+        let mut v = Vault::create_dual(&p, "Pw-12345").unwrap();
+        // Exercise rollback after record() has also trimmed the audit cap.
+        while v.data.audit.len() < 1000 {
+            v.data.audit.push(AuditEvent {
+                ts: now_rfc3339(),
+                event: "synthetic".into(),
+                method: "test".into(),
+                detail: String::new(),
+            });
+        }
+        v.write_file().unwrap();
+        let h = serde_json::to_value(&v.header).unwrap();
+        let d = serde_json::to_value(&v.data).unwrap();
+        let b = fs::read(&p).unwrap();
+        let tmp = p.with_extension("db.tmp");
+        assert!(!tmp.exists());
+        fs::create_dir(&tmp).unwrap(); // synthetic obstruction, never a real vault.
+        let result = v.set_dual_step_timeout(60);
+        fs::remove_dir(&tmp).unwrap();
+        assert!(matches!(result, Err(VaultError::Io(_))));
+        assert!(serde_json::to_value(&v.header).unwrap() == h);
+        assert!(serde_json::to_value(&v.data).unwrap() == d);
+        assert!(fs::read(&p).unwrap() == b);
+    }
+
+    #[test]
+    fn d9_password_unlock_repairs_raw_mirror_once_from_authenticated_settings() {
+        for raw in [
+            None,
+            Some(0u32),
+            Some(29),
+            Some(30),
+            Some(60),
+            Some(120),
+            Some(600),
+            Some(u32::MAX),
+        ] {
+            let p = fresh_path(&format!("d9-repair-{raw:?}"));
+            let mut v = Vault::create_dual(&p, "Pw-12345").unwrap();
+            assert!(v.set_dual_step_timeout(90).is_ok());
+            drop(v);
+            rewrite_header(&p, |h| {
+                if let Some(raw) = raw {
+                    h["dual_step_timeout_secs"] = serde_json::json!(raw);
+                } else {
+                    h.as_object_mut().unwrap().remove("dual_step_timeout_secs");
+                }
+            });
+            let v = reopen_dual(&p);
+            assert_eq!(v.settings().dual_step_timeout_secs, Some(90));
+            assert_eq!(
+                Vault::read_header(&p, Edition::Dual)
+                    .unwrap()
+                    .dual_step_timeout_secs,
+                Some(90)
+            );
+            let repair: Vec<_> = v
+                .audit()
+                .iter()
+                .filter(|a| a.event == "settings_tamper_detected")
+                .collect();
+            assert_eq!(repair.len(), 1);
+            assert_eq!(repair[0].method, "system");
+            assert_eq!(
+                repair[0].detail,
+                "dual_step_timeout_secs mirror repaired to 90"
+            );
+            assert_eq!(v.audit().last().unwrap().event, "login_success");
+            let disk = reopen_dual(&p);
+            assert_eq!(
+                disk.audit()
+                    .iter()
+                    .filter(|a| a.event == "settings_tamper_detected")
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn d9_successful_two_key_unlock_repairs_mirror_using_payload() {
+        let (p, c) = dual_vault_with("d9-key-repair", &[("a", KeyGroup::A), ("b", KeyGroup::B)]);
+        let mut v = reopen_dual(&p);
+        assert!(v.set_dual_step_timeout(60).is_ok());
+        drop(v);
+        rewrite_header(&p, |h| h["dual_step_timeout_secs"] = serde_json::json!(600));
+        let before = fs::read(&p).unwrap();
+        let now = Instant::now();
+        let pending =
+            Vault::dual_login_begin(&p, None, &mut TapBackend::tap(&c[0]), &mut || now).unwrap();
+        assert_eq!(pending.timeout_secs(), 600); // locked reads bounded, unauthenticated mirror.
+        assert!(
+            fs::read(&p).unwrap() == before,
+            "begin must not repair before authentication"
+        );
+        let result =
+            Vault::dual_login_complete(pending, None, &mut TapBackend::tap(&c[1]), &mut || now);
+        assert!(result.is_ok(), "two-key login failed: {:?}", result.err());
+        let v = result.unwrap();
+        assert_eq!(v.settings().dual_step_timeout_secs, Some(60));
+        assert_eq!(v.header.dual_step_timeout_secs, Some(60));
+        assert_eq!(
+            v.audit()
+                .iter()
+                .filter(|a| a.event == "settings_tamper_detected")
+                .count(),
+            1
+        );
+        assert_eq!(
+            Vault::read_header(&p, Edition::Dual)
+                .unwrap()
+                .dual_step_timeout_secs,
+            Some(60)
+        );
+        drop(v);
+        let persisted = reopen_dual(&p);
+        assert_eq!(
+            persisted
+                .audit()
+                .iter()
+                .filter(|a| a.event == "settings_tamper_detected")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn d9_matching_mirror_and_single_edition_never_report_tamper() {
+        for (tag, edition) in [("single", Edition::Single), ("dual", Edition::Dual)] {
+            let p = fresh_path(&format!("d9-no-tamper-{tag}"));
+            drop(Vault::create_for(&p, "Pw-12345", edition).unwrap());
+            let result = Vault::open_password_for(&p, "Pw-12345", edition);
+            assert!(result.is_ok(), "matching mirror login failed");
+            let v = result.unwrap();
+            assert!(!v
+                .audit()
+                .iter()
+                .any(|a| a.event == "settings_tamper_detected"));
+            if edition == Edition::Single {
+                assert!(serde_json::to_value(&v.header)
+                    .unwrap()
+                    .get("dual_step_timeout_secs")
+                    .is_none());
+                assert!(serde_json::to_value(v.settings())
+                    .unwrap()
+                    .get("dual_step_timeout_secs")
+                    .is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn d9_failed_authentication_does_not_repair_a_mirror() {
+        let p = fresh_path("d9-failed-auth");
+        drop(Vault::create_dual(&p, "Pw-12345").unwrap());
+        rewrite_header(&p, |h| h["dual_step_timeout_secs"] = serde_json::json!(600));
+        let before = fs::read(&p).unwrap();
+        assert!(Vault::open_password_dual(&p, "synthetic-wrong-password").is_err());
+        assert!(fs::read(&p).unwrap() == before);
+        assert_eq!(
+            Vault::read_header(&p, Edition::Dual)
+                .unwrap()
+                .dual_step_timeout_secs,
+            Some(600)
+        );
+    }
+
+    #[test]
+    fn d9_invalid_authenticated_timeout_fails_before_repair_or_write() {
+        for secs in [0, 29, 601, u32::MAX] {
+            let p = fresh_path(&format!("d9-invalid-payload-{secs}"));
+            let mut v = Vault::create_dual(&p, "Pw-12345").unwrap();
+            v.data.settings.dual_step_timeout_secs = Some(secs);
+            v.write_file().unwrap(); // re-encrypt synthetic invalid payload with fixture KEK.
+            drop(v);
+            rewrite_header(&p, |h| h["dual_step_timeout_secs"] = serde_json::json!(60));
+            let before = fs::read(&p).unwrap();
+            let sidecar = failures_path(&p);
+            assert!(!sidecar.exists());
+            let r = Vault::open_password_dual(&p, "Pw-12345");
+            assert!(
+                matches!(r, Err(VaultError::Format(_))),
+                "invalid payload timeout must fail closed"
+            );
+            assert!(fs::read(&p).unwrap() == before);
+            assert!(!sidecar.exists());
+            assert!(!p.with_extension("db.tmp").exists());
+        }
+    }
+
+    #[test]
+    fn d9_custom_setting_controls_new_pending_deadline() {
+        for secs in [30u32, 60, 120, 600] {
+            let (p, c) = dual_vault_with(
+                &format!("d9-pending-{secs}"),
+                &[("a", KeyGroup::A), ("b", KeyGroup::B)],
+            );
+            let mut v = reopen_dual(&p);
+            v.set_dual_step_timeout(secs).unwrap();
+            drop(v);
+            let now = Instant::now();
+            let pending =
+                Vault::dual_login_begin(&p, None, &mut TapBackend::tap(&c[0]), &mut || now)
+                    .unwrap();
+            assert_eq!(pending.timeout_secs(), secs);
+            assert!(!pending.is_expired(now + Duration::from_secs((secs - 1) as u64)));
+            assert!(!pending.is_expired(now + Duration::from_secs(secs as u64)));
+            assert!(pending
+                .is_expired(now + Duration::from_secs(secs as u64) + Duration::from_nanos(1)));
+            pending.cancel().unwrap();
+        }
+    }
+
+    #[test]
+    fn d9_failed_second_key_does_not_repair_before_full_authentication() {
+        let (p, c) = dual_vault_with(
+            "d9-second-failure",
+            &[("a", KeyGroup::A), ("b", KeyGroup::B)],
+        );
+        rewrite_header(&p, |h| h["dual_step_timeout_secs"] = serde_json::json!(600));
+        let before = fs::read(&p).unwrap();
+        let now = Instant::now();
+        let pending =
+            Vault::dual_login_begin(&p, None, &mut TapBackend::tap(&c[0]), &mut || now).unwrap();
+        let result =
+            Vault::dual_login_complete(pending, None, &mut TapBackend::tap(&c[0]), &mut || now);
+        assert!(result.is_err());
+        assert!(fs::read(&p).unwrap() == before);
+        assert_eq!(
+            Vault::read_header(&p, Edition::Dual)
+                .unwrap()
+                .dual_step_timeout_secs,
+            Some(600)
+        );
+    }
+
+    #[test]
+    fn d9_raw_mismatch_is_repaired_even_when_clamp_matches_authority() {
+        for (secs, mirror) in [(30, Some(0u32)), (600, Some(u32::MAX)), (120, None)] {
+            let p = fresh_path(&format!("d9-raw-not-clamp-{secs}"));
+            let mut v = Vault::create_dual(&p, "Pw-12345").unwrap();
+            v.set_dual_step_timeout(secs).unwrap();
+            drop(v);
+            rewrite_header(&p, |h| {
+                if let Some(raw) = mirror {
+                    h["dual_step_timeout_secs"] = serde_json::json!(raw);
+                } else {
+                    h.as_object_mut().unwrap().remove("dual_step_timeout_secs");
+                }
+            });
+            let h = Vault::read_header(&p, Edition::Dual).unwrap();
+            assert_eq!(effective_dual_step_timeout_secs(&h), secs);
+            let v = reopen_dual(&p);
+            assert_eq!(v.header.dual_step_timeout_secs, Some(secs));
+            assert_eq!(
+                v.audit()
+                    .iter()
+                    .filter(|a| a.event == "settings_tamper_detected")
+                    .count(),
+                1
+            );
+            let persisted = reopen_dual(&p);
+            assert_eq!(
+                persisted
+                    .audit()
+                    .iter()
+                    .filter(|a| a.event == "settings_tamper_detected")
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn d9_missing_authoritative_setting_fails_without_repair_or_write() {
+        let p = fresh_path("d9-missing-authority");
+        let mut v = Vault::create_dual(&p, "Pw-12345").unwrap();
+        v.data.settings.dual_step_timeout_secs = None;
+        v.write_file().unwrap();
+        drop(v);
+        rewrite_header(&p, |h| h["dual_step_timeout_secs"] = serde_json::json!(60));
+        let before = fs::read(&p).unwrap();
+        assert!(!failures_path(&p).exists());
+        assert!(matches!(
+            Vault::open_password_dual(&p, "Pw-12345"),
+            Err(VaultError::Format(_))
+        ));
+        assert!(fs::read(&p).unwrap() == before);
+        assert!(!failures_path(&p).exists());
+        assert!(!p.with_extension("db.tmp").exists());
+    }
+
+    #[test]
+    fn d9_non_u32_header_values_keep_existing_fail_closed_parse() {
+        for value in [
+            serde_json::json!("120"),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!(4294967296u64),
+        ] {
+            let p = fresh_path("d9-malformed-header");
+            drop(Vault::create_dual(&p, "Pw-12345").unwrap());
+            rewrite_header(&p, |h| h["dual_step_timeout_secs"] = value);
+            let before = fs::read(&p).unwrap();
+            assert!(Vault::read_header(&p, Edition::Dual).is_err());
+            assert!(Vault::open_password_dual(&p, "Pw-12345").is_err());
+            assert!(fs::read(&p).unwrap() == before);
+            assert!(!p.with_extension("db.tmp").exists());
+            assert!(!failures_path(&p).exists());
+        }
+    }
+
+    #[test]
+    fn d9_setting_rename_failure_restores_state_and_keeps_original_vault() {
+        let p = fresh_path("d9-rename-failure");
+        let mut v = Vault::create_dual(&p, "Pw-12345").unwrap();
+        let h = serde_json::to_value(&v.header).unwrap();
+        let d = serde_json::to_value(&v.data).unwrap();
+        let before = fs::read(&p).unwrap();
+        // Synthetic directory destination makes write(tmp) succeed, rename fail.
+        let blocked = p.with_extension("synthetic-blocked");
+        fs::create_dir(&blocked).unwrap();
+        v.path = blocked.clone();
+        let result = v.set_dual_step_timeout(60);
+        let tmp = blocked.with_extension("db.tmp");
+        let temp_was_written = tmp.is_file();
+        if temp_was_written {
+            fs::remove_file(&tmp).unwrap();
+        }
+        fs::remove_dir(&blocked).unwrap();
+        v.path = p.clone();
+        assert!(
+            temp_was_written,
+            "failure must occur AFTER temporary ciphertext write"
+        );
+        assert!(matches!(result, Err(VaultError::Io(_))));
+        assert!(serde_json::to_value(&v.header).unwrap() == h);
+        assert!(serde_json::to_value(&v.data).unwrap() == d);
+        assert!(fs::read(&p).unwrap() == before);
+    }
+
+    #[test]
+    fn d9_repair_save_failure_preserves_vault_and_failure_sidecar() {
+        let p = fresh_path("d9-repair-save-failure");
+        drop(Vault::create_dual(&p, "Pw-12345").unwrap());
+        rewrite_header(&p, |h| h["dual_step_timeout_secs"] = serde_json::json!(600));
+        record_login_failure(&p, "synthetic-existing-failure").unwrap();
+        let before = fs::read(&p).unwrap();
+        let failure_before = fs::read(failures_path(&p)).unwrap();
+        let tmp = p.with_extension("db.tmp");
+        fs::create_dir(&tmp).unwrap();
+        let result = Vault::open_password_dual(&p, "Pw-12345");
+        fs::remove_dir(&tmp).unwrap();
+        assert!(matches!(result, Err(VaultError::Io(_))));
+        assert!(fs::read(&p).unwrap() == before);
+        assert!(fs::read(failures_path(&p)).unwrap() == failure_before);
+        let v = reopen_dual(&p);
+        assert_eq!(v.header.dual_step_timeout_secs, Some(120));
+        assert_eq!(
+            v.audit()
+                .iter()
+                .filter(|a| a.event == "settings_tamper_detected")
+                .count(),
+            1
+        );
+        assert!(v
+            .audit()
+            .iter()
+            .any(|a| a.event == "login_failed" && a.method == "synthetic-existing-failure"));
+        assert!(!failures_path(&p).exists());
     }
 
     #[test]

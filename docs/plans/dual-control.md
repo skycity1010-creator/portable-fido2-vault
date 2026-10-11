@@ -1,6 +1,6 @@
 # 雙群組金鑰控管版（Dual-Control Edition）設計文件
 
-> 狀態：**D1–D8 已實作；D9–D13 未開始，實機驗收待 D13**。PR #29 維持 draft，未合併／未部署。
+> 狀態：**D1–D9 已實作；D10–D13 未開始，實機驗收待 D13**。PR #29 維持 draft，未合併／未部署。
 > 分支：`feature/dual-control-20261011`（base `main` `656ac95`）。
 > 需求來源：使用者 2026-10-11 Hermes desktop 對話（Q1–Q6 已裁決，見 §1）。
 
@@ -104,7 +104,7 @@ KEK（隨機 256-bit，加解密 payload；與 v1 相同）
 3. 第二步成功前，以下任一情況都會**清零 pending share、回到第一步**：逾時、按「取消」、第二步失敗（解包失敗、broker 錯誤或取消）、視窗關閉、改用密碼登入。逾時以 Rust 端截止時間為準，前端倒數僅供顯示。
 4. 等待時限設定：
    - 存放：加密 payload `Settings.dual_step_timeout_secs`（權威值），並鏡像到 header 明文 `dual_step_timeout_secs`。登入當下金庫還沒解密，只能讀明文鏡像。
-   - 範圍：**30–600 秒**，預設 120。讀取 header 時一律 clamp；值不合法時用預設值。
+   - 範圍：**30–600 秒**，預設 120。登入時以 header 的合法 `u32` 鏡像做 clamp；鏡像缺失／null 時使用預設 120。字串、負數、小數、超出 `u32` 的 JSON 值維持既有反序列化拒絕，不寬容解析。加密 payload 權威值缺失或超界時拒絕解鎖，不用預設值掩蓋不合法資料。
    - 解鎖後若兩值不一致，以 payload 值覆寫 header，並記 audit `settings_tamper_detected`。
    - 只有已解鎖的 session 才能修改（設定頁新增欄位），改動記 audit `settings_changed`。
 5. 稽核：
@@ -226,7 +226,8 @@ KEK（隨機 256-bit，加解密 payload；與 v1 相同）
 - [x] D6 excludeCredentials：同一支實體金鑰只能註冊一筆（mock / raw CTAP / Windows WebAuthn，見 §11）
 - [x] D7 兩步驟登入狀態機（begin / complete / cancel / 逾時，見 §11）
 - [x] D8 群組最後一支金鑰不可刪除 + 金鑰清單群組資料（見 §11）
-- [ ] D9–D13
+- [x] D9 時限設定：payload 權威值、header 鏡像、clamp 與竄改修復（見 §11）
+- [ ] D10–D13
 
 ## 11. 驗證紀錄
 
@@ -416,3 +417,17 @@ KEK（隨機 256-bit，加解密 payload；與 v1 相同）
 - 最終 MSVC single/dual 各 **305/305**、Node **65/65**、node syntax、scoped rustfmt、git diff check 全通過；測試前後兩檔 source SHA256 與 final frozen manifest 一致。
 - test-only follow-up 再由兩位獨立 CLI reviewer 檢查完整 diff/context，皆 passed=true、blocking 與 suggestions 空。final manifest SHA256 `0b27c308cb00718fa3cf258740f4151698d47219d0c18757b813a3e57d967552`。
 - 完整原始 log／失敗嘗試／verdict／snapshot 留存 `D:/scratch/dual-control-20261011/d8/`；收尾另存 durable evidence archive。實機刪除／前端停用鈕留待 D10/D13，未宣稱 PASS；PR 維持 draft、整體 Kanban blocked，不合併、不部署、不開始 D9。
+
+### D9（2026-10-11）
+
+- `Vault::set_dual_step_timeout(secs)`：僅雙人版接受 30–600 秒（含端點）；一次持久化加密 `Settings.dual_step_timeout_secs`、header 明文鏡像及 `settings_changed`（method=`manual`）。任何存檔錯誤都還原原設定、原鏡像和完整 audit，包含 audit 上限裁切前的紀錄。單人版或超界輸入拒絕，不改記憶體／磁碟／audit。
+- `lib.rs` 註冊 `set_dual_step_timeout` IPC；委派給受既有 session mutex／`with_unlocked` 保護的 `update_dual_step_timeout`。`get_vault_settings` 仍回傳加密 payload 的設定，不以 header 作權威來源。前端欄位是 D10，未在本輪加入。
+- 共用解鎖路徑先完成 AES-GCM 解密、payload 版本／dual-slot／權威時限驗證，再比較原始 header `Option<u32>`。不一致就以權威值修復並新增 `settings_tamper_detected`（method=`system`），與登入成功 audit 一次存檔。不能比較 clamp 後的值，否則 0→30、極大值→600、缺值→120 的竄改會被忽略。
+- 密碼與兩支金鑰登入共用修復；錯誤密碼、只完成第一步、第二步失敗、不合法權威設定皆不修復／不寫金庫。已鎖定時仍只採用有上限的明文鏡像，鏡像不是授權依據。D7 截止時間保留既有 `now > deadline` 判定，未改成 `>=`。
+- TDD 四個切片共 **10 個已執行 assertion RED**：setter 4、修復 2、權威範圍 1、IPC 3；各切片 GREEN 後才進下一步。其他 9 項新增測試為既有／補強行為 GREEN→GREEN，共新增 **19 個測試**。IPC 最初兩輪缺 dependency／錯誤 enum import 的編譯失敗保留為 NOT_EXECUTED，不算 RED；截止時間補強測試首次誤用 `>=`，查明 D7 原有判定後修正測試，未修改 production 邊界。
+- 候選兩份獨立唯讀審查通過後，加入 5 項 test-only 建議覆蓋：原始鏡像與 clamp 同值仍修復、缺少加密權威值、非 `u32` header 值、setter rename 失敗、修復存檔失敗保留 sidecar；另強化 audit 上限 rollback 和雙金鑰 repair audit 的重新解鎖持久化。初始 prompt 曾錯稱 sidecar 在存檔前刪除，兩位 reviewer 與父代理核對原始碼更正：實際一直是存檔成功後才刪除，production 未變動此順序。
+- 補強後兩份完整獨立審查皆 `passed=true`、`coverage_complete=true`，security／logic finding 空；父代理核對每個 touched line 與 immutable snapshot。Final manifest SHA256：`443e711de5e073d4812a12a4575d03cf4d86751605be10b704adae4a3d8d1a97`。
+- 最終本機 Rust MSVC：single／dual 各 **324/324**；Node **65/65**；syntax、scoped rustfmt、git diff check、新增行靜態安全掃描通過。source 與已審查 snapshot 一致。嚴格 Clippy `-D warnings` 仍被 `windows_webauthn.rs` 的 3 個既有基線問題阻擋（dead_code、兩個 too_many_arguments），不是 clean PASS；單次豁免這兩類既有 lint 後、限定 `--lib` 的 single／dual 檢查通過，未改永久 lint 設定。含所有 bin tests 的額外檢查也受既有診斷程式 lint／single-vs-dual 編譯 guard 阻擋，保留原始 log，不宣稱整體 Clippy clean。
+- GNU Release 單人版 `--features real-ctap --bin portable-fido-vault` 與雙人版 `--features real-ctap,dual-control --bin portable-fido-vault-dual` 均建置成功，x86_64 PE 與 SHA256 已核對；產物僅留在獨立 scratch target，未執行 GUI／未部署。隔離的 `TEMP/TMP/TMPDIR` synthetic fixture 目錄下另重跑 single／dual 各 324/324，production source 仍與審查 snapshot 一致。
+- 最終 reviewer 剩餘建議屬非阻擋性，留待 D11：鏡像不一致＋payload tag 破壞的組合；兩支金鑰成功但權威設定缺失／超界且有 sidecar；修復登入的 rename 階段故障。既有共用驗證／寫入順序已覆核，未發現 production 缺陷。
+- 全部原始 log、失敗嘗試、唯讀 verdict、snapshot／manifest 留存 `D:/scratch/dual-control-20261011/d9/`，收尾另存 durable archive。PR #29 保持 draft、整體 Kanban blocked；未合併／未部署／未接觸正式 vault／未開始 D10，實機驗收仍待 D13。新的 exact-head CI 結果由 archive receipt 與 Kanban 讀回紀錄，不以舊 D8 run 替代。

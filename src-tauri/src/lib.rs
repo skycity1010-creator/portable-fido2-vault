@@ -889,6 +889,17 @@ fn remove_key(state: tauri::State<VaultState>, credential_id: String) -> Result<
 }
 
 #[tauri::command]
+fn set_dual_step_timeout(state: tauri::State<VaultState>, secs: u32) -> Result<()> {
+    update_dual_step_timeout(&state, secs)
+}
+
+fn update_dual_step_timeout(state: &VaultState, secs: u32) -> Result<()> {
+    with_unlocked(state, |v| {
+        v.set_dual_step_timeout(secs).map_err(|e| e.to_string())
+    })
+}
+
+#[tauri::command]
 fn set_idle_lock(state: tauri::State<VaultState>, minutes: u32) -> Result<()> {
     with_unlocked(&state, |v| {
         v.set_idle_lock(minutes).map_err(|e| e.to_string())
@@ -1003,6 +1014,7 @@ pub fn run() {
             suggest_key_label,
             remove_key,
             set_idle_lock,
+            set_dual_step_timeout,
             get_vault_settings,
             set_password_history_limit,
             clear_clipboard_if_matches,
@@ -1436,5 +1448,94 @@ mod clipboard_match_tests {
         let unterminated: Vec<u16> = "expected".encode_utf16().collect();
         assert!(!clipboard_text_matches(&unterminated, "expected"));
         assert!(!clipboard_text_matches(&[], ""));
+    }
+}
+
+#[cfg(test)]
+mod d9_settings_ipc_tests {
+    use super::*;
+
+    fn state(vault: Option<vault::Vault>) -> VaultState {
+        VaultState(Mutex::new(AppInner {
+            vault,
+            backend: Box::new(fido2::UnavailableBackend::new(3)),
+            pending_csv_import: None,
+            dual_pending: None,
+            dual_generation: 0,
+        }))
+    }
+
+    #[test]
+    fn d9_ipc_locked_session_refuses_without_accessing_settings() {
+        let state = state(None);
+        assert_eq!(
+            update_dual_step_timeout(&state, 60).unwrap_err(),
+            "金庫未解鎖"
+        );
+        assert_eq!(
+            update_dual_step_timeout(&state, 0).unwrap_err(),
+            "金庫未解鎖"
+        );
+        state
+            .with_lock(|g| {
+                assert!(g.vault.is_none());
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn d9_ipc_unlocked_session_updates_and_core_checks_bounds() {
+        let dir = std::env::var_os("TMPDIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let p = dir.join(format!("d9-ipc-{}.db", rand::random::<u64>()));
+        let state = state(Some(
+            vault::Vault::create_dual(&p, "synthetic-d9-password").unwrap(),
+        ));
+        assert!(update_dual_step_timeout(&state, 60).is_ok());
+        state
+            .with_lock(|g| {
+                assert_eq!(
+                    g.vault.as_ref().unwrap().settings().dual_step_timeout_secs,
+                    Some(60)
+                );
+                Ok(())
+            })
+            .unwrap();
+        let before = std::fs::read(&p).unwrap();
+        assert!(update_dual_step_timeout(&state, 0).is_err());
+        assert!(std::fs::read(&p).unwrap() == before);
+        assert_eq!(
+            vault::Vault::read_header(&p, edition::Edition::Dual)
+                .unwrap()
+                .dual_step_timeout_secs,
+            Some(60)
+        );
+    }
+
+    #[test]
+    fn d9_ipc_command_registered_and_uses_the_tested_unlocked_guard() {
+        let source = include_str!("lib.rs");
+        let commands = source
+            .split(".invoke_handler(tauri::generate_handler![")
+            .nth(1)
+            .unwrap()
+            .split("])")
+            .next()
+            .unwrap();
+        assert!(commands
+            .lines()
+            .any(|l| l.trim() == "set_dual_step_timeout,"));
+        // Split deliberately avoids finding this test itself as the command body.
+        let marker = ["fn set_dual_step_", "timeout(state:"].concat();
+        let body = source
+            .split(&marker)
+            .nth(1)
+            .expect("Tauri setter exists")
+            .split("#[tauri::command]")
+            .next()
+            .unwrap();
+        assert!(body.contains("update_dual_step_timeout(&state, secs)"));
     }
 }
