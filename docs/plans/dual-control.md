@@ -497,3 +497,14 @@ KEK（隨機 256-bit，加解密 payload；與 v1 相同）
 - D11 殘餘事項 3（`target/*/examples/*` 不得隨產品發佈）已寫入 README 打包規則。
 - 驗證：文件中引用的 5 個新檔案路徑皆存在；UI 文字、錯誤訊息、audit method 與常數（30／120／600、`f2vlt-v2|dual-slot`）逐一對照 `src/app.js`、`src/index.html`、`src-tauri/src/{vault,crypto,fido2}.rs`；`git diff --check` 通過。純文件變更，未重跑 Rust／Node 套件，以 exact-head CI 為準。
 - 編輯腳本：`D:/scratch/dual-control-20261011/d12/d12-edit.py`（每個取代錨點都斷言只出現一次）。
+
+### D13 staging、實機進度與結果回饋修補（2026-10-12）
+
+- 原候選已獨立 staging 於 Win11-NB `C:\FIDOVAULT-RdpTest\D13-dual-e2e9f52c`；EXE `e2e9f52c060fbf4dbe4046104b2515973303cc00c1d371b3a45304ed11441af6`，loader 簽章 Valid、SHA256 `86545b66cdb0603bc26b626fb9ad610cb6e71f28d468f5ea66df23b03dda96d5`。四檔獨立讀回符合，無預置金庫；正式程式 hashes 與金庫 metadata 不變，未讀取／複製正式金庫內容。
+- 使用者依序回報 V1–V9 **PASS**（USER_REPORTED_PASS）；K1/K2 為兩支 YubiKey Bio，不擴大為其他金鑰類型或 broker 提示前景 PASS。V10 已確認 29／601 被拒、60 套用成功；60 秒倒數／逾時／之後重新完整登入仍未回報，V11／V12 未測、V13 選測未測。
+- 使用者要求按「套用」時可見結果；原碼已有 `alert()`，但實機未見提示。僅確認缺少可見 inline 回饋，不推定 WebView 根因。純前端修補：欄位旁 `textContent` live status 顯示範圍錯誤、套用中、IPC resolved 後成功、reject 後失敗；同步防重複送出，套用中停用按鈕／欄位、finally 恢復。Rust、IPC 名稱及 `{ secs }` 參數不變，單人版整區仍 hidden。
+- 原 SubAgent 在首個 API 呼叫 HTTP 400 model/provider 不相容，未讀／改檔，記為 NOT_EXECUTED；parent 接手，未更改持久配置。baseline Node 98/98；三組各 1 個已執行 assertion RED→GREEN；另新增 1 個 HTML accessibility 檢查（GREEN→GREEN）。原 alert 斷言依新需求改為 inline 斷言，保留 baseline 原檔。HTML 測試首次 locator 取到前方 warn，修正 locator 並保留原斷言／失敗 log，不計 behavior RED。
+- 最終 Node **102/102**、`node --check src/app.js`、`git diff --check` 通過；Reviewer profile `reviwer` 的獨立唯讀完成碼審查 `passed=true`、`coverage_complete=true`，security／logic 空，parent 核對 touched regions 與 immutable manifest `f9066e9f5f6b948eddf22cb4c9b2f8681d80be9577600d3d4bbf3b70f250cd2e`。非阻擋建議：alert 零呼叫與 30／600 合法邊界測試，未擴大本次修補。
+- GNU Release `real-ctap,dual-control` 實際 build exit 0；194 個 tracked build input 在生成 schema 還原後 hashes 不變、三檔與 reviewed snapshot 相符。EXE `9e6e5f55ed052e3d80fcadc3df8847f051945a2bff94a704d9f1ed2f0acdce9b`，7301632 bytes、x64 PE／subsystem 與原候選一致，配同一 verified loader。產物建置於 `ed87a80` 加 frozen frontend delta，並非後續 publication commit 的重建。
+- 窄範圍原始證據 `D:/scratch/dual-control-20261011/d13-feedback-parent/`；durable archive `D:/project/_archives/portable-fido2-vault/d13-feedback-9e6e5f55/`。打包時新候選實機狀態 NOT_TESTED，後續 CI 與獨立 staging 以額外 readback 記錄為準，不修改 frozen manifest。
+- D13 尚未完成；PR #29 維持 Draft、整體卡 blocked，不合併／不替換正式程式／不覆寫原候選或其測試金庫。

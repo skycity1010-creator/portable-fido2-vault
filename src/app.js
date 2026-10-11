@@ -969,17 +969,37 @@ async function abandonDualLogin() {
   try { await invoke("login_dual_cancel"); } catch {}
 }
 
+function showDualTimeoutFeedback(message) {
+  $("dual-timeout-feedback").textContent = message;
+  show("dual-timeout-feedback");
+}
+
+let dualTimeoutSaving = false;
+
 async function setDualStepTimeout() {
+  if (dualTimeoutSaving) return;
   const raw = String($("dual-step-timeout").value ?? "").trim();
   const secs = /^\d+$/.test(raw) ? Number(raw) : Number.NaN;
   if (!Number.isInteger(secs) || secs < 30 || secs > 600) {
-    return alert("請輸入 30–600 秒的第二步等待時限");
+    showDualTimeoutFeedback("未套用：請輸入 30–600 秒的第二步等待時限");
+    return;
   }
+  const button = $("btn-set-dual-step-timeout");
+  const input = $("dual-step-timeout");
+  dualTimeoutSaving = true;
   try {
+    button.disabled = true;
+    input.disabled = true;
+    showDualTimeoutFeedback("套用中，請稍候…");
     await invoke("set_dual_step_timeout", { secs });
-    $("dual-step-timeout").value = secs;
-    alert(`已套用：第二步等待時限 ${secs} 秒（自下次金鑰登入起生效）`);
-  } catch (e) { alert(String(e)); }
+    input.value = secs;
+    showDualTimeoutFeedback(`已套用：第二步等待時限 ${secs} 秒（自下次金鑰登入起生效）`);
+  } catch (e) { showDualTimeoutFeedback(`套用失敗：${String(e)}`); }
+  finally {
+    dualTimeoutSaving = false;
+    button.disabled = false;
+    input.disabled = false;
+  }
 }
 
 // ─────────────── 軌跡 ───────────────

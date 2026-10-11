@@ -484,7 +484,7 @@ test("dual timeout setting loads the vault value and validates 30–600 seconds 
     ui.$("dual-step-timeout").value = bad;
     await ui.$("btn-set-dual-step-timeout").onclick();
     await flush();
-    assert.match(ui.alerts.at(-1) || "", /30–600/, `value ${bad}`);
+    assert.match(ui.$("dual-timeout-feedback").textContent, /30–600/, `value ${bad}`);
   }
   assert.equal(commands(ui).includes("set_dual_step_timeout"), false);
   ui.$("dual-step-timeout").value = "60";
@@ -493,7 +493,7 @@ test("dual timeout setting loads the vault value and validates 30–600 seconds 
   const call = ui.calls.find((item) => item.command === "set_dual_step_timeout");
   assert.ok(call);
   assert.equal(call.args.secs, 60);
-  assert.match(ui.alerts.at(-1), /60 秒/);
+  assert.match(ui.$("dual-timeout-feedback").textContent, /60 秒/);
 });
 
 test("single edition hides the dual timeout setting", async () => {
@@ -730,4 +730,73 @@ test("a malicious first-step label is rendered as text only", async () => {
   await flush();
   assert.match(ui.$("dual-step-text").textContent, /<img src=x onerror=alert\(1\)>/);
   assert.deepEqual(htmlWrites, []);
+});
+
+// D13: visible feedback must work without browser alert dialogs.
+test("dual timeout validation renders inline feedback without alert", async () => {
+  const ui = loadUi();
+  ui.context.alert = () => {};
+  await flush();
+  await ui.$("btn-login-pw").onclick();
+  for (const bad of ["29", "601"]) {
+    ui.$("dual-step-timeout").value = bad;
+    await ui.$("btn-set-dual-step-timeout").onclick();
+    assert.match(ui.$("dual-timeout-feedback").textContent, /30–600/, `visible range feedback for ${bad}`);
+    assert.equal(visible(ui.$("dual-timeout-feedback")), true);
+  }
+  assert.equal(commands(ui).includes("set_dual_step_timeout"), false);
+});
+
+test("dual timeout save shows pending then persisted success and ignores duplicate submissions", async () => {
+  let resolve;
+  const gate = new Promise((r) => { resolve = r; });
+  const ui = loadUi({ handlers: { set_dual_step_timeout: () => gate } });
+  ui.context.alert = () => {};
+  await flush();
+  await ui.$("btn-login-pw").onclick();
+  ui.$("dual-step-timeout").value = "60";
+  const pending = ui.$("btn-set-dual-step-timeout").onclick();
+  await flush();
+  assert.equal(ui.$("btn-set-dual-step-timeout").disabled, true, "disable while saving");
+  assert.equal(ui.$("dual-step-timeout").disabled, true);
+  assert.match(ui.$("dual-timeout-feedback").textContent, /套用中/);
+  assert.doesNotMatch(ui.$("dual-timeout-feedback").textContent, /已套用/);
+  await ui.$("btn-set-dual-step-timeout").onclick();
+  assert.equal(ui.calls.filter((x) => x.command === "set_dual_step_timeout").length, 1);
+  resolve();
+  await pending;
+  assert.match(ui.$("dual-timeout-feedback").textContent, /已套用.*60 秒.*下次金鑰登入/);
+  assert.equal(visible(ui.$("dual-timeout-feedback")), true);
+  assert.equal(ui.$("btn-set-dual-step-timeout").disabled, false);
+  assert.equal(ui.$("dual-step-timeout").disabled, false);
+});
+
+test("dual timeout save failure renders text feedback and allows a successful retry", async () => {
+  let fail = true;
+  const message = "<img src=x onerror=evil()> synthetic save failed";
+  const ui = loadUi({ handlers: { set_dual_step_timeout: () => { if (fail) throw new Error(message); } } });
+  ui.context.alert = () => {};
+  await flush();
+  await ui.$("btn-login-pw").onclick();
+  ui.$("dual-step-timeout").value = "60";
+  await ui.$("btn-set-dual-step-timeout").onclick();
+  assert.match(ui.$("dual-timeout-feedback").textContent, /套用失敗.*synthetic save failed/);
+  assert.doesNotMatch(ui.$("dual-timeout-feedback").textContent, /已套用/);
+  assert.equal(visible(ui.$("dual-timeout-feedback")), true);
+  assert.equal(ui.$("btn-set-dual-step-timeout").disabled, false);
+  assert.equal(ui.$("dual-step-timeout").disabled, false);
+  assert.equal(htmlWrites.some((s) => s.includes(message)), false, "error must not be inserted as HTML");
+  fail = false;
+  await ui.$("btn-set-dual-step-timeout").onclick();
+  assert.match(ui.$("dual-timeout-feedback").textContent, /已套用.*60 秒/);
+});
+
+test("dual timeout feedback is an accessible live status inside edition-gated settings", () => {
+  const html = fs.readFileSync(path.join(__dirname, "..", "src", "index.html"), "utf8");
+  const start = html.indexOf('id="dual-settings"');
+  assert.ok(start >= 0, "dual settings section exists");
+  const end = html.indexOf('<div class="warn"', start);
+  assert.ok(end > start, "settings section terminator follows settings");
+  const section = html.slice(start, end);
+  assert.match(section, /id="dual-timeout-feedback"[^>]*role="status"[^>]*aria-live="polite"[^>]*aria-atomic="true"/);
 });
