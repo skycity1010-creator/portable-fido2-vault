@@ -196,6 +196,9 @@ fn error_category(error: &FidoError) -> &'static str {
         FidoError::PrfNotSupported => "prf-unsupported",
         FidoError::PrfNotConfirmed => "hmac-creation-unconfirmed",
         FidoError::CredentialExcluded => "credential-excluded",
+        FidoError::PlatformCredentialExists => "platform-credential-exists",
+        FidoError::PlatformPrfUnsupported => "platform-prf-unsupported",
+        FidoError::PlatformCredentialMissing => "platform-credential-missing",
         FidoError::NotSupported(_) => "capability-unsupported",
         FidoError::Internal(_) => "internal",
         FidoError::DeviceOpenDenied { .. } => "device-open-denied",
@@ -1109,6 +1112,18 @@ mod tests {
             (FidoError::PrfNotSupported, "prf-unsupported"),
             (FidoError::PrfNotConfirmed, "hmac-creation-unconfirmed"),
             (FidoError::CredentialExcluded, "credential-excluded"),
+            (
+                FidoError::PlatformCredentialExists,
+                "platform-credential-exists",
+            ),
+            (
+                FidoError::PlatformPrfUnsupported,
+                "platform-prf-unsupported",
+            ),
+            (
+                FidoError::PlatformCredentialMissing,
+                "platform-credential-missing",
+            ),
             (
                 FidoError::NotSupported("SENTINEL".into()),
                 "capability-unsupported",

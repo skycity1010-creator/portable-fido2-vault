@@ -167,7 +167,7 @@ v1 不變，`KeySlot` 新增：
 - [x] S0 spike（Win11-NB 負向、SKYCITY-PC 正向）
 - [x] 設計文件
 - [x] D1（2026-10-12，見 §11 D1）
-- [ ] D2
+- [x] D2（2026-10-12，見 §11 D2）
 - [ ] D3
 - [ ] D4
 - [ ] D5
@@ -204,3 +204,30 @@ v1 不變，`KeySlot` 新增：
 - 格式：`origin/main` 的 `vault.rs` 本來 rustfmt 乾淨，整檔 `rustfmt --config skip_children=true` 只影響新增行（diff 181 行全為新增）。
 - D1 為 lib-only 格式項目，不含 FFI／金鑰派生變更：未派 reviewer、未做 Release 建置（留給 D3 與 D9）。
 - 證據目錄：`D:\scratch\windows-hello-single-20261012\d1\`。
+
+### D2（2026-10-12）Backend trait 平台方法 + Mock
+
+變更（`src-tauri/src/fido2.rs`、`src-tauri/src/webauthn_diagnostics.rs`；只有新增，沒有刪改既有行）：
+- `PlatformStatus { api_ok, uvpa, console }` + `available()`（三項皆真）；`Default` 全為 false。
+- `PlatformRegistration { credential, creation_prf: Zeroizing<[u8;32]> }`，自訂 `Debug` 遮蔽 `creation_prf`。
+- `FidoBackend` 新增 5 個預設方法，預設全部 fail closed（`platform_status` 回全 false，其餘回 `NotSupported(PLATFORM_UNSUPPORTED_MSG)`）：
+  `platform_status`、`register_platform_credential(label, exclude)`、`get_platform_prf_secret(ids) -> (id, secret)`、`list_platform_credentials`、`delete_platform_credential`。
+  既有後端（Windows WebAuthn、raw CTAP、`UnavailableBackend`、各測試後端）沿用預設，行為不變；Windows 實作留給 D3。
+- `FidoError` 新增 `PlatformCredentialExists`（NTE_EXISTS，「這台電腦…已註冊 Windows Hello…未新增金鑰槽」）、`PlatformPrfUnsupported`（「不支援金庫解鎖所需的 PRF…未新增金鑰槽」）、`PlatformCredentialMissing`（「這台電腦沒有此金庫的 Windows Hello 憑證…」）；診斷分類 `platform-credential-exists`／`platform-prf-unsupported`／`platform-credential-missing`（closed 字串）。既有 `CredentialExcluded`（YubiKey、A/B 群組）訊息不變。
+- `MockBackend`：每個實例 = 一台電腦，在記憶體保存本機 Windows Hello credential；ID 版面 `b"f2vl-wh:" ‖ random(24)`（32 bytes，與 roaming ID 首位元組 0..=2 不衝突）；PRF = 既有 `prf_for_credential`（建立輸出 = 斷言輸出）。
+  - `MockPlatformMode`：`Supported`（預設，SKYCITY-PC 型）、`AssertionPrfFails`（Win11-NB 型：建立成功、斷言回 `PlatformPrfUnsupported`）、`CreationPrfMismatch`、`Unavailable`。
+  - `with_platform_mode`、`with_platform_credentials`（模擬同機重啟）、`platform_credential_ids`、`is_mock_platform_credential`。
+  - excludeCredentials：清單中有本機持有的 ID → `PlatformCredentialExists`，不建立；其他電腦的 ID 不擋。
+  - 斷言只挑本機持有的 ID（不在本機 → `PlatformCredentialMissing`）；刪除不存在 → `PlatformCredentialMissing`。
+  - roaming 路徑（`get_prf_secret`／`get_prf_secret_for_any`）收到 platform ID → `NoDevice`（模擬 YubiKey 不持有此 credential），供 D4 驗證「YubiKey 路徑不收 platform ID」。
+- 限制：Mock 的本機 credential 只在記憶體；跨行程（D7 Gate E2E）需用 `with_platform_credentials` 帶入。
+
+測試（15 個 `fido2::tests::wh_d2_*` + 既有 `webauthn_diagnostics::tests::error_categories_never_use_raw_text` 新增 3 列）：
+- stub 階段（Mock 未覆寫平台方法、`Display` 回 `TODO`、分類回 `todo`、`PlatformRegistration` 用 derive Debug）：
+  - RED（assertion 失敗，11 個）：`mock_platform_available_by_default`、`mock_register_then_assert_returns_creation_prf`、`mock_exclude_existing_rejects_without_creating`、`mock_nb_mode_creation_prf_but_assertion_fails`、`mock_creation_prf_mismatch_mode`、`mock_assert_picks_local_credential_only`、`mock_restart_keeps_machine_credentials`、`mock_roaming_path_rejects_platform_ids`（stub 時卡在前置的平台註冊，roaming 拒絕本身於 GREEN 才實際執行）、`mock_delete_unknown_and_twice`、`platform_registration_debug_redacts_prf`、`platform_error_messages`；另 `error_categories_never_use_raw_text` RED（left `"todo"`）。
+  - stub 即通過（4 個，trait 預設即規格／型別性質，不計 RED）：`trait_defaults_fail_closed`、`unavailable_backend_platform_ops_fail_closed`、`platform_status_requires_all_three`、`mock_unavailable_mode`。
+- RED 證據：`D:\scratch\windows-hello-single-20261012\d2\red-stub.log`、`red-stub-diag.log`。
+- 全套件：`real-ctap` 337 → **352 passed**、`real-ctap,dual-control` 337 → **352 passed**，0 failed、0 warning；Node 108/108；`node --check`、`git diff --check` OK；兩個來源檔 hash-lock 前後一致。
+- 格式：兩檔在 base 為 rustfmt 乾淨，整檔格式化後 diff 只有新增行（538 行）。
+- D2 不含 FFI／金鑰派生：未派 reviewer（D3 FFI 才派兩位）；未做 Release 建置。
+- 證據目錄：`D:\scratch\windows-hello-single-20261012\d2\`。
