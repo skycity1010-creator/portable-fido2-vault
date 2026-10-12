@@ -1,6 +1,6 @@
 # 單人版 Windows Hello 登入／解鎖（windows-hello-single）
 
-> 狀態：設計完成，**尚未授權實作**（Kanban 卡 blocked，等使用者說「開始 D1」）。
+> 狀態：實作中（2026-10-12 使用者授權「開始 D1」；逐項進行，每項完成後停下等下一個指示）。
 > 範圍：只有單人版 `portable-fido-vault.exe`。雙群組控管版（`portable-fido-vault-dual.exe`，v2）**不動**。
 
 ## 0 目標
@@ -166,7 +166,7 @@ v1 不變，`KeySlot` 新增：
 
 - [x] S0 spike（Win11-NB 負向、SKYCITY-PC 正向）
 - [x] 設計文件
-- [ ] D1
+- [x] D1（2026-10-12，見 §11 D1）
 - [ ] D2
 - [ ] D3
 - [ ] D4
@@ -175,3 +175,32 @@ v1 不變，`KeySlot` 新增：
 - [ ] D7
 - [ ] D8
 - [ ] D9
+
+## 11 驗證紀錄
+
+### D1（2026-10-12）格式：`SlotAuthenticator` + `KeySlot.authenticator`
+
+變更（只有 `src-tauri/src/vault.rs`）：
+- 新增 `pub enum SlotAuthenticator { Platform }`，`#[serde(rename_all = "lowercase")]`：只接受 `"platform"`，`"Platform"`／`"PLATFORM"`／`"roaming"`／空字串／非字串一律反序列化失敗。
+- `KeySlot.authenticator: Option<SlotAuthenticator>`，`#[serde(default, skip_serializing_if = "Option::is_none")]`；既有註冊路徑寫 `None`。
+- `check_header_edition`：v2（雙群組）任何 slot 帶 `authenticator` → `Format`，在解密前拒絕；v1 接受。
+
+測試（7 個新測試，`vault::tests::wh_d1_*`）：
+
+| 測試 | stub 階段 | 說明 |
+|---|---|---|
+| `wh_d1_platform_authenticator_serializes_as_lowercase` | RED（left `"Platform"` / right `"platform"`） | 序列化大小寫 |
+| `wh_d1_authenticator_deserialization_is_strict` | RED（`"platform"` 無法解析） | 嚴格大小寫、未知值拒絕 |
+| `wh_d1_single_edition_accepts_and_preserves_platform_slot` | RED（v1 platform slot 無法讀） | v1 可讀、可用主密碼開啟，正常存檔後 `authenticator` 保留 |
+| `wh_d1_edition_check_platform_slot_single_ok_dual_rejected` | RED（v2 回傳 `Ok(())`） | 純 header 版本守門 |
+| `wh_d1_dual_open_rejects_v2_file_with_authenticator_without_writing` | RED（stub 時因大小寫先在 JSON 解析失敗，回傳 `Json` 而非 `Format`） | 真實 v2 檔：`open_password_dual`／`read_header` → `Format`，檔案 byte-identical、無 sidecar、無 `.db.tmp` |
+| `wh_d1_roaming_slot_serialization_is_unchanged` | GREEN→GREEN（既有行為回歸） | 無 platform slot 的 `KeySlot` JSON 與變更前逐字相同 |
+| `wh_d1_v1_file_header_roundtrip_is_byte_identical` | GREEN→GREEN（既有行為回歸） | 真實 v1 檔 header 往返 byte-identical、不含 `authenticator` |
+
+- RED 證據：`D:\scratch\windows-hello-single-20261012\d1\red-stub-2.log`（5 failed / 2 passed，皆為 assertion 失敗，非編譯錯誤）。
+- 第一次 stub 執行 `red-stub-1-FIXTURE-literal-error.log` 中 `wh_d1_roaming_slot_serialization_is_unchanged` 的失敗是測試字面值寫錯（`KeyKind` 實際序列化為 `touch_only`），只修正該期望字面值，不計為 RED。
+- 全套件（MSVC wrapper，`D:\scratch\wh-test-msvc.sh`）：baseline `real-ctap` 330／`real-ctap,dual-control` 330 → D1 後各 **337 passed, 0 failed**；兩者 0 warning（與 baseline 相同）。
+- Node：108 tests / 108 pass；`node --check src/app.js` OK；`git diff --check` OK；`vault.rs` hash-lock 前後一致。
+- 格式：`origin/main` 的 `vault.rs` 本來 rustfmt 乾淨，整檔 `rustfmt --config skip_children=true` 只影響新增行（diff 181 行全為新增）。
+- D1 為 lib-only 格式項目，不含 FFI／金鑰派生變更：未派 reviewer、未做 Release 建置（留給 D3 與 D9）。
+- 證據目錄：`D:\scratch\windows-hello-single-20261012\d1\`。

@@ -118,6 +118,15 @@ pub struct Slot {
     pub ct: String,    // b64 AES-GCM(KEK) 含 tag
 }
 
+/// 金鑰槽的 authenticator 種類（docs/plans/windows-hello-single.md §3）。
+/// 明文、未認證的 metadata：只決定用哪種 attachment 去要 PRF；竄改只會讓該 slot 無法使用。
+/// 欄位不存在 = roaming（YubiKey）。目前只有 `platform`；大小寫嚴格，未知值反序列化失敗（fail closed）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SlotAuthenticator {
+    Platform,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct KeySlot {
     pub credential_id: String, // b64
@@ -127,6 +136,10 @@ pub struct KeySlot {
     /// 雙群組控管版（v2）必填；單人版（v1）必為 None，且不序列化（v1 檔案格式不變）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<KeyGroup>,
+    /// 單人版（v1）：`Some(Platform)` = Windows Hello slot；None = roaming（不序列化，舊檔 byte-identical）。
+    /// 雙群組控管版（v2）必為 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authenticator: Option<SlotAuthenticator>,
     pub nonce: String,
     pub ct: String,
 }
@@ -312,6 +325,16 @@ pub fn check_header_edition(header: &Header, edition: Edition) -> Result<(), Vau
             }
             if header.key_slots.iter().any(|slot| slot.group.is_none()) {
                 return Err(VaultError::Format("v2 金庫的金鑰槽缺少群組".into()));
+            }
+            // 雙群組控管版不支援 Windows Hello（docs/plans/windows-hello-single.md §4.5）。
+            if header
+                .key_slots
+                .iter()
+                .any(|slot| slot.authenticator.is_some())
+            {
+                return Err(VaultError::Format(
+                    "v2 金庫的金鑰槽不應含 authenticator 欄位".into(),
+                ));
             }
         }
     }
@@ -1549,6 +1572,7 @@ impl Vault {
             label: reg.label.clone(),
             key_type: reg.kind,
             group,
+            authenticator: None,
             nonce: base64_encode(&nonce),
             ct: base64_encode(&ct),
         });
@@ -1891,6 +1915,7 @@ mod tests {
             label: "k1".into(),
             key_type: KeyKind::TouchOnly,
             group,
+            authenticator: None,
             nonce: "bm9uY2U=".into(),
             ct: "Y3Q=".into(),
         }
@@ -2100,6 +2125,162 @@ mod tests {
                 vault: Edition::Dual
             })
         ));
+    }
+
+    // ── windows-hello D1：KeySlot.authenticator 格式 ──
+
+    fn platform_key_slot(group: Option<KeyGroup>) -> KeySlot {
+        let mut slot = sample_key_slot(group);
+        slot.authenticator = Some(SlotAuthenticator::Platform);
+        slot
+    }
+
+    #[test]
+    fn wh_d1_platform_authenticator_serializes_as_lowercase() {
+        let raw = serde_json::to_value(platform_key_slot(None)).unwrap();
+        assert_eq!(
+            raw["authenticator"],
+            serde_json::json!("platform"),
+            "platform slot must serialize as \"platform\": {raw}"
+        );
+    }
+
+    #[test]
+    fn wh_d1_authenticator_deserialization_is_strict() {
+        let with = |value: serde_json::Value| {
+            let mut raw = serde_json::to_value(sample_key_slot(None)).unwrap();
+            raw["authenticator"] = value;
+            serde_json::from_value::<KeySlot>(raw).map(|slot| slot.authenticator)
+        };
+        let ok = with(serde_json::json!("platform"));
+        assert!(
+            matches!(ok, Ok(Some(SlotAuthenticator::Platform))),
+            "\"platform\" must parse: {ok:?}"
+        );
+        for bad in ["Platform", "PLATFORM", "roaming", "cross-platform", ""] {
+            let r = with(serde_json::json!(bad));
+            assert!(r.is_err(), "{bad:?} must be rejected, got {r:?}");
+        }
+        let r = with(serde_json::json!(1));
+        assert!(r.is_err(), "non-string must be rejected, got {r:?}");
+    }
+
+    /// 既有行為回歸（GREEN→GREEN）：沒有 platform slot 的 v1 KeySlot / header 序列化與變更前逐字相同。
+    #[test]
+    fn wh_d1_roaming_slot_serialization_is_unchanged() {
+        let json = serde_json::to_string(&sample_key_slot(None)).unwrap();
+        assert_eq!(
+            json,
+            format!(
+                "{{\"credential_id\":\"Y3JlZA==\",\"aaguid\":\"{}\",\"label\":\"k1\",\"key_type\":\"touch_only\",\"nonce\":\"bm9uY2U=\",\"ct\":\"Y3Q=\"}}",
+                "00".repeat(16)
+            )
+        );
+        assert!(!json.contains("authenticator"));
+    }
+
+    /// 既有行為回歸（GREEN→GREEN）：真實 v1 檔案 header 經 Header 往返後 byte-for-byte 相同。
+    #[test]
+    fn wh_d1_v1_file_header_roundtrip_is_byte_identical() {
+        let p = fresh_path("wh-d1-v1-bytes");
+        let mut v = Vault::create(&p, "Pw-12345").unwrap();
+        let mut backend = MockBackend::new();
+        v.register_key(&mut backend, None).unwrap();
+        drop(v);
+        let buf = fs::read(&p).unwrap();
+        let len = u32::from_le_bytes(buf[6..10].try_into().unwrap()) as usize;
+        let raw = &buf[10..10 + len];
+        let header: Header = serde_json::from_slice(raw).unwrap();
+        assert_eq!(header.key_slots.len(), 1);
+        assert_eq!(header.key_slots[0].authenticator, None);
+        assert_eq!(serde_json::to_vec(&header).unwrap(), raw);
+        assert!(!std::str::from_utf8(raw).unwrap().contains("authenticator"));
+    }
+
+    #[test]
+    fn wh_d1_single_edition_accepts_and_preserves_platform_slot() {
+        let p = fresh_path("wh-d1-v1-platform");
+        let mut v = Vault::create(&p, "Pw-12345").unwrap();
+        let mut backend = MockBackend::new();
+        v.register_key(&mut backend, None).unwrap();
+        drop(v);
+        rewrite_header(&p, |h| {
+            h["key_slots"][0]["authenticator"] = serde_json::json!("platform");
+        });
+
+        let header = Vault::read_header(&p, Edition::Single);
+        assert!(
+            header.is_ok(),
+            "v1 platform slot must be readable: {:?}",
+            header.err()
+        );
+        assert_eq!(
+            header.unwrap().key_slots[0].authenticator,
+            Some(SlotAuthenticator::Platform)
+        );
+        let opened = Vault::open_password(&p, "Pw-12345");
+        assert!(
+            opened.is_ok(),
+            "v1 platform slot must open: {:?}",
+            opened.err()
+        );
+        let mut v = opened.unwrap();
+        v.set_idle_lock(7).unwrap();
+        drop(v);
+        assert_eq!(
+            raw_header_json(&p)["key_slots"][0]["authenticator"],
+            serde_json::json!("platform"),
+            "a normal save must keep the platform marker"
+        );
+    }
+
+    #[test]
+    fn wh_d1_edition_check_platform_slot_single_ok_dual_rejected() {
+        let mut v1 = sample_header(1);
+        v1.key_slots = vec![platform_key_slot(None)];
+        assert!(check_header_edition(&v1, Edition::Single).is_ok());
+
+        let mut v2 = valid_v2_header();
+        v2.key_slots.push(platform_key_slot(Some(KeyGroup::B)));
+        let r = check_header_edition(&v2, Edition::Dual);
+        assert!(
+            matches!(r, Err(VaultError::Format(_))),
+            "v2 slot with authenticator must be Format: {r:?}"
+        );
+    }
+
+    #[test]
+    fn wh_d1_dual_open_rejects_v2_file_with_authenticator_without_writing() {
+        let p = fresh_path("wh-d1-v2-reject");
+        let mut v = Vault::create_dual(&p, "Pw-12345").unwrap();
+        let mut backend = MockBackend::new();
+        v.register_key_in_group(&mut backend, None, "a1", KeyGroup::A)
+            .unwrap();
+        drop(v);
+        rewrite_header(&p, |h| {
+            h["key_slots"][0]["authenticator"] = serde_json::json!("platform");
+        });
+        let before = fs::read(&p).unwrap();
+
+        let r = Vault::open_password_dual(&p, "Pw-12345");
+        assert!(
+            matches!(r, Err(VaultError::Format(_))),
+            "dual edition must refuse a v2 slot with authenticator: {:?}",
+            r.err()
+        );
+        let h = Vault::read_header(&p, Edition::Dual);
+        assert!(
+            matches!(h, Err(VaultError::Format(_))),
+            "read_header must refuse it too: {:?}",
+            h.err()
+        );
+        assert_eq!(
+            fs::read(&p).unwrap(),
+            before,
+            "file must stay byte-identical"
+        );
+        assert!(!failures_path(&p).exists(), "no failure sidecar");
+        assert!(!p.with_extension("db.tmp").exists());
     }
 
     // ── D4：建立 v2 / 主密碼 break-glass / payload 形狀 ──
