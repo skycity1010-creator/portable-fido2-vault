@@ -459,6 +459,148 @@ fn read_keys_from_file(path: &std::path::Path) -> Result<Vec<KeyInfo>> {
     Ok(key_infos(&h))
 }
 
+/// Safe, non-interactive Windows Hello capability response; never contains secrets.
+#[derive(Debug, serde::Serialize)]
+struct PlatformStatusInfo {
+    api_ok: bool,
+    uvpa: bool,
+    console: bool,
+    local_credential: bool,
+}
+
+fn query_platform_status(
+    state: &VaultState,
+    path: &std::path::Path,
+    ed: edition::Edition,
+) -> Result<PlatformStatusInfo> {
+    require_windows_hello_single(ed)?;
+    state.with_lock(|g| {
+        let header = match g.vault.as_ref() {
+            // Vault exposes no header accessor; use its checked persisted header.
+            Some(v) => Some(vault::Vault::read_header(&v.path, ed).map_err(|e| e.to_string())?),
+            None if path.exists() => {
+                Some(vault::Vault::read_header(path, ed).map_err(|e| e.to_string())?)
+            }
+            None => None,
+        };
+        if let Some(h) = header.as_ref() {
+            vault::check_header_edition(h, ed).map_err(|e| e.to_string())?;
+        }
+        let status = g.backend.platform_status();
+        let mut local_credential = false;
+        if status.available() {
+            if let Some(h) = header {
+                // RP-scoped membership also recognizes R3 marker-lost slots.
+                // This is a query only: do not repair or persist the header here.
+                let local = g
+                    .backend
+                    .list_platform_credentials()
+                    .map_err(|e| e.to_string())?;
+                for slot in &h.key_slots {
+                    let id = crypto::base64_decode(&slot.credential_id)
+                        .map_err(|_| "credential_id 解碼失敗".to_string())?;
+                    local_credential |= local.contains(&id);
+                }
+            }
+        }
+        Ok(PlatformStatusInfo {
+            api_ok: status.api_ok,
+            uvpa: status.uvpa,
+            console: status.console,
+            local_credential,
+        })
+    })
+}
+
+fn require_windows_hello_single(ed: edition::Edition) -> Result<()> {
+    if ed != edition::Edition::Single {
+        return Err("Windows Hello 僅支援單人版；請使用 YubiKey 或主密碼".into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn platform_status(state: tauri::State<VaultState>) -> Result<PlatformStatusInfo> {
+    query_platform_status(&state, &path_from_state_or_default(), edition::current())
+}
+
+fn require_windows_hello_available(backend: &dyn fido2::FidoBackend) -> Result<()> {
+    if !backend.platform_status().available() {
+        return Err("Windows Hello 需要 Windows 11、WebAuthn API v8+、可用的 UVPA 與本機 Console，且斷言須支援 PRF；請使用 YubiKey 或主密碼登入".into());
+    }
+    Ok(())
+}
+
+fn register_windows_hello_inner(
+    state: &VaultState,
+    ed: edition::Edition,
+    raise: impl FnOnce(bool) -> Result<isize>,
+    computer_name: impl FnOnce() -> Result<String>,
+) -> Result<fido2::RegisteredCredential> {
+    require_windows_hello_single(ed)?;
+    state.with_lock(|g| {
+        let v = g.vault.as_mut().ok_or_else(|| "金庫未解鎖".to_string())?;
+        require_windows_hello_available(g.backend.as_ref())?;
+        let name = computer_name()?;
+        let owner = raise(true)?;
+        g.backend.set_webauthn_parent_hwnd(owner);
+        v.register_windows_hello(g.backend.as_mut(), &name, ed)
+            .map_err(|e| e.to_string())
+    })
+}
+
+#[tauri::command]
+fn register_windows_hello(
+    window: tauri::WebviewWindow,
+    state: tauri::State<VaultState>,
+) -> Result<fido2::RegisteredCredential> {
+    register_windows_hello_inner(
+        &state,
+        edition::current(),
+        |required| raise_key_operation_window(&window, required),
+        || {
+            std::env::var("COMPUTERNAME")
+                .map_err(|_| "無法取得本機電腦名稱；請使用 YubiKey 或主密碼".to_string())
+        },
+    )
+}
+
+fn login_windows_hello_inner(
+    state: &VaultState,
+    path: &std::path::Path,
+    ed: edition::Edition,
+    raise: impl FnOnce(bool) -> Result<isize>,
+) -> Result<Vec<vault::Entry>> {
+    require_windows_hello_single(ed)?;
+    state.with_lock(|g| {
+        require_windows_hello_available(g.backend.as_ref())?;
+        let owner = raise(true)?;
+        g.backend.set_webauthn_parent_hwnd(owner);
+        let v = vault::Vault::open_windows_hello(path, g.backend.as_mut(), ed)
+            .map_err(|e| e.to_string())?;
+        let entries = v.entries().to_vec();
+        // Authentication, successful persistence and publication share one lock.
+        // A concurrent lock command cannot interleave and be undone by login.
+        g.pending_csv_import = None;
+        g.dual_pending = None;
+        g.vault = Some(v);
+        Ok(entries)
+    })
+}
+
+#[tauri::command]
+fn login_windows_hello(
+    window: tauri::WebviewWindow,
+    state: tauri::State<VaultState>,
+) -> Result<Vec<vault::Entry>> {
+    login_windows_hello_inner(
+        &state,
+        &path_from_state_or_default(),
+        edition::current(),
+        |required| raise_key_operation_window(&window, required),
+    )
+}
+
 /// 首次執行：建立帳號（主密碼）。
 #[tauri::command]
 fn create_vault(state: tauri::State<VaultState>, password: String) -> Result<()> {
@@ -482,17 +624,33 @@ fn create_vault(state: tauri::State<VaultState>, password: String) -> Result<()>
 /// 主密碼登入。
 #[tauri::command]
 fn login_password(state: tauri::State<VaultState>, password: String) -> Result<Vec<vault::Entry>> {
-    let path = path_from_state_or_default();
-    let v = vault::Vault::open_password_for(&path, &password, edition::current())
-        .map_err(|e| e.to_string())?;
-    let entries = v.entries().to_vec();
+    login_password_inner(
+        &state,
+        &path_from_state_or_default(),
+        &password,
+        edition::current(),
+    )
+}
+
+fn login_password_inner(
+    state: &VaultState,
+    path: &std::path::Path,
+    password: &str,
+    ed: edition::Edition,
+) -> Result<Vec<vault::Entry>> {
     state.with_lock(|g| {
+        let v = if ed == edition::Edition::Single {
+            vault::Vault::open_password_with_platform(path, password, ed, g.backend.as_mut())
+        } else {
+            vault::Vault::open_password_for(path, password, ed)
+        }
+        .map_err(|e| e.to_string())?;
+        let entries = v.entries().to_vec();
         // 改用主密碼登入：放棄進行中的兩步驟登入（share 清零）。
         g.dual_pending = None;
         g.vault = Some(v);
-        Ok(())
-    })?;
-    Ok(entries)
+        Ok(entries)
+    })
 }
 
 /// FIDO2 金鑰登入。pin：PIN 型金鑰必填；其他類型忽略。
@@ -881,10 +1039,56 @@ fn suggest_key_label(state: tauri::State<VaultState>) -> Result<String> {
     with_unlocked(&state, |v| Ok(v.suggested_key_label()))
 }
 
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case", tag = "outcome", content = "warning")]
+enum KeyRemovalInfo {
+    Removed,
+    ManualRemovalRequired(KeyRemovalWarning),
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum KeyRemovalWarning {
+    NotLocal,
+    DiscoveryFailed,
+    DeleteFailed,
+}
+
 #[tauri::command]
-fn remove_key(state: tauri::State<VaultState>, credential_id: String) -> Result<()> {
-    with_unlocked(&state, |v| {
-        v.remove_key(&credential_id).map_err(|e| e.to_string())
+fn remove_key(
+    state: tauri::State<VaultState>,
+    credential_id: String,
+) -> Result<Option<KeyRemovalInfo>> {
+    remove_key_inner(&state, &credential_id, edition::current())
+}
+
+fn remove_key_inner(
+    state: &VaultState,
+    credential_id: &str,
+    ed: edition::Edition,
+) -> Result<Option<KeyRemovalInfo>> {
+    state.with_lock(|g| {
+        let v = g.vault.as_mut().ok_or_else(|| "金庫未解鎖".to_string())?;
+        if ed == edition::Edition::Dual {
+            v.remove_key(credential_id).map_err(|e| e.to_string())?;
+            return Ok(None); // Preserve the existing dual JSON null response.
+        }
+        let outcome = v
+            .remove_key_with_platform(credential_id, g.backend.as_mut(), ed)
+            .map_err(|e| e.to_string())?;
+        Ok(match outcome {
+            vault::PlatformCleanupOutcome::NotApplicable => None,
+            vault::PlatformCleanupOutcome::Removed => Some(KeyRemovalInfo::Removed),
+            vault::PlatformCleanupOutcome::ManualRemovalRequired(warning) => {
+                Some(KeyRemovalInfo::ManualRemovalRequired(match warning {
+                    vault::PlatformCleanupWarning::NotLocal => KeyRemovalWarning::NotLocal,
+                    vault::PlatformCleanupWarning::DiscoveryFailed => {
+                        KeyRemovalWarning::DiscoveryFailed
+                    }
+                    vault::PlatformCleanupWarning::DeleteFailed => KeyRemovalWarning::DeleteFailed,
+                }))
+            }
+        })
     })
 }
 
@@ -992,6 +1196,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_edition,
             boot_info,
+            platform_status,
+            register_windows_hello,
+            login_windows_hello,
             create_vault,
             login_password,
             login_key,
@@ -1022,6 +1229,926 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod wh_d5_tests {
+    use super::*;
+    use fido2::{FidoBackend, FidoError, MockBackend, PlatformStatus};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct Calls {
+        status: usize,
+        list: usize,
+        create: usize,
+        assert: usize,
+        delete: usize,
+        hwnd: Vec<isize>,
+        allow: Vec<Vec<u8>>,
+    }
+
+    struct Recording {
+        mock: MockBackend,
+        calls: Arc<Mutex<Calls>>,
+        status: PlatformStatus,
+        list_error: bool,
+        rogue: bool,
+        delete_error: bool,
+    }
+
+    impl Recording {
+        fn new() -> Self {
+            Self {
+                mock: MockBackend::new(),
+                calls: Arc::new(Mutex::new(Calls::default())),
+                status: PlatformStatus {
+                    api_ok: true,
+                    uvpa: true,
+                    console: true,
+                },
+                list_error: false,
+                rogue: false,
+                delete_error: false,
+            }
+        }
+    }
+
+    impl FidoBackend for Recording {
+        fn detect(&mut self) -> std::result::Result<fido2::DetectedKey, FidoError> {
+            self.mock.detect()
+        }
+        fn register_credential(
+            &mut self,
+            d: &fido2::DetectedKey,
+            pin: Option<&str>,
+        ) -> std::result::Result<fido2::RegisteredCredential, FidoError> {
+            self.mock.register_credential(d, pin)
+        }
+        fn get_prf_secret(
+            &mut self,
+            id: &[u8],
+            pin: Option<&str>,
+        ) -> std::result::Result<[u8; 32], FidoError> {
+            self.mock.get_prf_secret(id, pin)
+        }
+        fn platform_status(&self) -> PlatformStatus {
+            self.calls.lock().unwrap().status += 1;
+            self.status
+        }
+        fn list_platform_credentials(&mut self) -> std::result::Result<Vec<Vec<u8>>, FidoError> {
+            self.calls.lock().unwrap().list += 1;
+            if self.list_error {
+                return Err(FidoError::Internal("synthetic discovery failure".into()));
+            }
+            self.mock.list_platform_credentials()
+        }
+        fn register_platform_credential(
+            &mut self,
+            label: &str,
+            exclude: &[Vec<u8>],
+        ) -> std::result::Result<fido2::PlatformRegistration, FidoError> {
+            self.calls.lock().unwrap().create += 1;
+            self.mock.register_platform_credential(label, exclude)
+        }
+        fn get_platform_prf_secret(
+            &mut self,
+            ids: &[Vec<u8>],
+        ) -> std::result::Result<(Vec<u8>, [u8; 32]), FidoError> {
+            let mut c = self.calls.lock().unwrap();
+            c.assert += 1;
+            c.allow = ids.to_vec();
+            drop(c);
+            if self.rogue {
+                return Ok((vec![255; 32], [0; 32]));
+            }
+            self.mock.get_platform_prf_secret(ids)
+        }
+        fn delete_platform_credential(&mut self, id: &[u8]) -> std::result::Result<(), FidoError> {
+            self.calls.lock().unwrap().delete += 1;
+            if self.delete_error {
+                return Err(FidoError::Internal("synthetic delete failure".into()));
+            }
+            self.mock.delete_platform_credential(id)
+        }
+        fn set_webauthn_parent_hwnd(&mut self, handle: isize) {
+            self.calls.lock().unwrap().hwnd.push(handle);
+        }
+    }
+
+    fn fixture_root() -> std::path::PathBuf {
+        std::env::var_os("TMPDIR")
+            .filter(|value| !value.is_empty())
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+    }
+
+    struct Fixture {
+        dir: std::path::PathBuf,
+        path: std::path::PathBuf,
+    }
+
+    impl std::ops::Deref for Fixture {
+        type Target = std::path::Path;
+        fn deref(&self) -> &Self::Target {
+            &self.path
+        }
+    }
+
+    impl AsRef<std::path::Path> for Fixture {
+        fn as_ref(&self) -> &std::path::Path {
+            &self.path
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            // The directory was atomically created by this fixture, never adopted.
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn fixture() -> Fixture {
+        fixture_in(&fixture_root())
+    }
+
+    fn fixture_in(root: &std::path::Path) -> Fixture {
+        std::fs::create_dir_all(root).unwrap();
+        for _ in 0..32 {
+            let dir = root.join(format!("f2v-wh-d5-{:016x}", rand::random::<u64>()));
+            match std::fs::create_dir(&dir) {
+                Ok(()) => {
+                    return Fixture {
+                        path: dir.join("vault.db"),
+                        dir,
+                    };
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("could not create isolated D5 fixture: {error}"),
+            }
+        }
+        panic!("could not reserve unique D5 fixture directory")
+    }
+
+    #[test]
+    fn wh_d5_review_t1_fixture_honors_injected_root_and_scoped_cleanup() {
+        let root = fixture_root();
+        let p = fixture_in(&root);
+        assert!(p.starts_with(&root), "fixture must honor the injected root");
+        let dir = p.parent().unwrap().to_path_buf();
+        assert!(dir.is_dir());
+        std::fs::write(&p, b"synthetic scoped cleanup sentinel").unwrap();
+        drop(p);
+        assert!(!dir.exists(), "only this fixture directory must be cleaned");
+        assert!(root.is_dir(), "the supplied root must be preserved");
+    }
+
+    fn state(v: Option<vault::Vault>, b: Recording) -> (VaultState, Arc<Mutex<Calls>>) {
+        let calls = b.calls.clone();
+        (
+            VaultState(Mutex::new(AppInner {
+                vault: v,
+                backend: Box::new(b),
+                pending_csv_import: None,
+                dual_pending: None,
+                dual_generation: 0,
+            })),
+            calls,
+        )
+    }
+
+    #[test]
+    fn wh_d5_control_unknown_removal_does_not_touch_native_or_persist() {
+        let p = fixture();
+        let v = vault::Vault::create_for(&p, "synthetic-D5-password", edition::Edition::Single)
+            .unwrap();
+        let before = std::fs::read(&p).unwrap();
+        let (s, c) = state(Some(v), Recording::new());
+        let result = remove_key_inner(&s, "unknown-id", edition::Edition::Single);
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&p).unwrap(), before);
+        let c = c.lock().unwrap();
+        assert_eq!((c.create, c.assert, c.delete, c.hwnd.len()), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn wh_d5_control_dual_removal_preserves_null_and_skips_backend() {
+        let p = fixture();
+        let mut v =
+            vault::Vault::create_for(&p, "synthetic-D5-password", edition::Edition::Dual).unwrap();
+        for (name, group) in [
+            ("a1", crypto::KeyGroup::A),
+            ("a2", crypto::KeyGroup::A),
+            ("b1", crypto::KeyGroup::B),
+        ] {
+            let mut roaming = MockBackend::new();
+            let result = v.register_key_for(&mut roaming, None, name, Some(group));
+            assert!(
+                result.is_ok(),
+                "dual synthetic registration failed: {result:?}"
+            );
+        }
+        let id = v.keys_meta()[0].0.clone();
+        let (s, c) = state(Some(v), Recording::new());
+        let result = remove_key_inner(&s, &id, edition::Edition::Dual);
+        assert!(result.is_ok());
+        assert_eq!(
+            serde_json::to_value(result.unwrap()).unwrap(),
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            vault::Vault::read_header(&p, edition::Edition::Dual)
+                .unwrap()
+                .key_slots
+                .len(),
+            2
+        );
+        let c = c.lock().unwrap();
+        assert_eq!(
+            (c.status, c.list, c.create, c.assert, c.delete, c.hwnd.len()),
+            (0, 0, 0, 0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn wh_d5_control_existing_password_roaming_and_dual_paths() {
+        let p = fixture();
+        let mut v = vault::Vault::create_for(&p, "synthetic-D5-password", edition::Edition::Single)
+            .unwrap();
+        let mut roaming = MockBackend::new();
+        let reg = v.register_key_with_label(&mut roaming, None, "synthetic-roaming");
+        assert!(reg.is_ok());
+        let id = crypto::base64_encode(&reg.unwrap().credential_id);
+        v.lock();
+        let (s, c) = state(None, Recording::new());
+        let pw = login_password_inner(&s, &p, "synthetic-D5-password", edition::Edition::Single);
+        assert!(pw.is_ok());
+        let removal = remove_key_inner(&s, &id, edition::Edition::Single);
+        assert!(removal.is_ok());
+        assert_eq!(removal.unwrap(), None);
+        let c = c.lock().unwrap();
+        assert_eq!((c.create, c.assert, c.delete, c.hwnd.len()), (0, 0, 0, 0));
+
+        let dual_path = fixture();
+        let dual =
+            vault::Vault::create_for(&dual_path, "synthetic-D5-password", edition::Edition::Dual);
+        assert!(dual.is_ok());
+        dual.unwrap().lock();
+        let (ds, dc) = state(None, Recording::new());
+        let dual_pw = login_password_inner(
+            &ds,
+            &dual_path,
+            "synthetic-D5-password",
+            edition::Edition::Dual,
+        );
+        assert!(dual_pw.is_ok());
+        assert_eq!(dc.lock().unwrap().status, 0);
+    }
+
+    fn ipc_wiring_is_correct(source: &str) -> bool {
+        let normalized = source.replace(char::from(13), "");
+        let source = normalized.split("\n#[cfg(test)]\n").next().unwrap();
+        if source
+            .matches(".invoke_handler(tauri::generate_handler![")
+            .count()
+            != 1
+        {
+            return false;
+        }
+        let Some(commands) = source
+            .split(".invoke_handler(tauri::generate_handler![")
+            .nth(1)
+            .and_then(|tail| tail.split("])").next())
+        else {
+            return false;
+        };
+        for command in [
+            "platform_status",
+            "register_windows_hello",
+            "login_windows_hello",
+            "login_password",
+            "remove_key",
+        ] {
+            if !commands
+                .lines()
+                .any(|line| line.trim() == format!("{command},"))
+            {
+                return false;
+            }
+        }
+        for (entry, helper) in [
+            ("fn platform_status(state:", "query_platform_status(&state"),
+            (
+                "fn register_windows_hello(\n",
+                "register_windows_hello_inner(",
+            ),
+            ("fn login_windows_hello(\n", "login_windows_hello_inner("),
+            ("fn login_password(state:", "login_password_inner("),
+            ("fn remove_key(\n", "remove_key_inner("),
+        ] {
+            if source.matches(entry).count() != 1 {
+                return false;
+            }
+            let Some(body) = source
+                .split(entry)
+                .nth(1)
+                .and_then(|tail| tail.split("\n}\n").next())
+            else {
+                return false;
+            };
+            if !body.contains(helper) {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[test]
+    fn wh_d5_control_command_registry_and_ipc_helper_wiring() {
+        assert!(ipc_wiring_is_correct(include_str!("lib.rs")));
+    }
+
+    #[test]
+    fn wh_d5_review_t2_wiring_oracle_rejects_disconnected_production() {
+        let source = include_str!("lib.rs").replace(char::from(13), "");
+        assert!(
+            ipc_wiring_is_correct(&source),
+            "actual command wiring must pass"
+        );
+        let disconnected = source.replacen(
+            "remove_key_inner(&state, &credential_id, edition::current())",
+            "Ok(None)",
+            1,
+        );
+        assert_ne!(
+            disconnected, source,
+            "negative fixture must remove real production call"
+        );
+        assert!(
+            !ipc_wiring_is_correct(&disconnected),
+            "test text cannot certify disconnected production"
+        );
+    }
+
+    #[test]
+    fn wh_d5_control_dual_and_locked_refuse_without_backend_or_focus() {
+        let p = fixture();
+        let (s, c) = state(None, Recording::new());
+        let mut focus = 0;
+        let mut name = 0;
+        assert!(query_platform_status(&s, &p, edition::Edition::Dual).is_err());
+        assert!(register_windows_hello_inner(
+            &s,
+            edition::Edition::Dual,
+            |_| {
+                focus += 1;
+                Ok(1)
+            },
+            || {
+                name += 1;
+                Ok("SYNTHETIC".into())
+            }
+        )
+        .is_err());
+        assert!(
+            login_windows_hello_inner(&s, &p, edition::Edition::Dual, |_| {
+                focus += 1;
+                Ok(1)
+            })
+            .is_err()
+        );
+        let locked = register_windows_hello_inner(
+            &s,
+            edition::Edition::Single,
+            |_| {
+                focus += 1;
+                Ok(1)
+            },
+            || {
+                name += 1;
+                Ok("SYNTHETIC".into())
+            },
+        );
+        assert!(locked.is_err());
+        assert_eq!(locked.err().unwrap(), "金庫未解鎖");
+        assert_eq!((focus, name), (0, 0));
+        let c = c.lock().unwrap();
+        assert_eq!(
+            (c.status, c.list, c.create, c.assert, c.delete, c.hwnd.len()),
+            (0, 0, 0, 0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn wh_d5_control_status_no_vault_foreign_and_lost_marker() {
+        let missing = fixture();
+        let (empty, ec) = state(None, Recording::new());
+        let result = query_platform_status(&empty, &missing, edition::Edition::Single);
+        assert!(result.is_ok());
+        assert!(!result.unwrap().local_credential);
+        assert_eq!(ec.lock().unwrap().list, 0);
+        let p = fixture();
+        let mut b = Recording::new();
+        let mut v = vault::Vault::create_for(&p, "synthetic-D5-password", edition::Edition::Single)
+            .unwrap();
+        assert!(v
+            .register_windows_hello(&mut b.mock, "SYNTHETIC", edition::Edition::Single)
+            .is_ok());
+        v.lock();
+        let (foreign, fc) = state(None, Recording::new());
+        let result = query_platform_status(&foreign, &p, edition::Edition::Single);
+        assert!(result.is_ok());
+        assert!(!result.unwrap().local_credential);
+        assert_eq!(fc.lock().unwrap().list, 1);
+        lose_marker(&p);
+        let before = std::fs::read(&p).unwrap();
+        let (local, lc) = state(None, b);
+        let result = query_platform_status(&local, &p, edition::Edition::Single);
+        assert!(result.is_ok());
+        assert!(result.unwrap().local_credential);
+        assert_eq!(std::fs::read(&p).unwrap(), before);
+        let c = lc.lock().unwrap();
+        assert_eq!((c.create, c.assert, c.delete, c.hwnd.len()), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn wh_d5_control_status_unavailable_error_and_checked_header() {
+        for mode in 0..5 {
+            let p = fixture();
+            let v = vault::Vault::create_for(&p, "synthetic-D5-password", edition::Edition::Single)
+                .unwrap();
+            v.lock();
+            let mut b = Recording::new();
+            match mode {
+                0 => b.status.api_ok = false,
+                1 => b.status.uvpa = false,
+                2 => b.status.console = false,
+                3 => b.list_error = true,
+                _ => std::fs::write(&p, b"synthetic corrupt header").unwrap(),
+            }
+            let before = std::fs::read(&p).unwrap();
+            let (s, c) = state(None, b);
+            let result = query_platform_status(&s, &p, edition::Edition::Single);
+            if mode >= 3 {
+                assert!(
+                    result.is_err(),
+                    "discovery/header errors must remain errors"
+                );
+            } else {
+                assert!(result.is_ok());
+                assert!(!result.unwrap().local_credential);
+            }
+            let c = c.lock().unwrap();
+            assert_eq!(c.list, usize::from(mode == 3));
+            assert_eq!((c.create, c.assert, c.delete, c.hwnd.len()), (0, 0, 0, 0));
+            assert_eq!(std::fs::read(&p).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn wh_d5_control_status_unlocked_uses_vault_path() {
+        let p = fixture();
+        let mut b = Recording::new();
+        let mut v = vault::Vault::create_for(&p, "synthetic-D5-password", edition::Edition::Single)
+            .unwrap();
+        assert!(v
+            .register_windows_hello(&mut b.mock, "SYNTHETIC", edition::Edition::Single)
+            .is_ok());
+        let before = std::fs::read(&p).unwrap();
+        let (s, c) = state(Some(v), b);
+        let unrelated = fixture();
+        let result = query_platform_status(&s, &unrelated, edition::Edition::Single);
+        assert!(result.is_ok());
+        assert!(result.unwrap().local_credential);
+        assert_eq!(std::fs::read(&p).unwrap(), before);
+        let c = c.lock().unwrap();
+        assert_eq!((c.create, c.assert, c.delete, c.hwnd.len()), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn wh_d5_control_register_duplicate_nb_and_persist_fail() {
+        for mode in 0..4 {
+            let p = fixture();
+            let mut b = Recording::new();
+            let mut v =
+                vault::Vault::create_for(&p, "synthetic-D5-password", edition::Edition::Single)
+                    .unwrap();
+            if mode == 0 {
+                assert!(v
+                    .register_windows_hello(&mut b.mock, "SYNTHETIC", edition::Edition::Single)
+                    .is_ok());
+            } else if mode == 1 {
+                b.mock = MockBackend::new()
+                    .with_platform_mode(fido2::MockPlatformMode::AssertionPrfFails);
+            } else if mode == 2 {
+                std::fs::create_dir(p.with_extension("db.tmp")).unwrap();
+            } else {
+                b.list_error = true;
+            }
+            let before = std::fs::read(&p).unwrap();
+            let (s, c) = state(Some(v), b);
+            let result = register_windows_hello_inner(
+                &s,
+                edition::Edition::Single,
+                |_| Ok(789),
+                || Ok("SYNTHETIC".into()),
+            );
+            assert!(result.is_err());
+            assert_eq!(std::fs::read(&p).unwrap(), before);
+            let c = c.lock().unwrap();
+            if mode == 0 || mode == 3 {
+                assert_eq!((c.create, c.assert, c.delete), (0, 0, 0));
+            } else {
+                assert_eq!((c.create, c.assert, c.delete), (1, 1, 1));
+            }
+        }
+    }
+
+    #[test]
+    fn wh_d5_control_register_missing_name_and_focus_error_do_not_mutate() {
+        for missing_name in [true, false] {
+            let p = fixture();
+            let v = vault::Vault::create_for(&p, "synthetic-D5-password", edition::Edition::Single)
+                .unwrap();
+            let before = std::fs::read(&p).unwrap();
+            let (s, c) = state(Some(v), Recording::new());
+            let mut focus = 0;
+            let result = register_windows_hello_inner(
+                &s,
+                edition::Edition::Single,
+                |_| {
+                    focus += 1;
+                    Err("synthetic focus refusal".into())
+                },
+                || {
+                    if missing_name {
+                        Err("synthetic missing name".into())
+                    } else {
+                        Ok("SYNTHETIC".into())
+                    }
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(focus, usize::from(!missing_name));
+            let c = c.lock().unwrap();
+            assert_eq!(
+                (c.list, c.create, c.assert, c.delete, c.hwnd.len()),
+                (0, 0, 0, 0, 0)
+            );
+            assert_eq!(std::fs::read(&p).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn wh_d5_control_login_unavailable_before_focus() {
+        for field in 0..3 {
+            let p = fixture();
+            let mut b = Recording::new();
+            match field {
+                0 => b.status.api_ok = false,
+                1 => b.status.uvpa = false,
+                _ => b.status.console = false,
+            }
+            let (s, c) = state(None, b);
+            let mut focus = 0;
+            let result = login_windows_hello_inner(&s, &p, edition::Edition::Single, |_| {
+                focus += 1;
+                Ok(1)
+            });
+            assert!(result.is_err());
+            assert_eq!(focus, 0);
+            let c = c.lock().unwrap();
+            assert_eq!(
+                (c.list, c.create, c.assert, c.delete, c.hwnd.len()),
+                (0, 0, 0, 0, 0)
+            );
+        }
+    }
+
+    #[test]
+    fn wh_d5_control_login_failure_never_publishes_or_clears_pending() {
+        for mode in 0..5 {
+            let p = fixture();
+            let mut b = Recording::new();
+            let mut v =
+                vault::Vault::create_for(&p, "synthetic-D5-password", edition::Edition::Single)
+                    .unwrap();
+            assert!(v
+                .register_windows_hello(&mut b.mock, "SYNTHETIC", edition::Edition::Single)
+                .is_ok());
+            v.lock();
+            match mode {
+                0 => b.rogue = true,
+                1 => b.list_error = true,
+                2 => b.mock = MockBackend::new(), // Foreign machine: no local intersection.
+                3 => {
+                    let ids = b.mock.platform_credential_ids().to_vec();
+                    b.mock = MockBackend::new()
+                        .with_platform_credentials(ids)
+                        .with_platform_mode(fido2::MockPlatformMode::AssertionPrfFails);
+                }
+                _ => std::fs::create_dir(p.with_extension("db.tmp")).unwrap(),
+            }
+            let before = std::fs::read(&p).unwrap();
+            let (s, c) = state(None, b);
+            seed_pending(&s, &p);
+            let result = login_windows_hello_inner(&s, &p, edition::Edition::Single, |_| Ok(1));
+            assert!(result.is_err(), "failed auth/persist cannot return entries");
+            s.with_lock(|g| {
+                assert!(g.vault.is_none());
+                assert!(g.pending_csv_import.is_some() && g.dual_pending.is_some());
+                Ok(())
+            })
+            .unwrap();
+            let c = c.lock().unwrap();
+            assert_eq!((c.create, c.delete), (0, 0));
+            assert_eq!(c.assert, usize::from(mode != 1 && mode != 2));
+            assert_eq!(std::fs::read(&p).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn wh_d5_control_removal_unavailable_foreign_and_list_error() {
+        for mode in 0..3 {
+            let p = fixture();
+            let mut b = Recording::new();
+            let mut v =
+                vault::Vault::create_for(&p, "synthetic-D5-password", edition::Edition::Single)
+                    .unwrap();
+            let reg = v.register_windows_hello(&mut b.mock, "SYNTHETIC", edition::Edition::Single);
+            assert!(reg.is_ok());
+            let id = crypto::base64_encode(&reg.unwrap().credential_id);
+            match mode {
+                0 => b.status.console = false,
+                1 => b.mock = MockBackend::new(),
+                _ => b.list_error = true,
+            }
+            let (s, c) = state(Some(v), b);
+            let result = remove_key_inner(&s, &id, edition::Edition::Single);
+            assert!(result.is_ok());
+            let warning = if mode == 1 {
+                KeyRemovalWarning::NotLocal
+            } else {
+                KeyRemovalWarning::DiscoveryFailed
+            };
+            assert_eq!(
+                result.unwrap(),
+                Some(KeyRemovalInfo::ManualRemovalRequired(warning))
+            );
+            assert!(vault::Vault::read_header(&p, edition::Edition::Single)
+                .unwrap()
+                .key_slots
+                .is_empty());
+            let c = c.lock().unwrap();
+            assert_eq!((c.create, c.assert, c.delete, c.hwnd.len()), (0, 0, 0, 0));
+            if mode == 0 {
+                assert_eq!(c.list, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn wh_d5_removal_preserves_d4_cleanup_outcome() {
+        for fail in [false, true] {
+            let p = fixture();
+            let mut b = Recording::new();
+            let mut v =
+                vault::Vault::create_for(&p, "synthetic-D5-password", edition::Edition::Single)
+                    .unwrap();
+            let reg = v.register_windows_hello(&mut b.mock, "SYNTHETIC", edition::Edition::Single);
+            assert!(reg.is_ok());
+            let id = crypto::base64_encode(&reg.unwrap().credential_id);
+            b.delete_error = fail;
+            let (s, c) = state(Some(v), b);
+            let result = remove_key_inner(&s, &id, edition::Edition::Single);
+            assert!(result.is_ok());
+            assert_eq!(
+                result.unwrap(),
+                Some(if fail {
+                    KeyRemovalInfo::ManualRemovalRequired(KeyRemovalWarning::DeleteFailed)
+                } else {
+                    KeyRemovalInfo::Removed
+                })
+            );
+            assert!(vault::Vault::read_header(&p, edition::Edition::Single)
+                .unwrap()
+                .key_slots
+                .is_empty());
+            let c = c.lock().unwrap();
+            assert_eq!(c.delete, 1);
+            assert_eq!((c.create, c.assert, c.hwnd.len()), (0, 0, 0));
+        }
+    }
+
+    fn lose_marker(p: &std::path::Path) {
+        let bytes = std::fs::read(p).unwrap();
+        let len = u32::from_le_bytes(bytes[6..10].try_into().unwrap()) as usize;
+        let mut header: serde_json::Value = serde_json::from_slice(&bytes[10..10 + len]).unwrap();
+        for slot in header["key_slots"].as_array_mut().unwrap() {
+            slot.as_object_mut().unwrap().remove("authenticator");
+        }
+        let header = serde_json::to_vec(&header).unwrap();
+        let mut rewritten = bytes[..6].to_vec();
+        rewritten.extend_from_slice(&(header.len() as u32).to_le_bytes());
+        rewritten.extend_from_slice(&header);
+        rewritten.extend_from_slice(&bytes[10 + len..]);
+        std::fs::write(p, rewritten).unwrap();
+    }
+
+    #[test]
+    fn wh_d5_password_single_integrates_r3_authenticated_save() {
+        let p = fixture();
+        let mut b = Recording::new();
+        let mut v = vault::Vault::create_for(&p, "synthetic-D5-password", edition::Edition::Single)
+            .unwrap();
+        assert!(v
+            .register_windows_hello(&mut b.mock, "SYNTHETIC", edition::Edition::Single)
+            .is_ok());
+        v.lock();
+        lose_marker(&p);
+        let (s, c) = state(None, b);
+        let result =
+            login_password_inner(&s, &p, "synthetic-D5-password", edition::Edition::Single);
+        assert!(result.is_ok());
+        let h = vault::Vault::read_header(&p, edition::Edition::Single).unwrap();
+        assert_eq!(
+            h.key_slots[0].authenticator,
+            Some(vault::SlotAuthenticator::Platform)
+        );
+        let c = c.lock().unwrap();
+        assert!(c.list > 0);
+        assert_eq!((c.create, c.assert, c.delete, c.hwnd.len()), (0, 0, 0, 0));
+    }
+
+    fn seed_pending(s: &VaultState, p: &std::path::Path) {
+        s.with_lock(|g| {
+            g.pending_csv_import = Some(PendingCsvImport {
+                token: "synthetic-token".into(),
+                parsed: csv_import::parse_import_csv(
+                    "site,account,password,notes\nexample,synthetic,fixture,\n",
+                )
+                .unwrap(),
+                entries_fingerprint: [0; 32],
+            });
+            g.dual_pending = Some(vault::DualPending::for_test(
+                p.to_path_buf(),
+                std::time::Instant::now(),
+            ));
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn wh_d5_login_publishes_and_clears_pending_under_one_lock() {
+        let p = fixture();
+        let mut b = Recording::new();
+        let mut v = vault::Vault::create_for(&p, "synthetic-D5-password", edition::Edition::Single)
+            .unwrap();
+        assert!(v
+            .add_entry("synthetic-site", "synthetic-account", "synthetic-entry", "")
+            .is_ok());
+        assert!(v
+            .register_windows_hello(&mut b.mock, "SYNTHETIC", edition::Edition::Single)
+            .is_ok());
+        v.lock();
+        let (s, c) = state(None, b);
+        seed_pending(&s, &p);
+        let result = login_windows_hello_inner(&s, &p, edition::Edition::Single, |required| {
+            assert!(required);
+            assert!(matches!(
+                s.0.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ));
+            Ok(456)
+        });
+        assert!(result.is_ok(), "successful D4 login must publish entries");
+        assert_eq!(result.unwrap().len(), 1);
+        s.with_lock(|g| {
+            assert!(g.vault.is_some());
+            assert!(g.pending_csv_import.is_none() && g.dual_pending.is_none());
+            assert_eq!(g.vault.as_ref().unwrap().entries().len(), 1);
+            Ok(())
+        })
+        .unwrap();
+        let c = c.lock().unwrap();
+        assert_eq!((c.create, c.assert, c.delete), (0, 1, 0));
+        assert_eq!(c.hwnd, vec![456]);
+    }
+
+    #[test]
+    fn wh_d5_register_unavailable_refuses_before_focus() {
+        for status in [
+            PlatformStatus {
+                api_ok: false,
+                uvpa: true,
+                console: true,
+            },
+            PlatformStatus {
+                api_ok: true,
+                uvpa: false,
+                console: true,
+            },
+            PlatformStatus {
+                api_ok: true,
+                uvpa: true,
+                console: false,
+            },
+        ] {
+            let p = fixture();
+            let v = vault::Vault::create_for(&p, "synthetic-D5-password", edition::Edition::Single)
+                .unwrap();
+            let before = std::fs::read(&p).unwrap();
+            let mut b = Recording::new();
+            b.status = status;
+            let (s, c) = state(Some(v), b);
+            let mut focus = 0;
+            let result = register_windows_hello_inner(
+                &s,
+                edition::Edition::Single,
+                |_| {
+                    focus += 1;
+                    Ok(123)
+                },
+                || Ok("SYNTHETIC".into()),
+            );
+            assert!(result.is_err(), "unavailable must refuse");
+            assert_eq!(focus, 0, "refusal must not activate window");
+            let error = result.err().unwrap();
+            assert!(
+                error.contains("Console")
+                    && error.contains("v8")
+                    && error.contains("YubiKey")
+                    && error.contains("主密碼")
+            );
+            let c = c.lock().unwrap();
+            assert_eq!(
+                (c.list, c.create, c.assert, c.delete, c.hwnd.len()),
+                (0, 0, 0, 0, 0)
+            );
+            assert_eq!(std::fs::read(&p).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn wh_d5_register_happy_uses_live_hwnd_and_d4() {
+        let p = fixture();
+        let v = vault::Vault::create_for(&p, "synthetic-D5-password", edition::Edition::Single)
+            .unwrap();
+        let (s, c) = state(Some(v), Recording::new());
+        let mut focus = 0;
+        let result = register_windows_hello_inner(
+            &s,
+            edition::Edition::Single,
+            |required| {
+                assert!(required);
+                focus += 1;
+                Ok(123)
+            },
+            || Ok("TRUSTED-SYNTHETIC".into()),
+        );
+        assert!(result.is_ok(), "registration should succeed");
+        let reg = result.unwrap();
+        assert_eq!(focus, 1);
+        let h = vault::Vault::read_header(&p, edition::Edition::Single).unwrap();
+        assert_eq!(h.key_slots.len(), 1);
+        assert_eq!(
+            h.key_slots[0].label,
+            "Windows Hello（本機 TRUSTED-SYNTHETIC）"
+        );
+        assert_eq!(
+            h.key_slots[0].credential_id,
+            crypto::base64_encode(&reg.credential_id)
+        );
+        let json = serde_json::to_value(&reg).unwrap();
+        assert!(json.get("creation_prf").is_none() && json.get("secret").is_none());
+        let c = c.lock().unwrap();
+        assert_eq!((c.create, c.assert, c.delete), (1, 1, 0));
+        assert_eq!(c.hwnd, vec![123]);
+    }
+
+    #[test]
+    fn wh_d5_status_locked_local_intersection_is_readonly() {
+        let p = fixture();
+        let mut b = Recording::new();
+        let mut v = vault::Vault::create_for(&p, "synthetic-D5-password", edition::Edition::Single)
+            .unwrap();
+        let reg = v.register_windows_hello(&mut b.mock, "SYNTHETIC", edition::Edition::Single);
+        assert!(reg.is_ok());
+        v.lock();
+        let before = std::fs::read(&p).unwrap();
+        let (s, c) = state(None, b);
+        let result = query_platform_status(&s, &p, edition::Edition::Single);
+        assert!(result.is_ok());
+        let info = result.unwrap();
+        assert!(info.api_ok && info.uvpa && info.console && info.local_credential);
+        assert_eq!(std::fs::read(&p).unwrap(), before);
+        let json = serde_json::to_value(info).unwrap();
+        assert_eq!(json.as_object().unwrap().len(), 4);
+        let c = c.lock().unwrap();
+        assert!(c.list > 0);
+        assert_eq!((c.create, c.assert, c.delete, c.hwnd.len()), (0, 0, 0, 0));
+    }
 }
 
 #[cfg(test)]
