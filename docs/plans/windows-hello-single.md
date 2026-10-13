@@ -169,7 +169,7 @@ v1 不變，`KeySlot` 新增：
 - [x] D1（2026-10-12，見 §11 D1）
 - [x] D2（2026-10-12，見 §11 D2）
 - [x] D3（2026-10-13，FFI、兩位 completed-code reviewer、本機驗證完成；見 §11 D3）
-- [ ] D4
+- [x] D4（2026-10-13，本機實作／兩位 completed-code review 完成；Hosted CI 結果以 §11 D4 的發布 receipt／Kanban 為準）
 - [ ] D5
 - [ ] D6
 - [ ] D7
@@ -262,3 +262,32 @@ v1 不變，`KeySlot` 新增：
 - 既有 shared assertion response-version／原生 PRF wipe／普通陣列回傳問題保留為 PRE-S1／PRE-S2，未擴大重構 roaming 範圍、未宣稱已修。ObservationOnly 的 candidate-foreground publication 沒有平台 downstream handoff 效果；foreground-to-FFI 仍非 OS 原子操作。
 - D4 需補建立後斷言比對、失敗清理、slot persistence、edition 守門與刪除前 membership。D4–D9 仍未勾選；本項完成後停止，等待使用者下一項指示。
 - 證據：`D:\project\_archives\portable-fido2-vault\wh-d3-followup-20261013-085634\`。原始快照另保存在 `wh-d3-review-20261013-081309`，兩者均不改寫歷史 verdict。
+
+### D4（2026-10-13）Vault 平台流程、相容性與失敗清理
+
+- **範圍：** production 只有 `src-tauri/src/vault.rs`，source commit `681c399694188327ad5991072b5a731650706120`；另更新本計畫驗證紀錄。沒有新增 IPC／UI／Gate 功能，沒有 Release 建置、部署、GUI、native WebAuthn、實體金鑰或使用者金庫操作；D5–D9 未開始。
+- **新增 API：** `register_windows_hello`、`open_windows_hello`、`read_header_with_platform`、`open_password_with_platform`、`remove_key_with_platform`，及 `PlatformCleanupOutcome`／`PlatformCleanupWarning`。所有平台寫入／登入入口 edition-explicit，在 backend 前拒絕 v2；既有雙群組路徑不變。
+- **註冊：** available／本 RP local-list 守門、排除所有 platform IDs（含 verified R3 分類）、拒絕空 ID／vault 或 local-before 碰撞；post-create list 證明 new credential ownership 後才斷言及清理。Assertion selected ID 必須完全一致，creation/assertion PRF 以鎖定 digest 0.10.7 的 `CtOutput` 常數時間比對，沿既有 HKDF／AES-GCM 包裝 KEK。新增 caller secret／wrap／解包 KEK 以 `Zeroizing` 及明確 `zeroize` 保護，不新增 KDF、AAD 或 dependency。
+- **失敗與移除：** 註冊 assertion／mismatch／persist 失敗只 best-effort 清理可證實的新 credential；保留 primary error，完整還原 header 與 audit（含 cap trim）。Backend-aware removal 先成功 persist，再重新查 available／fresh RP membership 才 delete；不在本機、discovery／delete 失敗皆回 typed 手動清理 outcome，不回滾已落盤的 slot 移除。未知 marker 與 unavailable/list-error 交集同樣提示可能殘留；platform removal audit 使用 `windows-hello:<label>`，roaming 保持 `fido2:<label>`。
+- **登入／R3：** Windows Hello 只送本機 platform intersection，回傳 ID 必須在 allow-list 且有 matching slot；共用既有 KEK／payload unlock、success audit 與 sidecar merge。兩個 roaming 入口排除 explicit／verified-local platform ID，any-key 回傳亦驗 membership。Read-only R3 query 不寫檔；正常 authenticated password／roaming／platform save 才保留修復 marker。不依 label、AAGUID 或 prefix 猜種類。
+
+#### TDD、審查與修補
+
+- **41 個新 `wh_d4_*` tests**；parent 以 log／exit／exact test name／正整數執行數及每階段來源 snapshot 核實 **32 組 assertion RED→GREEN**（其中 1 組為 fixture-disjoint invariant），另 **9 個 GREEN→GREEN 控制**。原 118 個 vault tests 的完整原始區段 byte-preserved；其他 tracked production 不變。
+- R3 原始 Reviewer verdict `passed=false`：D4-L1 固定 COMPUTERNAME 展示名稱阻擋不同電腦／Windows 帳號；D4-L2 真實 cancellation 以 opaque `Internal` 返回，不能被當成已證實拒絕。兩項各有直接 RED→GREEN：L1 使用 Unicode 長度受限的唯一 suffix，身份重複仍只由 local membership 決定；L2 只有 typed `PinRejected`／已證實 rogue ID／AEAD wrong-secret 記失敗，opaque `Internal` 原樣返 caller，不解析 HRESULT 文字、不猜取消。
+- R4 Reviewer 再拒絕 D4-L3（lost marker＋unavailable removal 無警告），以交集 RED→GREEN 補齊。Officer 的 lost-marker＋list-error warning 與 platform removal audit 建議亦各有 RED→GREEN；補上 4 個 scripted negative controls：post-create list error、空／local non-vault ID collision、save＋delete 雙失敗、persist 後 fresh-list 改變。
+- R5 首次 full suite **404 passed／1 failed** 是註冊 tmp／rename rollback fixtures 共用同 tag／process-ID 路徑的平行衝突；原 FAIL 保留。用純 fixture-tag 不等 assertion RED→GREEN 分離兩路徑，production 不為此改動。R3 另有一次 removal-loop fixture reuse 的 unwrap error，保留但不列為 production RED。
+- **最終 R5**：Reviewer 與 Officer 都 `passed=true`／`coverage_complete=true`，security／logic arrays 空；manifest SHA256 `69fdc9081150fe7110fcbdec9caa880f286d6b581c0e7e131db898b86f830577`，196 檔快照與 full／incremental patch 雜湊核對。Parent 另核 Reviewer 真正 numbered-read stream，1846-line full patch、82-line delta、1699 added source lines 全讀，與凍結來源逐行一致，不只信任 coverage 自述。R3／R4 原拒絕結果與所有限制保留，不改寫為 PASS。
+
+#### 自動驗證與發布 gate
+
+- Parent 最終完整 MSVC lib suites：`real-ctap` **406 passed／0 failed**；`real-ctap,dual-control` **406 passed／0 failed**，無 test-compile warning。Node **108/108**；`node --check`、`rustfmt --check`、`git diff --check` 成功。Source hash-lock `0dec9dd45e3d37cd1d27982449dbf3c327e327002792be3a3ee1d344b04043c8` 前後一致。
+- Fixture 修正後另以 **8 threads** 執行全部 41 個 D4 tests **三次，各 41/41**，全部成功；不宣稱無限次壓力測試或 timing／allocator residue 已驗證。
+- Hosted **exact-head／current-integration CI** 在發布後由 parent 讀回 run、jobs、named steps 與完整 logs。PR #30 保持 Draft，整張功能卡 `t_01329074` 維持 blocked；**CI 未讀回前不宣稱 D4 收尾完成**。最終結果、tested merge parents 與 counts 以 `D4-final-closeout-receipt.json`／`ci-final-receipt.json` 及 Kanban 收尾留言為準，不以 D3 舊綠燈替代。
+
+#### 保留限制與後續交接
+
+- Legacy password／roaming 的 platform discovery 不可用／list error 時採 best-effort 跳過 R3 修復，保留 explicit marker；strict query／platform login 的實際 list error 仍可見。已失去 marker 的未知異機 ID 無法可靠分類，仍須真正取得 PRF 並通過 AEAD；不宣稱完整修復所有 metadata 遺失。
+- Native `Internal` 契約仍無法細分取消與未 typed 原生拒絕，因此保守不記已證實 auth failure；沒有新增取消 variant 或修改 FFI。原有 PRE-S1／PRE-S2 shared native assertion 問題未修，caller zeroization 不等同 native memory wiping 或編譯器暫存器擦除證據。
+- Post-create RP-list proof 失敗不可盲刪不明 credential；best-effort delete 也可能失敗，因此可能有 Windows credential 殘留。D6 應呈現消歧 label、typed 手動清理警告及 proof-failure 殘留提示；D9 補原生 roaming 拒收 platform IDs、取消 sidecar 空及 Console V1–V9 實機回歸。這些是交接，不是已開始 D6／D9 或已報物理 PASS。
+- 證據：`D:\project\_archives\portable-fido2-vault\wh-d4-review-20261013-R5\`；完整 TDD／suite 原始 logs：`D:\scratch\wh-d4-20261013\`。本項收尾後停止，等待使用者下一項指示。
