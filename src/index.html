@@ -37,6 +37,8 @@
           <input type="password" id="login-pin" autocomplete="off" />
         </div>
         <button id="btn-login-key" class="primary hidden">以金鑰登入</button>
+        <button id="btn-login-hello" class="primary hidden" type="button">使用 Windows Hello 登入</button>
+        <div id="hello-login-status" class="muted" role="status" aria-live="polite"></div>
         <div id="dual-login-hint" class="muted hidden" role="status" aria-live="polite"></div>
         <div id="dual-step-panel" class="dual-step hidden" role="status" aria-live="polite">
           <div id="dual-step-text"></div>
@@ -130,8 +132,11 @@
       <div id="keys-list"></div>
       <div class="row" style="margin-top:12px">
         <button id="btn-register-key" class="primary">＋ 註冊新金鑰</button>
+        <button id="btn-register-hello" class="primary hidden" type="button">＋ 註冊 Windows Hello</button>
       </div>
       <div id="register-status" class="muted"></div>
+      <div id="hello-register-status" class="muted" role="status" aria-live="polite"></div>
+      <div id="key-removal-status" class="muted" role="status" aria-live="polite"></div>
     </section>
 
     <!-- 軌跡紀錄 -->

@@ -16,10 +16,19 @@ let keyNameDialogGeneration = 0;
 let activeCsvImportToken = null;
 let csvImportInFlight = false;
 let entrySearchQuery = "";
+// Manual Windows credential cleanup remains visible across independent removals.
+const manualRemovalWarnings = new Map();
+function keyRemovalFeedback(message) {
+  const warning = manualRemovalWarnings.size
+    ? `已從金庫移除「${[...manualRemovalWarnings.values()].join("」、「")}」；Windows 通行金鑰可能殘留，請到 設定 → 帳戶 → 通行金鑰 手動刪除。`
+    : "";
+  $("key-removal-status").textContent = warning ? `${warning} ${message}` : message;
+}
 
 // 雙群組控管版（dual-control）狀態；單人版維持 "single"，不改既有行為。
 // 兩步驟登入的 share 只存在 Rust 端；前端只保存顯示用的截止時間（倒數僅供顯示，以 Rust 為準）。
 let edition = "single";
+let helloEditionConfirmed = false;
 let dualLoginReady = false;
 let dualLogin = null; // { deadline, timer }
 let dualBusy = false;
@@ -58,8 +67,11 @@ function errBox(msg) { $("login-error").textContent = msg || ""; }
 async function loadEdition() {
   // 取不到 edition 時維持單人版 UI；雙人版金庫仍由 Rust 端版本互斥 fail closed。
   try {
-    edition = (await invoke("get_edition")) === "dual" ? "dual" : "single";
+    const reportedEdition = await invoke("get_edition");
+    helloEditionConfirmed = reportedEdition === "single";
+    edition = reportedEdition === "dual" ? "dual" : "single";
   } catch {
+    helloEditionConfirmed = false;
     edition = "single";
   }
   if (!isDual()) return;
@@ -79,6 +91,14 @@ async function boot() {
         ? "以 A、B 群組金鑰各一支依序驗證登入；主密碼僅供緊急登入"
         : "可使用主密碼或任一支已註冊金鑰登入";
       renderLoginKeys(info.keys, info.brokered_key_login);
+      if (helloEditionConfirmed) {
+        // An unreadable/unavailable platform must never display a Hello login action.
+        hide("btn-login-hello");
+        try {
+          const status = await invoke("platform_status");
+          if (status.api_ok && status.uvpa && status.console && status.local_credential) show("btn-login-hello");
+        } catch { /* Password and roaming login remain available. */ }
+      }
     } else {
       show("screen-login");
       show("setup-panel");
@@ -99,6 +119,8 @@ function renderLoginKeys(keys, useBrokeredKeyLogin) {
   hide("btn-login-key");
   hide("pin-box");
   if (isDual()) return renderDualLoginKeys(keys);
+  // Only roaming credentials can be selected by the YubiKey path.
+  keys = keys.filter((key) => key.authenticator !== "platform");
   if (!keys.length) {
     box.textContent = "（尚無已註冊金鑰 — 登入後可於「金鑰管理」註冊）";
     return;
@@ -204,12 +226,33 @@ async function doLoginKey() {
   }
 }
 
+async function doLoginHello() {
+  if (!helloEditionConfirmed) return;
+  const button = $("btn-login-hello");
+  if (button.disabled || button.classList.contains("hidden")) return;
+  button.disabled = true;
+  button.setAttribute("aria-busy", "true");
+  errBox("");
+  $("hello-login-status").textContent = "請依 Windows Hello 提示完成驗證";
+  try {
+    const entries = await invoke("login_windows_hello");
+    await enterMain(entries);
+  } catch (e) {
+    errBox(String(e));
+  } finally {
+    $("hello-login-status").textContent = "";
+    button.disabled = false;
+    button.removeAttribute?.("aria-busy");
+  }
+}
+
 async function enterMain(entries, options = {}) {
   const session = ++entryDeleteSession;
   // 防禦：進入主畫面時不留任何兩步驟倒數。
   if (dualLogin) returnToDualStepOne();
   hide("screen-login");
   show("screen-main");
+  if (helloEditionConfirmed) show("btn-register-hello");
   if (options.breakGlass) show("breakglass-banner"); else hide("breakglass-banner");
   if (!entries) entries = await invoke("list_entries");
   const settings = await invoke("get_vault_settings");
@@ -607,17 +650,43 @@ async function renderKeys() {
   if (isDual()) return renderDualKeys(box, info ? info.keys : null);
   box.innerHTML = "";
   if (!info || !info.keys.length) { box.innerHTML = '<div class="muted">（尚無已註冊金鑰）</div>'; return; }
-  info.keys.forEach((k, i) => {
+  info.keys.forEach((k) => {
     const div = document.createElement("div");
     div.className = "key-item";
     div.style.cursor = "default";
-    div.innerHTML = `<span>🔑 <span class="klabel">${esc(k.label)}</span></span><span class="ktype">${esc(k.key_type)} · ${esc(k.prompt_zh)}</span>`;
+    const label = document.createElement("span");
+    label.className = "klabel";
+    label.textContent = `${k.authenticator === "platform" ? "Windows Hello" : "🔑"} ${k.label}`;
+    const type = document.createElement("span");
+    type.className = "ktype";
+    type.textContent = k.authenticator === "platform"
+      ? `Windows Hello（平台憑證；${k.platform_local === true ? "此帳號可用（查詢時）" : k.platform_local === false ? "非本機／此帳號無此憑證" : "本機狀態未確認"}）`
+      : `${k.key_type} · ${k.prompt_zh}`;
+    div.appendChild(label);
+    div.appendChild(type);
     const rm = document.createElement("button");
     rm.textContent = "移除";
     rm.style.marginLeft = "auto";
     rm.onclick = async () => {
+      if (rm.disabled) return;
       if (!confirm(`確定移除金鑰「${k.label}」？\n移除後該金鑰無法再解鎖（不可逆）。`)) return;
-      await invoke("remove_key", { credentialId: k.credential_id }).then(() => renderKeys()).catch((e) => alert(String(e)));
+      rm.disabled = true;
+      keyRemovalFeedback("正在移除金鑰…");
+      try {
+        const outcome = await invoke("remove_key", { credentialId: k.credential_id });
+        if (outcome?.outcome === "manual_removal_required") {
+          manualRemovalWarnings.set(k.credential_id, k.label);
+          keyRemovalFeedback("");
+        } else if (outcome?.outcome === "removed" || (outcome === null && k.authenticator !== "platform")) {
+          // D5 的 roaming remove_key 仍回傳 JSON null；不可誤報為平台結果未知。
+          keyRemovalFeedback("已從金庫移除金鑰");
+        } else {
+          keyRemovalFeedback("回傳結果未知；請確認金庫與 Windows 通行金鑰狀態");
+        }
+        await renderKeys();
+      } catch (e) {
+        keyRemovalFeedback(`移除失敗：${String(e)}`);
+      } finally { rm.disabled = false; }
     };
     div.appendChild(rm);
     box.appendChild(div);
@@ -771,6 +840,25 @@ function bindKeyNameDialog() {
     }
   };
   $("btn-cancel-key-name").onclick = () => dialog.close("cancel");
+}
+
+async function registerHello() {
+  if (!helloEditionConfirmed) return;
+  const button = $("btn-register-hello");
+  if (button.disabled || button.classList.contains("hidden")) return;
+  button.disabled = true;
+  button.setAttribute("aria-busy", "true");
+  $("hello-register-status").textContent = "請依 Windows Hello 提示完成建立與再次驗證…";
+  try {
+    const reg = await invoke("register_windows_hello");
+    $("hello-register-status").textContent = `已註冊 Windows Hello：${reg.label}`;
+    await renderKeys();
+  } catch (e) {
+    $("hello-register-status").textContent = `註冊失敗：${String(e)}。若 Windows 通行金鑰仍有殘留，請到 設定 → 帳戶 → 通行金鑰 手動刪除。`;
+  } finally {
+    button.disabled = false;
+    button.removeAttribute?.("aria-busy");
+  }
 }
 
 async function registerKey() {
@@ -1092,6 +1180,7 @@ document.addEventListener("DOMContentLoaded", () => {
   $("btn-create").onclick = doCreate;
   $("btn-login-pw").onclick = doLoginPw;
   $("btn-login-key").onclick = doLoginKey;
+  $("btn-login-hello").onclick = doLoginHello;
   $("login-pw").addEventListener("keydown", (e) => e.key === "Enter" && doLoginPw());
   $("login-pin").addEventListener("keydown", (e) => e.key === "Enter" && doLoginKey());
 
@@ -1139,6 +1228,7 @@ document.addEventListener("DOMContentLoaded", () => {
   $("btn-toggle-e-pass").onclick = () => togglePasswordVisibility("e-pass", "btn-toggle-e-pass");
   $("btn-toggle-ed-pass").onclick = () => togglePasswordVisibility("ed-pass", "btn-toggle-ed-pass");
   $("btn-register-key").onclick = registerKey;
+  $("btn-register-hello").onclick = registerHello;
   bindKeyNameDialog();
   $("btn-set-idle").onclick = setIdle;
   $("btn-set-password-history-limit").onclick = setPasswordHistoryLimit;

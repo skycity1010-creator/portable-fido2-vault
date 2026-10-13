@@ -112,6 +112,12 @@ pub struct KeyInfo {
     pub label: String,
     pub key_type: fido2::KeyKind,
     pub prompt_zh: &'static str,
+    /// 單人版的 platform slot 標記；舊版 JSON（無 platform slot）不增加欄位。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authenticator: Option<vault::SlotAuthenticator>,
+    /// 有效 RP-local discovery 時的平台憑證是否屬於目前 Windows 帳號；None = 未能確認。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub platform_local: Option<bool>,
     /// 雙人版：所屬群組（單人版不輸出）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<crypto::KeyGroup>,
@@ -129,10 +135,32 @@ fn key_infos(h: &vault::Header) -> Vec<KeyInfo> {
             label: s.label.clone(),
             key_type: s.key_type,
             prompt_zh: s.key_type.prompt_zh(),
+            authenticator: s.authenticator,
+            platform_local: None,
             group: s.group,
             last_in_group: vault::last_key_in_group(h, &s.credential_id).is_some(),
         })
         .collect()
+}
+
+fn key_infos_with_local(h: &vault::Header, local: Option<&[Vec<u8>]>) -> Vec<KeyInfo> {
+    let mut infos = key_infos(h);
+    if h.v == 1 {
+        for info in &mut infos {
+            let membership = local.and_then(|list| {
+                crypto::base64_decode(&info.credential_id)
+                    .ok()
+                    .map(|id| list.contains(&id))
+            });
+            if info.authenticator.is_none() && membership == Some(true) {
+                info.authenticator = Some(vault::SlotAuthenticator::Platform);
+            }
+            if info.authenticator.is_some() {
+                info.platform_local = membership;
+            }
+        }
+    }
+    infos
 }
 
 impl From<&vault::Header> for Vec<KeyInfo> {
@@ -438,7 +466,19 @@ fn get_edition() -> edition::Edition {
 fn boot_info(state: tauri::State<VaultState>) -> Result<LoginScreenInfo> {
     let path = path_from_state_or_default();
     let has_vault = path.exists();
-    let keys = if has_vault {
+    let keys = if has_vault && edition::current() == edition::Edition::Single {
+        let h = vault::Vault::read_header(&path, edition::Edition::Single)
+            .map_err(|e| e.to_string())?;
+        state.with_lock(|g| {
+            // RP-local discovery is read-only. Failure must not prevent password login.
+            let local = if g.backend.platform_status().available() {
+                g.backend.list_platform_credentials().ok()
+            } else {
+                None
+            };
+            Ok(key_infos_with_local(&h, local.as_deref()))
+        })?
+    } else if has_vault {
         read_keys_from_file(&path)?
     } else {
         Vec::new()
@@ -2207,6 +2247,34 @@ mod key_info_tests {
         assert_eq!(json[0]["group"], "A");
         assert_eq!(json[2]["last_in_group"], true);
         assert!(json[0].get("last_in_group").is_none());
+    }
+
+    #[test]
+    fn wh_d6_key_info_marks_explicit_and_verified_local_platform_without_changing_roaming_json() {
+        let mut explicit = slot("b25l", None);
+        explicit["authenticator"] = serde_json::json!("platform");
+        let h = header_json(
+            1,
+            serde_json::json!([explicit, slot("dHdv", None), slot("Zm9yZWlnbg==", None)]),
+        );
+        let infos = key_infos_with_local(&h, Some(&[b"two".to_vec()]));
+        let json = serde_json::to_value(infos).unwrap();
+        assert_eq!(json[0]["authenticator"], "platform");
+        assert_eq!(json[0]["platform_local"], false);
+        assert_eq!(json[1]["authenticator"], "platform");
+        assert_eq!(json[1]["platform_local"], true);
+        assert!(json[2].get("platform_local").is_none());
+        let unknown = serde_json::to_value(key_infos_with_local(&h, None)).unwrap();
+        assert_eq!(unknown[0]["authenticator"], "platform");
+        assert!(unknown[0].get("platform_local").is_none());
+        assert!(json[2].get("authenticator").is_none());
+        assert!(serde_json::to_value(key_infos(&header_json(
+            1,
+            serde_json::json!([slot("b25l", None)])
+        )))
+        .unwrap()[0]
+            .get("authenticator")
+            .is_none());
     }
 
     #[test]
