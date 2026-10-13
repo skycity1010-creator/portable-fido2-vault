@@ -171,7 +171,7 @@ v1 不變，`KeySlot` 新增：
 - [x] D3（2026-10-13，FFI、兩位 completed-code reviewer、本機驗證完成；見 §11 D3）
 - [x] D4（2026-10-13，本機實作／兩位 completed-code review 完成；Hosted CI 結果以 §11 D4 的發布 receipt／Kanban 為準）
 - [x] D5（2026-10-13，本機 IPC／兩位 completed-code review／回歸及建置完成；Hosted CI 以 §11 D5 的發布 receipt／Kanban 為準）
-- [ ] D6
+- [ ] D6（候選 `8ffeb16` 已完成兩位獨立審查與本機回歸；等待發布後 exact-head CI 讀回）
 - [ ] D7
 - [ ] D8
 - [ ] D9
@@ -319,3 +319,12 @@ v1 不變，`KeySlot` 新增：
 - D6 需接入 status／登入／註冊元素、platform 標示及 typed cleanup warning／proof-failure 殘留提示；KeyInfo 本次未擴充。D4 best-effort R3 discovery／credential cleanup 的限制不變；source-text oracle 是 frozen source 格式的文字檢查，不是 AST 或任意 source mutation 的語意保證；scoped cleanup 為 best effort，不保證所有 OS／權限／open-handle 情境都無殘留。
 - PRE-L1 既有 roaming／dual two-lock publication race、PRE-S1／PRE-S2 shared native assertion version／PRF wipe 問題未修，另案處理；不因本次 Hello single-lock publish 或 caller zeroization 宣稱已修。
 - 原 R1 拒絕與 R2 verdict／全部限制保留。證據：`D:\project\_archives\portable-fido2-vault\wh-d5-review-20261013-R2\`；完整原始 TDD／suite／build logs：`D:\scratch\wh-d5-20261013\`。D5 收尾後停止，等待使用者下一項指示。
+
+### D6（2026-10-13）單人版 Windows Hello UI
+
+- **範圍與候選：** `src/index.html`、`src/app.js`、`tests/windows-hello-ui.test.cjs`，另 `src-tauri/src/lib.rs` 的 KeyInfo／read-only RP-local membership；source commit `8ffeb165a5c42c6380805187312acae11b20535a`。雙群組 UI／IPC 原形狀保持；D7–D9 未開始，沒有 GUI、native WebAuthn、實體金鑰或正式金庫操作。
+- 登入按鈕預設 hidden，僅 `get_edition == single` 且 status 四個能力欄位全 true 時顯示；edition 查詢失敗或未知值不呼叫任何 Hello IPC。註冊按鈕只在單人版解鎖後顯示；登入／註冊皆有同步 disabled 重入守門，參數不接受前端指定的憑證／label／attachment。KeyInfo 的 `authenticator` 與 `platform_local` 為 optional；只用本 RP credential discovery 證明 local／foreign，失敗維持 unknown，不憑歷史 label 判身份；既有 roaming JSON 未新增欄位。新標籤、錯誤、清理警告以 `textContent` 呈現。
+- 平台移除的 `manual_removal_required` 警告以 credential ID 累積，不被其他移除進度／成功／失敗或反向 async 完成覆蓋。D5 roaming 移除原有 JSON `null` 仍視為成功；這項在 parent 實測 14/15 RED（該測試失敗）→最小修補→15/15 GREEN，原失敗不改寫。平台未知／null 回傳仍顯示未知，不誤稱清理成功。
+- **Frozen R3：** `D:\project\_archives\portable-fido2-vault\wh-d6-review-20261013-R3\`，197/197 source hashes 親自讀回一致；manifest SHA256 `fa8fac01ec5be50a2379508a747e66b78c8768c38bcbf769d97c1953d21845d4`，完整四檔 patch SHA256 `649ba0869370835bedd70fe1b78177d10e50333c2215940b309f33fa9c5d6f98`。原 R1 否決、R2 兩個 429 無 verdict 均保留；R3 Reviewer 對完整 patch／依賴讀取後 `passed=true`，Officer 透過既有 SSH/scp 唯讀取回獨立審查 `passed=true`（A2A context `ctx-d4a48ad2820645cf`），兩者無 blocking security／logic concern。Claude CLI 另因 weekly limit 429 未執行、Hermes 子代理因模型不支援 400 未執行，均不列為審查通過。
+- **Parent 本機驗證：** D6 Node 15/15，Node 全套 123/123；MSVC Rust `real-ctap` 428/428、`real-ctap,dual-control` 428/428；原有 mock Gate 20/20、dual Gate 25/25；GNU locked/offline Release 單／雙 GUI 與兩種 CLI example 建置成功。build 曾因 GNU `windres` 未在 PATH 失敗，補入既有 winlibs 工具路徑後通過；僅既有 `MonitorTerminal::try_lock` dead_code warning。`git diff --check`、`node --check src/app.js` 通過；整庫 `cargo fmt --check` 在未改動的 `windows_webauthn.rs` 顯示既有差異，未擴大 D6 scope。這些測試不代表 D9 實機驗收或可部署。
+- **發布 gate：** PR #30 維持 OPEN Draft；待本段文件提交／推送後，以最終 exact-head CI run 的 jobs、steps、結論讀回驗證，再勾選 D6 與記錄卡片。整張功能卡 `t_01329074` 維持 blocked，D7–D9 不隨本次開始。
