@@ -171,7 +171,7 @@ v1 不變，`KeySlot` 新增：
 - [x] D3（2026-10-13，FFI、兩位 completed-code reviewer、本機驗證完成；見 §11 D3）
 - [x] D4（2026-10-13，本機實作／兩位 completed-code review 完成；Hosted CI 結果以 §11 D4 的發布 receipt／Kanban 為準）
 - [x] D5（2026-10-13，本機 IPC／兩位 completed-code review／回歸及建置完成；Hosted CI 以 §11 D5 的發布 receipt／Kanban 為準）
-- [ ] D6（候選 `8ffeb16` 已完成兩位獨立審查與本機回歸；等待發布後 exact-head CI 讀回）
+- [x] D6（R3 雙審查、本機回歸與 source+doc head `27553a2` exact-head CI `38392679679` PASS；見 §11 D6）
 - [ ] D7
 - [ ] D8
 - [ ] D9
@@ -327,4 +327,4 @@ v1 不變，`KeySlot` 新增：
 - 平台移除的 `manual_removal_required` 警告以 credential ID 累積，不被其他移除進度／成功／失敗或反向 async 完成覆蓋。D5 roaming 移除原有 JSON `null` 仍視為成功；這項在 parent 實測 14/15 RED（該測試失敗）→最小修補→15/15 GREEN，原失敗不改寫。平台未知／null 回傳仍顯示未知，不誤稱清理成功。
 - **Frozen R3：** `D:\project\_archives\portable-fido2-vault\wh-d6-review-20261013-R3\`，197/197 source hashes 親自讀回一致；manifest SHA256 `fa8fac01ec5be50a2379508a747e66b78c8768c38bcbf769d97c1953d21845d4`，完整四檔 patch SHA256 `649ba0869370835bedd70fe1b78177d10e50333c2215940b309f33fa9c5d6f98`。原 R1 否決、R2 兩個 429 無 verdict 均保留；R3 Reviewer 對完整 patch／依賴讀取後 `passed=true`，Officer 透過既有 SSH/scp 唯讀取回獨立審查 `passed=true`（A2A context `ctx-d4a48ad2820645cf`），兩者無 blocking security／logic concern。Claude CLI 另因 weekly limit 429 未執行、Hermes 子代理因模型不支援 400 未執行，均不列為審查通過。
 - **Parent 本機驗證：** D6 Node 15/15，Node 全套 123/123；MSVC Rust `real-ctap` 428/428、`real-ctap,dual-control` 428/428；原有 mock Gate 20/20、dual Gate 25/25；GNU locked/offline Release 單／雙 GUI 與兩種 CLI example 建置成功。build 曾因 GNU `windres` 未在 PATH 失敗，補入既有 winlibs 工具路徑後通過；僅既有 `MonitorTerminal::try_lock` dead_code warning。`git diff --check`、`node --check src/app.js` 通過；整庫 `cargo fmt --check` 在未改動的 `windows_webauthn.rs` 顯示既有差異，未擴大 D6 scope。這些測試不代表 D9 實機驗收或可部署。
-- **發布 gate：** PR #30 維持 OPEN Draft；待本段文件提交／推送後，以最終 exact-head CI run 的 jobs、steps、結論讀回驗證，再勾選 D6 與記錄卡片。整張功能卡 `t_01329074` 維持 blocked，D7–D9 不隨本次開始。
+- **發布 gate：** source+doc head `27553a2c476a2530e93dc465b583f8ab429ba6af` 的 exact-head CI run `38392679679` / job `115280075583` completed/success，所有步驟均成功；完整 log SHA256 `05d29f23f89b39e82e13505a91cba2bf24d1b37d279716825790ff5761c84051`（`wh-d6-review-20261013-R3/ci-run-38392679679.log`）。Hosted merge checkout `11ffd36` 顯示 `Merge 27553a2c... into 368f103...`；log 逐項核實 Node 123/123、Rust single 428/428、dual 428/428、mock Gate 20/20、dual Gate 25/25。PR #30 維持 OPEN Draft；本段後續僅提交 D6 驗收文件，最終 remote/PR head 與該文件 commit 的 CI 另於 Kanban 留 receipt，不把前述 run 冒充新的 head run。整張功能卡 `t_01329074` 維持 blocked，D7–D9 不隨本次開始。
