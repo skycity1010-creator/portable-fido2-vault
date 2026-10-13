@@ -2,7 +2,8 @@
 //! The raw CTAP backend remains available for the CLI and diagnostics.
 
 use crate::fido2::{
-    BackendInitError, DetectedKey, FidoBackend, FidoError, KeyKind, RegisteredCredential,
+    BackendInitError, DetectedKey, FidoBackend, FidoError, KeyKind, PlatformRegistration,
+    PlatformStatus, RegisteredCredential,
 };
 use crate::webauthn_diagnostics::{
     capability_record, diagnose, monitor_record, ContinuationDiagnostics, ContinuationStatus,
@@ -572,6 +573,13 @@ fn is_local_console_session(evidence: NativeSessionEvidence) -> bool {
     evidence.protocol_query == QueryStatus::Valid && evidence.protocol == SessionProtocol::Console
 }
 
+fn platform_console_session(session: u32, evidence: NativeSessionEvidence) -> bool {
+    session != 0
+        && is_local_console_session(evidence)
+        && evidence.state_query == QueryStatus::Valid
+        && evidence.state == SessionState::Active
+}
+
 // The BOOL and byte count are native API output, not environment heuristics.
 unsafe fn parse_wts<T: Copy>(
     success: i32,
@@ -697,9 +705,7 @@ impl MonitorTerminal {
         loop {
             let phase = self.phase.load(Ordering::Acquire);
             let next = match phase {
-                PHASE_WATCHING | PHASE_ACTIVATION_CLAIMED | PHASE_ACTIVATED => {
-                    PHASE_API_RETURNED
-                }
+                PHASE_WATCHING | PHASE_ACTIVATION_CLAIMED | PHASE_ACTIVATED => PHASE_API_RETURNED,
                 _ => return,
             };
             if self
@@ -871,7 +877,8 @@ trait ForegroundSystem {
         _: &MonitorTerminal,
         _: &AtomicBool,
         _: &AtomicBool,
-    ) {}
+    ) {
+    }
     fn activate_if_foreground(
         &mut self,
         baseline: &BrokerBaseline,
@@ -1168,8 +1175,21 @@ fn capture_broker(
     })
 }
 
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum ForegroundMonitorPolicy {
+    #[default]
+    RoamingActive,
+    ObservationOnly,
+}
+impl ForegroundMonitorPolicy {
+    fn for_platform(platform: bool) -> Self {
+        if platform { Self::ObservationOnly } else { Self::RoamingActive }
+    }
+}
+
 #[derive(Default)]
 struct MonitorPolicy {
+    foreground_policy: ForegroundMonitorPolicy,
     stopped: bool,
     reason: Option<MonitorStop>,
     passive_safe: bool,
@@ -1208,7 +1228,7 @@ impl MonitorPolicy {
         accepted: &Mutex<Option<AcceptedBroker>>,
     ) -> bool {
         if !self.stopped {
-            self.reason = monitor_observe_reason(
+            self.reason = monitor_observe_reason_with_policy(
                 system,
                 owner,
                 baseline,
@@ -1217,6 +1237,7 @@ impl MonitorPolicy {
                 terminal_gate,
                 &mut self.passive_safe,
                 accepted,
+                self.foreground_policy,
             );
             self.stopped = self.reason.is_some();
         }
@@ -1245,6 +1266,7 @@ fn monitor_observe(
     .is_some()
 }
 
+#[cfg(test)]
 fn monitor_observe_reason(
     system: &mut impl ForegroundSystem,
     owner: isize,
@@ -1254,6 +1276,20 @@ fn monitor_observe_reason(
     terminal_gate: &MonitorTerminal,
     passive_safe: &mut bool,
     accepted: &Mutex<Option<AcceptedBroker>>,
+) -> Option<MonitorStop> {
+    monitor_observe_reason_with_policy(system, owner, baseline, cancelled, api_returned, terminal_gate, passive_safe, accepted, ForegroundMonitorPolicy::RoamingActive)
+}
+
+fn monitor_observe_reason_with_policy(
+    system: &mut impl ForegroundSystem,
+    owner: isize,
+    baseline: Arc<BrokerBaseline>,
+    cancelled: &AtomicBool,
+    api_returned: &AtomicBool,
+    terminal_gate: &MonitorTerminal,
+    passive_safe: &mut bool,
+    accepted: &Mutex<Option<AcceptedBroker>>,
+    foreground_policy: ForegroundMonitorPolicy,
 ) -> Option<MonitorStop> {
     if api_returned.load(Ordering::Acquire) {
         return Some(MonitorStop::ApiReturned);
@@ -1325,6 +1361,11 @@ fn monitor_observe_reason(
     }
     if initial_foreground != owner && initial_foreground != candidate.hwnd {
         return Some(MonitorStop::ForegroundLost);
+    }
+    if foreground_policy == ForegroundMonitorPolicy::ObservationOnly && initial_foreground == owner {
+        // Continue observing genuine candidates; never activate or publish an
+        // owner-foreground broker as a foreground handoff authorization.
+        return None;
     }
 
     // Re-scan after the initial focus sample so the final identity/visibility
@@ -1673,11 +1714,22 @@ struct MonitorWorkerChannels<'a> {
     reason: &'a Mutex<Option<MonitorStop>>,
 }
 
+#[cfg(test)]
 fn run_monitor_worker(
     system: &mut impl ForegroundSystem,
     owner: isize,
     baseline: Arc<BrokerBaseline>,
     channels: MonitorWorkerChannels<'_>,
+) {
+    run_monitor_worker_with_policy(system, owner, baseline, channels, ForegroundMonitorPolicy::RoamingActive);
+}
+
+fn run_monitor_worker_with_policy(
+    system: &mut impl ForegroundSystem,
+    owner: isize,
+    baseline: Arc<BrokerBaseline>,
+    channels: MonitorWorkerChannels<'_>,
+    foreground_policy: ForegroundMonitorPolicy,
 ) {
     while !channels.armed.load(Ordering::Acquire) {
         if channels.api_returned.load(Ordering::Acquire) {
@@ -1697,7 +1749,7 @@ fn run_monitor_worker(
         system.wait(Duration::from_millis(5));
     }
     let deadline = system.monotonic() + focus_monitor_timeout();
-    let mut policy = MonitorPolicy::default();
+    let mut policy = MonitorPolicy { foreground_policy, ..Default::default() };
     while !channels.cancelled.load(Ordering::Acquire)
         && !channels.api_returned.load(Ordering::Acquire)
         && system.monotonic() < deadline
@@ -1854,6 +1906,10 @@ impl WebAuthnForegroundMonitor {
     }
 
     fn prepare(owner_hwnd: HWND, operation: Operation) -> Option<Self> {
+        Self::prepare_with_policy(owner_hwnd, operation, ForegroundMonitorPolicy::RoamingActive)
+    }
+
+    fn prepare_with_policy(owner_hwnd: HWND, operation: Operation, foreground_policy: ForegroundMonitorPolicy) -> Option<Self> {
         let system_directory = system_directory().or_else(|| {
             log::warn!("[WebAuthN-focus] could not determine the Windows system directory");
             None
@@ -1918,7 +1974,7 @@ impl WebAuthnForegroundMonitor {
         let worker = match thread::Builder::new()
             .name("webauthn-security-dialog-focus".into())
             .spawn(move || {
-                run_monitor_worker(
+                run_monitor_worker_with_policy(
                     &mut NativeForegroundSystem,
                     owner_hwnd_value,
                     baseline,
@@ -1931,6 +1987,7 @@ impl WebAuthnForegroundMonitor {
                         passive_safe: &worker_passive_safe,
                         reason: &worker_reason,
                     },
+                    foreground_policy,
                 );
             }) {
             Ok(worker) => worker,
@@ -1971,6 +2028,167 @@ fn vault_hmac_salt() -> [u8; 32] {
 
 const OP_TIMEOUT_MS: u32 = 90_000;
 const MAX_API_BUFFER: usize = 1024 * 1024;
+const MAX_PLATFORM_CREDENTIALS: usize = 4096;
+
+// windows-sys 0.61.2 stops at MakeCredential options v7 / attestation v6.
+// The appended fields below follow Microsoft's webauthn.h v8 / v7 respectively.
+// Never access appended response fields until dwVersion proves they exist.
+#[repr(C)]
+struct MakeCredentialOptionsV8 {
+    base: WEBAUTHN_AUTHENTICATOR_MAKE_CREDENTIAL_OPTIONS,
+    p_prf_global_eval: *mut WEBAUTHN_HMAC_SECRET_SALT,
+    c_credential_hints: u32,
+    ppwsz_credential_hints: *const *const u16,
+    b_third_party_payment: windows_sys::core::BOOL,
+}
+
+#[repr(C)]
+struct CredentialAttestationV7 {
+    base: WEBAUTHN_CREDENTIAL_ATTESTATION,
+    p_hmac_secret: *mut WEBAUTHN_HMAC_SECRET_SALT,
+    b_third_party_payment: windows_sys::core::BOOL,
+}
+
+fn platform_attestation_version_supported(version: u32) -> bool {
+    // This parser and its cleanup guard share the same official v7/v8 prefix contract.
+    matches!(version, 7 | 8)
+}
+
+// Platform-only ownership seam; roaming AttestationGuard remains independent.
+struct PlatformAttestationGuard {
+    allocation: *mut WEBAUTHN_CREDENTIAL_ATTESTATION,
+    free: unsafe extern "system" fn(*const WEBAUTHN_CREDENTIAL_ATTESTATION),
+}
+impl Drop for PlatformAttestationGuard {
+    fn drop(&mut self) {
+        if !self.allocation.is_null() {
+            // Native API owns valid writable buffers. Read only dwVersion before
+            // extending the base; unknown future layouts are deliberately skipped.
+            unsafe {
+                // Official header commit 0ef86c2fe31e5b0608cc4fce4820935bd644cabb
+                // defines attestation v7 and v8 with the same PRF prefix.
+                if platform_attestation_version_supported((*self.allocation).dwVersion) {
+                    let extended = self.allocation.cast::<CredentialAttestationV7>();
+                    let output = (*extended).p_hmac_secret;
+                    if !output.is_null() {
+                        use zeroize::Zeroize;
+                        for (length, bytes) in [((*output).cbFirst, (*output).pbFirst), ((*output).cbSecond, (*output).pbSecond)] {
+                            // Each output is independent; never trust an arbitrary reported length.
+                            if length == 32 && !bytes.is_null() {
+                                slice::from_raw_parts_mut(bytes, 32).zeroize();
+                            }
+                        }
+                    }
+                }
+                (self.free)(self.allocation);
+            }
+        }
+    }
+}
+
+struct PendingPlatformCredential(Vec<u8>);
+impl Drop for PendingPlatformCredential {
+    fn drop(&mut self) {
+        if !self.0.is_empty() {
+            let _ =
+                unsafe { WebAuthNDeletePlatformCredential(self.0.len() as u32, self.0.as_ptr()) };
+        }
+    }
+}
+
+struct PlatformCredentialListGuard(*mut WEBAUTHN_CREDENTIAL_DETAILS_LIST);
+impl Drop for PlatformCredentialListGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { WebAuthNFreePlatformCredentialList(self.0) };
+        }
+    }
+}
+
+fn platform_prf_error(hr: windows_sys::core::HRESULT) -> FidoError {
+    use windows_sys::Win32::Foundation::{NTE_BAD_KEY_STATE, NTE_NOT_FOUND, NTE_NOT_SUPPORTED};
+    match hr {
+        NTE_BAD_KEY_STATE | NTE_NOT_SUPPORTED => FidoError::PlatformPrfUnsupported,
+        NTE_NOT_FOUND => FidoError::PlatformCredentialMissing,
+        _ => api_error("platform getAssertion", hr),
+    }
+}
+
+fn platform_make_error(hr: windows_sys::core::HRESULT) -> FidoError {
+    use windows_sys::Win32::Foundation::{NTE_EXISTS, NTE_NOT_SUPPORTED};
+    match hr {
+        NTE_EXISTS => FidoError::PlatformCredentialExists,
+        NTE_NOT_SUPPORTED => FidoError::PlatformPrfUnsupported,
+        _ => api_error("platform makeCredential", hr),
+    }
+}
+
+fn platform_list_error(hr: windows_sys::core::HRESULT) -> Result<Vec<Vec<u8>>, FidoError> {
+    if hr == windows_sys::Win32::Foundation::NTE_NOT_FOUND {
+        Ok(Vec::new())
+    } else {
+        Err(api_error("getPlatformCredentialList", hr))
+    }
+}
+
+// Only call while the WebAuthN allocation is owned by PlatformCredentialListGuard.
+fn copy_platform_ids(
+    entries: &WEBAUTHN_CREDENTIAL_DETAILS_LIST,
+) -> Result<Vec<Vec<u8>>, FidoError> {
+    let count = entries.cCredentialDetails as usize;
+    if count > MAX_PLATFORM_CREDENTIALS || (count != 0 && entries.ppCredentialDetails.is_null()) {
+        return Err(FidoError::Internal(
+            "platform credential list is invalid".into(),
+        ));
+    }
+    let mut ids = Vec::with_capacity(count);
+    let mut total_bytes = 0usize;
+    for index in 0..count {
+        let detail = unsafe { *entries.ppCredentialDetails.add(index) };
+        if detail.is_null() {
+            return Err(FidoError::Internal(
+                "platform credential entry is null".into(),
+            ));
+        }
+        let detail = unsafe { &*detail };
+        let size = detail.cbCredentialID as usize;
+        total_bytes = total_bytes.saturating_add(size);
+        if size == 0 || total_bytes > MAX_API_BUFFER {
+            return Err(FidoError::Internal(
+                "platform credential list exceeds size limit".into(),
+            ));
+        }
+        let id = unsafe {
+            copy_api_bytes(
+                detail.pbCredentialID,
+                detail.cbCredentialID,
+                "platform credential ID",
+            )?
+        };
+        ids.push(id);
+    }
+    Ok(ids)
+}
+
+// Caller owns the API allocation and must keep it alive until this copy finishes.
+fn platform_attestation_prf(
+    att: &WEBAUTHN_CREDENTIAL_ATTESTATION,
+) -> Result<zeroize::Zeroizing<[u8; 32]>, FidoError> {
+    if !platform_attestation_version_supported(att.dwVersion) || att.bPrfEnabled == 0 || att.bResidentKey == 0 {
+        return Err(FidoError::PlatformPrfUnsupported);
+    }
+    let extended = unsafe { &*(att as *const _ as *const CredentialAttestationV7) };
+    if extended.p_hmac_secret.is_null() {
+        return Err(FidoError::PlatformPrfUnsupported);
+    }
+    let output = unsafe { &*extended.p_hmac_secret };
+    if output.cbFirst != 32 || output.pbFirst.is_null() || output.cbSecond != 0 {
+        return Err(FidoError::PlatformPrfUnsupported);
+    }
+    let mut secret = zeroize::Zeroizing::new([0u8; 32]);
+    secret.copy_from_slice(unsafe { slice::from_raw_parts(output.pbFirst, 32) });
+    Ok(secret)
+}
 
 /// Uses Windows' brokered WebAuthn path so standard-user GUI launches do not open raw HID.
 pub struct WindowsWebAuthnBackend {
@@ -1999,6 +2217,17 @@ impl WindowsWebAuthnBackend {
             api_version,
             continuation: None,
         })
+    }
+
+    fn require_platform_available(&self) -> Result<(), FidoError> {
+        if self.platform_status().available() {
+            Ok(())
+        } else {
+            Err(FidoError::NotSupported(
+                "Windows Hello 需要 WebAuthn API v8+、可用的本機驗證器與本機 Console 工作階段"
+                    .into(),
+            ))
+        }
     }
 
     fn hwnd(&self) -> Result<HWND, FidoError> {
@@ -2197,6 +2426,160 @@ impl WindowsWebAuthnBackend {
         ))
     }
 
+    fn make_platform_credential(
+        &mut self,
+        label: &str,
+        exclude: &[Vec<u8>],
+    ) -> Result<PlatformRegistration, FidoError> {
+        self.continuation = None;
+        self.require_platform_available()?;
+        diagnose(
+            Operation::MakeCredential,
+            |diagnostic| self.make_platform_credential_with_diagnostics(label, exclude, diagnostic),
+            |record| log::info!("[WebAuthN-platform-operation] {}", record),
+        )
+    }
+
+    fn make_platform_credential_with_diagnostics(
+        &self,
+        label: &str,
+        exclude: &[Vec<u8>],
+        diagnostic: &mut OperationDiagnostics,
+    ) -> Result<PlatformRegistration, FidoError> {
+        diagnostic.failure_stage = Some(FailureStage::Preflight);
+        validate_exclude_credential_ids(exclude)?;
+        let challenge = random_bytes(32);
+        let mut client_json = client_data_json(ClientDataOperation::Create, &challenge);
+        let client_data = make_client_data(&mut client_json)?;
+        let rp_id = wide(RP_ID);
+        let rp_name = wide("FidoVault");
+        let user_name = wide("vault-user");
+        let user_display_name = wide("FidoVault user");
+        let mut user_id = random_bytes(16);
+        let rp = WEBAUTHN_RP_ENTITY_INFORMATION {
+            dwVersion: WEBAUTHN_RP_ENTITY_INFORMATION_CURRENT_VERSION,
+            pwszId: rp_id.as_ptr(),
+            pwszName: rp_name.as_ptr(),
+            pwszIcon: ptr::null(),
+        };
+        let user = WEBAUTHN_USER_ENTITY_INFORMATION {
+            dwVersion: WEBAUTHN_USER_ENTITY_INFORMATION_CURRENT_VERSION,
+            cbId: user_id.len() as u32,
+            pbId: user_id.as_mut_ptr(),
+            pwszName: user_name.as_ptr(),
+            pwszIcon: ptr::null(),
+            pwszDisplayName: user_display_name.as_ptr(),
+        };
+        let mut cose = [
+            WEBAUTHN_COSE_CREDENTIAL_PARAMETER {
+                dwVersion: WEBAUTHN_COSE_CREDENTIAL_PARAMETER_CURRENT_VERSION,
+                pwszCredentialType: WEBAUTHN_CREDENTIAL_TYPE_PUBLIC_KEY,
+                lAlg: WEBAUTHN_COSE_ALGORITHM_ECDSA_P256_WITH_SHA256,
+            },
+            WEBAUTHN_COSE_CREDENTIAL_PARAMETER {
+                dwVersion: WEBAUTHN_COSE_CREDENTIAL_PARAMETER_CURRENT_VERSION,
+                pwszCredentialType: WEBAUTHN_CREDENTIAL_TYPE_PUBLIC_KEY,
+                lAlg: WEBAUTHN_COSE_ALGORITHM_RSASSA_PKCS1_V1_5_WITH_SHA256,
+            },
+        ];
+        let cose_parameters = WEBAUTHN_COSE_CREDENTIAL_PARAMETERS {
+            cCredentialParameters: cose.len() as u32,
+            pCredentialParameters: cose.as_mut_ptr(),
+        };
+        let mut exclude_entries = exclude_credential_entries(exclude);
+        let exclude_list = exclude_credential_list(&mut exclude_entries);
+        let mut salt = zeroize::Zeroizing::new(vault_hmac_salt());
+        let mut eval = WEBAUTHN_HMAC_SECRET_SALT {
+            cbFirst: 32,
+            pbFirst: salt.as_mut_ptr(),
+            cbSecond: 0,
+            pbSecond: ptr::null_mut(),
+        };
+        let options = MakeCredentialOptionsV8 {
+            base: WEBAUTHN_AUTHENTICATOR_MAKE_CREDENTIAL_OPTIONS {
+                dwVersion: 8,
+                dwTimeoutMilliseconds: OP_TIMEOUT_MS,
+                CredentialList: exclude_list,
+                dwAuthenticatorAttachment: WEBAUTHN_AUTHENTICATOR_ATTACHMENT_PLATFORM,
+                dwUserVerificationRequirement: WEBAUTHN_USER_VERIFICATION_REQUIREMENT_REQUIRED,
+                dwAttestationConveyancePreference: WEBAUTHN_ATTESTATION_CONVEYANCE_PREFERENCE_NONE,
+                bRequireResidentKey: 1,
+                bPreferResidentKey: 1,
+                bEnablePrf: 1,
+                dwFlags: raw_hmac_secret_flag(),
+                ..Default::default()
+            },
+            p_prf_global_eval: &mut eval,
+            c_credential_hints: 0,
+            ppwsz_credential_hints: ptr::null(),
+            b_third_party_payment: 0,
+        };
+        let owner_for_prepare = self.hwnd()?;
+        let owner_identity =
+            checked_owner(&mut NativeForegroundSystem, owner_for_prepare as isize)?;
+        let focus_monitor = WebAuthnForegroundMonitor::prepare_with_policy(
+            owner_for_prepare, Operation::MakeCredential, ForegroundMonitorPolicy::ObservationOnly,
+        );
+        let (owner, _) = self.foreground_owner_hwnd(owner_identity)?;
+        if let Some(monitor) = focus_monitor.as_ref() {
+            monitor.arm();
+        }
+        let mut attestation = ptr::null_mut();
+        let hr = unsafe {
+            WebAuthNAuthenticatorMakeCredential(
+                owner,
+                &rp,
+                &user,
+                &cose_parameters,
+                &client_data,
+                (&options as *const MakeCredentialOptionsV8).cast(),
+                &mut attestation,
+            )
+        };
+        // Establish one platform-only wipe-before-free lifecycle even on HRESULT failure.
+        let attestation = PlatformAttestationGuard {
+            allocation: attestation,
+            free: WebAuthNFreeCredentialAttestation,
+        };
+        let _ = focus_monitor.map(WebAuthnForegroundMonitor::finish_observation);
+        diagnostic.failure_stage = Some(FailureStage::Api);
+        if hr < 0 {
+            return Err(platform_make_error(hr));
+        }
+        diagnostic.failure_stage = Some(FailureStage::Response);
+        if attestation.allocation.is_null() {
+            return Err(FidoError::PlatformPrfUnsupported);
+        }
+        let att = unsafe { &*attestation.allocation };
+        let credential_id =
+            unsafe { copy_api_bytes(att.pbCredentialId, att.cbCredentialId, "credential ID")? };
+        if credential_id.is_empty() {
+            return Err(FidoError::PlatformPrfUnsupported);
+        }
+        let mut pending = PendingPlatformCredential(credential_id);
+        let creation_prf = platform_attestation_prf(att)?;
+        diagnostic.hmac_creation_confirmed = Some(true);
+        diagnostic.output_present = Some(true);
+        diagnostic.output_length = Some(32);
+        let authenticator_data = unsafe {
+            copy_api_bytes(
+                att.pbAuthenticatorData,
+                att.cbAuthenticatorData,
+                "authenticator data",
+            )?
+        };
+        let registration = PlatformRegistration {
+            credential: RegisteredCredential {
+                credential_id: std::mem::take(&mut pending.0),
+                aaguid: aaguid_from_authenticator_data(&authenticator_data),
+                label: label.to_owned(),
+                kind: KeyKind::WindowsManaged,
+            },
+            creation_prf,
+        };
+        Ok(registration)
+    }
+
     fn get_hmac_secret(&mut self, credential_id: &[u8]) -> Result<[u8; 32], FidoError> {
         self.get_hmac_secret_for_any(&[credential_id.to_vec()])
             .map(|(_, secret)| secret)
@@ -2208,8 +2591,24 @@ impl WindowsWebAuthnBackend {
     ) -> Result<(Vec<u8>, [u8; 32]), FidoError> {
         diagnose(
             Operation::GetAssertion,
-            |diagnostic| self.get_hmac_secret_for_any_with_diagnostics(credential_ids, diagnostic),
+            |diagnostic| {
+                self.get_hmac_secret_for_any_with_diagnostics(credential_ids, diagnostic, false)
+            },
             |record| log::info!("[WebAuthN-operation] {}", record),
+        )
+    }
+
+    fn get_platform_secret(
+        &mut self,
+        credential_ids: &[Vec<u8>],
+    ) -> Result<(Vec<u8>, [u8; 32]), FidoError> {
+        self.require_platform_available()?;
+        diagnose(
+            Operation::GetAssertion,
+            |diagnostic| {
+                self.get_hmac_secret_for_any_with_diagnostics(credential_ids, diagnostic, true)
+            },
+            |record| log::info!("[WebAuthN-platform-operation] {}", record),
         )
     }
 
@@ -2217,40 +2616,47 @@ impl WindowsWebAuthnBackend {
         &mut self,
         credential_ids: &[Vec<u8>],
         diagnostic: &mut OperationDiagnostics,
+        platform: bool,
     ) -> Result<(Vec<u8>, [u8; 32]), FidoError> {
         diagnostic.failure_stage = Some(FailureStage::Preflight);
         let mut continuation = self.continuation.take();
         let mut system = NativeForegroundSystem;
-        let mut continuation_diagnostic = ContinuationDiagnostics::default();
-        let preparation = prepare_assertion_continuation(
-            &mut continuation,
-            self.hwnd,
-            credential_ids,
-            &mut system,
-            &mut continuation_diagnostic,
-        );
-        log::info!(
-            "[WebAuthN-continuation] {}",
-            continuation_diagnostic.record(system.current_pid())
-        );
-        let creation_owner = match preparation {
-            Ok((outcome, creation_owner)) => {
-                log::info!(
-                    "[WebAuthN-handoff] outcome={}",
-                    match outcome {
-                        HandoffOutcome::Ordinary => "ordinary",
-                        HandoffOutcome::OwnerForeground => "owner-foreground",
-                        HandoffOutcome::Recovered => "recovered",
-                    }
-                );
-                creation_owner
-            }
-            Err(refusal) => {
-                log::warn!("[WebAuthN-handoff] reason={}", refusal.reason());
-                return Err(FidoError::Internal(format!(
-                    "Windows WebAuthn continuation refused: {}",
-                    refusal.reason()
-                )));
+        let creation_owner = if platform {
+            // Hello does not necessarily use CredentialUIBroker. Treat the second
+            // prompt as a fresh owner-bound ceremony, never roaming handoff.
+            None
+        } else {
+            let mut continuation_diagnostic = ContinuationDiagnostics::default();
+            let preparation = prepare_assertion_continuation(
+                &mut continuation,
+                self.hwnd,
+                credential_ids,
+                &mut system,
+                &mut continuation_diagnostic,
+            );
+            log::info!(
+                "[WebAuthN-continuation] {}",
+                continuation_diagnostic.record(system.current_pid())
+            );
+            match preparation {
+                Ok((outcome, creation_owner)) => {
+                    log::info!(
+                        "[WebAuthN-handoff] outcome={}",
+                        match outcome {
+                            HandoffOutcome::Ordinary => "ordinary",
+                            HandoffOutcome::OwnerForeground => "owner-foreground",
+                            HandoffOutcome::Recovered => "recovered",
+                        }
+                    );
+                    creation_owner
+                }
+                Err(refusal) => {
+                    log::warn!("[WebAuthN-handoff] reason={}", refusal.reason());
+                    return Err(FidoError::Internal(format!(
+                        "Windows WebAuthn continuation refused: {}",
+                        refusal.reason()
+                    )));
+                }
             }
         };
         let owner_identity = assertion_owner_baseline(&mut system, self.hwnd, creation_owner)?;
@@ -2288,8 +2694,16 @@ impl WindowsWebAuthnBackend {
             dwVersion: WEBAUTHN_AUTHENTICATOR_GET_ASSERTION_OPTIONS_VERSION_6,
             dwTimeoutMilliseconds: OP_TIMEOUT_MS,
             CredentialList: credential_list,
-            dwAuthenticatorAttachment: WEBAUTHN_AUTHENTICATOR_ATTACHMENT_CROSS_PLATFORM,
-            dwUserVerificationRequirement: WEBAUTHN_USER_VERIFICATION_REQUIREMENT_PREFERRED,
+            dwAuthenticatorAttachment: if platform {
+                WEBAUTHN_AUTHENTICATOR_ATTACHMENT_PLATFORM
+            } else {
+                WEBAUTHN_AUTHENTICATOR_ATTACHMENT_CROSS_PLATFORM
+            },
+            dwUserVerificationRequirement: if platform {
+                WEBAUTHN_USER_VERIFICATION_REQUIREMENT_REQUIRED
+            } else {
+                WEBAUTHN_USER_VERIFICATION_REQUIREMENT_PREFERRED
+            },
             dwFlags: raw_hmac_secret_flag(),
             pHmacSecretSaltValues: &mut salt_values,
             ..Default::default()
@@ -2298,8 +2712,9 @@ impl WindowsWebAuthnBackend {
         let rp_id = wide(RP_ID);
         let mut assertion = ptr::null_mut();
         let owner_for_prepare = self.hwnd()?;
-        let focus_monitor =
-            WebAuthnForegroundMonitor::prepare(owner_for_prepare, Operation::GetAssertion);
+        let focus_monitor = WebAuthnForegroundMonitor::prepare_with_policy(
+            owner_for_prepare, Operation::GetAssertion, ForegroundMonitorPolicy::for_platform(platform),
+        );
         let (owner_hwnd, foreground_before_api) = self.foreground_owner_hwnd(owner_identity)?;
         if let Some(monitor) = focus_monitor.as_ref() {
             monitor.arm();
@@ -2324,7 +2739,11 @@ impl WindowsWebAuthnBackend {
             if !assertion.is_null() {
                 unsafe { WebAuthNFreeAssertion(assertion) };
             }
-            return Err(api_error("getAssertion", hr));
+            return Err(if platform {
+                platform_prf_error(hr)
+            } else {
+                api_error("getAssertion", hr)
+            });
         }
         diagnostic.failure_stage = Some(FailureStage::Response);
         if assertion.is_null() {
@@ -2336,9 +2755,11 @@ impl WindowsWebAuthnBackend {
         let result = unsafe { &*assertion.0 };
         if result.pHmacSecret.is_null() {
             diagnostic.output_present = Some(false);
-            return Err(FidoError::Internal(
-                "security key returned no hmac-secret output".into(),
-            ));
+            return Err(if platform {
+                FidoError::PlatformPrfUnsupported
+            } else {
+                FidoError::Internal("security key returned no hmac-secret output".into())
+            });
         }
         let selected_id = unsafe {
             copy_api_bytes(
@@ -2353,11 +2774,15 @@ impl WindowsWebAuthnBackend {
         let output = unsafe { &*result.pHmacSecret };
         diagnostic.output_present = Some(!output.pbFirst.is_null());
         diagnostic.output_length = Some(output.cbFirst);
-        if output.cbFirst != 32 || output.pbFirst.is_null() {
-            return Err(FidoError::Internal(format!(
-                "Windows WebAuthn API returned an invalid hmac-secret length ({})",
-                output.cbFirst
-            )));
+        if output.cbFirst != 32 || output.pbFirst.is_null() || (platform && output.cbSecond != 0) {
+            return Err(if platform {
+                FidoError::PlatformPrfUnsupported
+            } else {
+                FidoError::Internal(format!(
+                    "Windows WebAuthn API returned an invalid hmac-secret length ({})",
+                    output.cbFirst
+                ))
+            });
         }
         let bytes = unsafe { slice::from_raw_parts(output.pbFirst, 32) };
         let mut secret = [0u8; 32];
@@ -2367,6 +2792,90 @@ impl WindowsWebAuthnBackend {
 }
 
 impl FidoBackend for WindowsWebAuthnBackend {
+    fn platform_status(&self) -> PlatformStatus {
+        let api_ok = self.api_version >= 8;
+        let mut available: windows_sys::core::BOOL = 0;
+        let uvpa = api_ok
+            && unsafe { WebAuthNIsUserVerifyingPlatformAuthenticatorAvailable(&mut available) }
+                >= 0
+            && available != 0;
+        let pid = unsafe { GetCurrentProcessId() };
+        let console = process_session(pid)
+            .filter(|&session| session != 0)
+            .map(|session| {
+                platform_console_session(
+                    session,
+                    session_evidence(
+                        query_wts::<u16>(session, WTSClientProtocolType),
+                        query_wts::<i32>(session, WTSConnectState),
+                    ),
+                )
+            })
+            .unwrap_or(false);
+        PlatformStatus {
+            api_ok,
+            uvpa,
+            console,
+        }
+    }
+
+    fn register_platform_credential(
+        &mut self,
+        label: &str,
+        exclude: &[Vec<u8>],
+    ) -> Result<PlatformRegistration, FidoError> {
+        self.make_platform_credential(label, exclude)
+    }
+
+    fn get_platform_prf_secret(
+        &mut self,
+        credential_ids: &[Vec<u8>],
+    ) -> Result<(Vec<u8>, [u8; 32]), FidoError> {
+        self.get_platform_secret(credential_ids)
+    }
+
+    fn list_platform_credentials(&mut self) -> Result<Vec<Vec<u8>>, FidoError> {
+        self.continuation = None;
+        self.require_platform_available()?;
+        let rp_id = wide(RP_ID);
+        let options = WEBAUTHN_GET_CREDENTIALS_OPTIONS {
+            dwVersion: WEBAUTHN_GET_CREDENTIALS_OPTIONS_CURRENT_VERSION,
+            pwszRpId: rp_id.as_ptr(),
+            bBrowserInPrivateMode: 0,
+        };
+        let mut list = ptr::null_mut();
+        let hr = unsafe { WebAuthNGetPlatformCredentialList(&options, &mut list) };
+        let list = PlatformCredentialListGuard(list);
+        if hr < 0 {
+            return platform_list_error(hr);
+        }
+        if list.0.is_null() {
+            return Err(FidoError::Internal(
+                "platform credential list was null".into(),
+            ));
+        }
+        let entries = unsafe { &*list.0 };
+        copy_platform_ids(entries)
+    }
+
+    fn delete_platform_credential(&mut self, credential_id: &[u8]) -> Result<(), FidoError> {
+        self.continuation = None;
+        self.require_platform_available()?;
+        if credential_id.is_empty() || credential_id.len() > MAX_API_BUFFER {
+            return Err(FidoError::Internal("invalid platform credential ID".into()));
+        }
+        let hr = unsafe {
+            WebAuthNDeletePlatformCredential(credential_id.len() as u32, credential_id.as_ptr())
+        };
+        if hr == windows_sys::Win32::Foundation::NTE_NOT_FOUND {
+            Err(FidoError::PlatformCredentialMissing)
+        } else if hr < 0 {
+            Err(api_error("deletePlatformCredential", hr))
+        } else {
+            Ok(())
+        }
+    }
+
     fn set_webauthn_parent_hwnd(&mut self, handle: isize) {
         self.continuation = None;
         self.hwnd = handle;
@@ -2627,6 +3136,349 @@ fn api_error(operation: &str, hr: windows_sys::core::HRESULT) -> FidoError {
 mod tests {
     use super::*;
 
+    // ── D3：Windows Hello platform FFI (pure tests; never open a prompt) ──
+    // Fixtures only: callback owns and frees the synthetic outer allocation.
+    static D3_FREE_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static D3_FREE_SAW_ZERO: AtomicBool = AtomicBool::new(false);
+    unsafe extern "system" fn d3_fixture_free(p: *const WEBAUTHN_CREDENTIAL_ATTESTATION) {
+        let att = Box::from_raw(p.cast_mut().cast::<CredentialAttestationV7>());
+        let salt = &*att.p_hmac_secret;
+        D3_FREE_SAW_ZERO.store(slice::from_raw_parts(salt.pbFirst, 32).iter().all(|b| *b == 0), Ordering::SeqCst);
+        D3_FREE_CALLS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn wh_d3_followup_unknown_attestation_versions_fail_closed_before_extension_read() {
+        for version in [9, u32::MAX] {
+            let mut first = [0x5au8; 32];
+            let mut salt = WEBAUTHN_HMAC_SECRET_SALT {
+                cbFirst: 32, pbFirst: first.as_mut_ptr(), cbSecond: 0, pbSecond: ptr::null_mut(),
+            };
+            let mut att = CredentialAttestationV7 {
+                base: WEBAUTHN_CREDENTIAL_ATTESTATION {
+                    dwVersion: version, bPrfEnabled: 1, bResidentKey: 1, ..Default::default()
+                },
+                p_hmac_secret: &mut salt, b_third_party_payment: 0,
+            };
+            assert!(matches!(platform_attestation_prf(&att.base), Err(FidoError::PlatformPrfUnsupported)),
+                "UNKNOWN-VERSION: parser must not accept a version skipped by native cleanup");
+            // Reached only after the legal-buffer assertion succeeds; RED is not a bad-pointer crash.
+            att.p_hmac_secret = std::ptr::dangling_mut();
+            assert!(matches!(platform_attestation_prf(&att.base), Err(FidoError::PlatformPrfUnsupported)));
+            assert!(first.iter().all(|b| *b == 0x5a));
+        }
+    }
+
+    #[test]
+    fn wh_d3_followup_s1_native_first_wiped_before_free_on_success_and_error() {
+        for (version, flags) in [(7, (1, 1)), (7, (0, 1)), (7, (1, 0)), (8, (1, 1))] {
+            D3_FREE_CALLS.store(0, Ordering::SeqCst);
+            D3_FREE_SAW_ZERO.store(false, Ordering::SeqCst);
+            let mut first = [0x5au8; 32];
+            let mut salt = WEBAUTHN_HMAC_SECRET_SALT { cbFirst: 32, pbFirst: first.as_mut_ptr(), cbSecond: 0, pbSecond: ptr::null_mut() };
+            let att = Box::new(CredentialAttestationV7 {
+                base: WEBAUTHN_CREDENTIAL_ATTESTATION { dwVersion: version, bPrfEnabled: flags.0, bResidentKey: flags.1, ..Default::default() },
+                p_hmac_secret: &mut salt, b_third_party_payment: 0,
+            });
+            let guard = PlatformAttestationGuard { allocation: Box::into_raw(att).cast(), free: d3_fixture_free };
+            let copy = platform_attestation_prf(unsafe { &*guard.allocation });
+            assert_eq!(copy.is_ok(), flags == (1, 1));
+            drop(guard); // same lifecycle for success, unsupported flags and later early-error
+            assert_eq!(D3_FREE_CALLS.load(Ordering::SeqCst), 1);
+            assert!(D3_FREE_SAW_ZERO.load(Ordering::SeqCst), "native fixture must be zero before free callback");
+            assert!(first.iter().all(|b| *b == 0));
+            if let Ok(copy) = copy { assert!(copy.iter().all(|b| *b == 0x5a)); }
+        }
+    }
+
+    unsafe extern "system" fn d3_fixture_free_outer(p: *const WEBAUTHN_CREDENTIAL_ATTESTATION) {
+        drop(Box::from_raw(p.cast_mut().cast::<CredentialAttestationV7>()));
+    }
+
+    #[test]
+    fn wh_d3_followup_s1_second_output_wiped_with_bounded_versioned_cleanup() {
+        // Bad first pointer/length must not suppress cleanup of a legal second output.
+        for (first_len, first_ptr) in [(0, ptr::null_mut()), (31, std::ptr::dangling_mut::<u8>()), (u32::MAX, std::ptr::dangling_mut::<u8>())] {
+            let mut second = [0xa5u8; 32];
+            let mut salt = WEBAUTHN_HMAC_SECRET_SALT { cbFirst: first_len, pbFirst: first_ptr, cbSecond: 32, pbSecond: second.as_mut_ptr() };
+            let att = Box::new(CredentialAttestationV7 { base: WEBAUTHN_CREDENTIAL_ATTESTATION { dwVersion: 7, ..Default::default() }, p_hmac_secret: &mut salt, b_third_party_payment: 0 });
+            drop(PlatformAttestationGuard { allocation: Box::into_raw(att).cast(), free: d3_fixture_free_outer });
+            assert!(second.iter().all(|b| *b == 0), "legal second fixture output must be wiped even when response is rejected");
+        }
+        // Unsupported future versions and pre-v7 must not read an extension pointer.
+        for version in [0, 6, 9, u32::MAX] {
+            let att = Box::new(CredentialAttestationV7 { base: WEBAUTHN_CREDENTIAL_ATTESTATION { dwVersion: version, ..Default::default() }, p_hmac_secret: std::ptr::dangling_mut(), b_third_party_payment: 0 });
+            drop(PlatformAttestationGuard { allocation: Box::into_raw(att).cast(), free: d3_fixture_free_outer });
+        }
+        for len in [0, 31, 33, u32::MAX] {
+            let mut first = [0x5au8; 32];
+            let mut second = [0xa5u8; 32];
+            let mut salt = WEBAUTHN_HMAC_SECRET_SALT { cbFirst: len, pbFirst: first.as_mut_ptr(), cbSecond: len, pbSecond: second.as_mut_ptr() };
+            let att = Box::new(CredentialAttestationV7 { base: WEBAUTHN_CREDENTIAL_ATTESTATION { dwVersion: 7, ..Default::default() }, p_hmac_secret: &mut salt, b_third_party_payment: 0 });
+            drop(PlatformAttestationGuard { allocation: Box::into_raw(att).cast(), free: d3_fixture_free_outer });
+            assert!(first.iter().all(|b| *b == 0x5a));
+            assert!(second.iter().all(|b| *b == 0xa5));
+        }
+        let mut salt = WEBAUTHN_HMAC_SECRET_SALT { cbFirst: 32, pbFirst: ptr::null_mut(), cbSecond: 32, pbSecond: ptr::null_mut() };
+        let att = Box::new(CredentialAttestationV7 { base: WEBAUTHN_CREDENTIAL_ATTESTATION { dwVersion: 7, ..Default::default() }, p_hmac_secret: &mut salt, b_third_party_payment: 0 });
+        drop(PlatformAttestationGuard { allocation: Box::into_raw(att).cast(), free: d3_fixture_free_outer });
+        let att = Box::new(CredentialAttestationV7 { base: WEBAUTHN_CREDENTIAL_ATTESTATION { dwVersion: 7, ..Default::default() }, p_hmac_secret: ptr::null_mut(), b_third_party_payment: 0 });
+        drop(PlatformAttestationGuard { allocation: Box::into_raw(att).cast(), free: d3_fixture_free_outer });
+        unsafe extern "system" fn free_base(p: *const WEBAUTHN_CREDENTIAL_ATTESTATION) { drop(Box::from_raw(p.cast_mut())); }
+        let base = Box::new(WEBAUTHN_CREDENTIAL_ATTESTATION { dwVersion: 6, ..Default::default() });
+        drop(PlatformAttestationGuard { allocation: Box::into_raw(base), free: free_base });
+        drop(PlatformAttestationGuard { allocation: ptr::null_mut(), free: d3_fixture_free_outer });
+    }
+
+    #[test]
+    fn wh_d3_followup_platform_cleanup_and_policy_wiring() {
+        let source = include_str!("windows_webauthn.rs");
+        let start = source.find(concat!("fn make_platform_credential_with_", "diagnostics(")).unwrap();
+        let end = start + source[start..].find(concat!("fn ", "get_hmac_secret(")).unwrap();
+        let creation = &source[start..end];
+        assert!(creation.contains("ForegroundMonitorPolicy::ObservationOnly"));
+        let native_return = creation.find(concat!("&mut ", "attestation,")).unwrap();
+        let guard = creation.find(concat!("let attestation = ", "PlatformAttestationGuard {")).unwrap();
+        let finish = creation.find(concat!("focus_monitor.map(", "WebAuthnForegroundMonitor::finish_observation)")).unwrap();
+        let hr_error = creation.find("if hr < 0").unwrap();
+        assert!(native_return < guard && guard < finish && finish < hr_error);
+        assert!(!creation.contains(concat!("AttestationGuard(", "attestation)")));
+        assert!(!creation.contains(concat!("WebAuthNFreeCredentialAttestation(", "attestation)")));
+        let start = source.find(concat!("fn get_hmac_secret_for_any_with_", "diagnostics(")).unwrap();
+        let end = start + source[start..].find(concat!("impl FidoBackend for ", "WindowsWebAuthnBackend")).unwrap();
+        assert!(source[start..end].contains("ForegroundMonitorPolicy::for_platform(platform)"));
+        // Existing roaming creation remains on the default active monitor/free guard.
+        let start = source.find(concat!("fn make_credential_with_", "diagnostics(")).unwrap();
+        let end = start + source[start..].find(concat!("fn make_platform_", "credential(")).unwrap();
+        let roaming = &source[start..end];
+        assert!(roaming.contains(concat!("WebAuthnForegroundMonitor::prepare(", "owner_for_prepare, Operation::MakeCredential)")));
+        assert!(roaming.contains(concat!("AttestationGuard(", "attestation)")));
+        assert!(!roaming.contains("PlatformAttestationGuard"));
+    }
+
+    #[test]
+    fn wh_d3_followup_abi_emit_actual_rust_layout() {
+        use std::mem::{offset_of, size_of};
+        macro_rules! fields { ($t:ty, $($f:ident),+) => { $(println!("ABI {} {} {} {}", stringify!($t), stringify!($f), offset_of!($t, $f), size_of_val(&unsafe { std::mem::zeroed::<$t>() }.$f));)+ }; }
+        fields!(WEBAUTHN_AUTHENTICATOR_MAKE_CREDENTIAL_OPTIONS, dwVersion, dwTimeoutMilliseconds, CredentialList, Extensions, dwAuthenticatorAttachment, bRequireResidentKey, dwUserVerificationRequirement, dwAttestationConveyancePreference, dwFlags, pCancellationId, pExcludeCredentialList, dwEnterpriseAttestation, dwLargeBlobSupport, bPreferResidentKey, bBrowserInPrivateMode, bEnablePrf, pLinkedDevice, cbJsonExt, pbJsonExt);
+        fields!(WEBAUTHN_CREDENTIAL_ATTESTATION, dwVersion, pwszFormatType, cbAuthenticatorData, pbAuthenticatorData, cbAttestation, pbAttestation, dwAttestationDecodeType, pvAttestationDecode, cbAttestationObject, pbAttestationObject, cbCredentialId, pbCredentialId, Extensions, dwUsedTransport, bEpAtt, bLargeBlobSupported, bResidentKey, bPrfEnabled, cbUnsignedExtensionOutputs, pbUnsignedExtensionOutputs);
+        fields!(WEBAUTHN_HMAC_SECRET_SALT, cbFirst, pbFirst, cbSecond, pbSecond);
+        println!("SIZE WEBAUTHN_HMAC_SECRET_SALT {}", size_of::<WEBAUTHN_HMAC_SECRET_SALT>());
+        fields!(WEBAUTHN_GET_CREDENTIALS_OPTIONS, dwVersion, pwszRpId, bBrowserInPrivateMode);
+        println!("SIZE WEBAUTHN_GET_CREDENTIALS_OPTIONS {}", size_of::<WEBAUTHN_GET_CREDENTIALS_OPTIONS>());
+        fields!(WEBAUTHN_CREDENTIAL_DETAILS, dwVersion, cbCredentialID, pbCredentialID, pRpInformation, pUserInformation, bRemovable, bBackedUp);
+        fields!(WEBAUTHN_CREDENTIAL_DETAILS_LIST, cCredentialDetails, ppCredentialDetails);
+        println!("SIZE WEBAUTHN_CREDENTIAL_DETAILS_LIST {}", size_of::<WEBAUTHN_CREDENTIAL_DETAILS_LIST>());
+        fields!(WEBAUTHN_CREDENTIALS, cCredentials, pCredentials);
+        println!("SIZE WEBAUTHN_CREDENTIALS {}", size_of::<WEBAUTHN_CREDENTIALS>());
+        fields!(WEBAUTHN_EXTENSIONS, cExtensions, pExtensions);
+        println!("SIZE WEBAUTHN_EXTENSIONS {}", size_of::<WEBAUTHN_EXTENSIONS>());
+        fields!(MakeCredentialOptionsV8, p_prf_global_eval, c_credential_hints, ppwsz_credential_hints, b_third_party_payment);
+        println!("SIZE MakeCredentialOptionsV8 {}", size_of::<MakeCredentialOptionsV8>());
+        fields!(CredentialAttestationV7, p_hmac_secret, b_third_party_payment);
+        println!("SIZE CredentialAttestationV7 {}", size_of::<CredentialAttestationV7>());
+        assert_eq!(size_of::<usize>(), 8);
+    }
+
+    #[test]
+    fn wh_d3_ffi_layout_matches_webauthn_header() {
+        use std::mem::{offset_of, size_of};
+        assert_eq!(
+            size_of::<WEBAUTHN_AUTHENTICATOR_MAKE_CREDENTIAL_OPTIONS>(),
+            128
+        );
+        assert_eq!(offset_of!(MakeCredentialOptionsV8, p_prf_global_eval), 128);
+        assert_eq!(offset_of!(MakeCredentialOptionsV8, c_credential_hints), 136);
+        assert_eq!(
+            offset_of!(MakeCredentialOptionsV8, ppwsz_credential_hints),
+            144
+        );
+        assert_eq!(
+            offset_of!(MakeCredentialOptionsV8, b_third_party_payment),
+            152
+        );
+        assert_eq!(size_of::<MakeCredentialOptionsV8>(), 160);
+        assert_eq!(size_of::<WEBAUTHN_CREDENTIAL_ATTESTATION>(), 144);
+        assert_eq!(offset_of!(CredentialAttestationV7, p_hmac_secret), 144);
+        assert_eq!(
+            offset_of!(CredentialAttestationV7, b_third_party_payment),
+            152
+        );
+        assert_eq!(size_of::<CredentialAttestationV7>(), 160);
+    }
+
+    #[test]
+    fn wh_d3_typed_platform_hresult_mapping() {
+        use windows_sys::Win32::Foundation::{
+            NTE_BAD_KEY_STATE, NTE_EXISTS, NTE_NOT_FOUND, NTE_NOT_SUPPORTED,
+        };
+        assert!(matches!(
+            platform_make_error(NTE_EXISTS),
+            FidoError::PlatformCredentialExists
+        ));
+        assert!(matches!(
+            platform_prf_error(NTE_BAD_KEY_STATE),
+            FidoError::PlatformPrfUnsupported
+        ));
+        assert!(matches!(
+            platform_prf_error(NTE_NOT_SUPPORTED),
+            FidoError::PlatformPrfUnsupported
+        ));
+        assert!(matches!(
+            platform_prf_error(NTE_NOT_FOUND),
+            FidoError::PlatformCredentialMissing
+        ));
+        assert!(matches!(platform_list_error(NTE_NOT_FOUND), Ok(ids) if ids.is_empty()));
+    }
+
+    #[test]
+    fn wh_d3_attestation_prf_rejects_old_version_without_reading_appended_fields() {
+        let att = WEBAUTHN_CREDENTIAL_ATTESTATION {
+            dwVersion: 6,
+            ..Default::default()
+        };
+        assert!(matches!(
+            platform_attestation_prf(&att),
+            Err(FidoError::PlatformPrfUnsupported)
+        ));
+    }
+
+    #[test]
+    fn wh_d3_attestation_prf_copies_only_confirmed_32_byte_output() {
+        let mut bytes = [0x5au8; 32];
+        let mut salt = WEBAUTHN_HMAC_SECRET_SALT {
+            cbFirst: 32,
+            pbFirst: bytes.as_mut_ptr(),
+            cbSecond: 0,
+            pbSecond: ptr::null_mut(),
+        };
+        let mut att = CredentialAttestationV7 {
+            base: WEBAUTHN_CREDENTIAL_ATTESTATION {
+                dwVersion: 7,
+                bPrfEnabled: 1,
+                bResidentKey: 1,
+                ..Default::default()
+            },
+            p_hmac_secret: &mut salt,
+            b_third_party_payment: 0,
+        };
+        let result = platform_attestation_prf(&att.base);
+        assert!(result.is_ok(), "valid PRF was rejected: {:?}", result.err());
+        let result = platform_attestation_prf(&att.base).unwrap();
+        bytes.fill(0); // prove output is copied before API allocation is released
+        assert_eq!(&*result, &[0x5a; 32]);
+        att.base.bPrfEnabled = 0;
+        assert!(matches!(
+            platform_attestation_prf(&att.base),
+            Err(FidoError::PlatformPrfUnsupported)
+        ));
+        att.base.bPrfEnabled = 1;
+        salt.cbFirst = 31;
+        assert_eq!(salt.cbFirst, 31);
+        assert_eq!(unsafe { (*att.p_hmac_secret).cbFirst }, 31);
+        assert!(matches!(
+            platform_attestation_prf(&att.base),
+            Err(FidoError::PlatformPrfUnsupported)
+        ));
+        salt.cbFirst = 32;
+        salt.cbSecond = 32;
+        assert_eq!((salt.cbFirst, salt.cbSecond), (32, 32));
+        assert!(matches!(
+            platform_attestation_prf(&att.base),
+            Err(FidoError::PlatformPrfUnsupported)
+        ));
+    }
+
+    #[test]
+    fn wh_d3_console_requires_nonzero_session_valid_protocol_and_active_state() {
+        let active = session_evidence(Ok(0), Ok(WTSActive));
+        assert!(platform_console_session(1, active));
+        assert!(!platform_console_session(0, active));
+        assert!(!platform_console_session(
+            1,
+            session_evidence(Ok(2), Ok(WTSActive))
+        ));
+        assert!(!platform_console_session(1, session_evidence(Ok(0), Ok(1))));
+        assert!(!platform_console_session(
+            1,
+            session_evidence(Ok(0), Err(QueryStatus::NativeFailure))
+        ));
+        assert!(!platform_console_session(
+            1,
+            session_evidence(Err(QueryStatus::NativeFailure), Ok(WTSActive))
+        ));
+    }
+
+    #[test]
+    fn wh_d3_platform_list_validates_count_pointers_and_ids() {
+        let mut list = WEBAUTHN_CREDENTIAL_DETAILS_LIST::default();
+        assert!(copy_platform_ids(&list).unwrap().is_empty());
+        list.cCredentialDetails = 1;
+        assert!(copy_platform_ids(&list).is_err());
+        list.cCredentialDetails = MAX_PLATFORM_CREDENTIALS as u32 + 1;
+        assert!(copy_platform_ids(&list).is_err());
+        let mut id = [1u8, 2, 3];
+        let mut detail = WEBAUTHN_CREDENTIAL_DETAILS {
+            cbCredentialID: id.len() as u32,
+            pbCredentialID: id.as_mut_ptr(),
+            ..Default::default()
+        };
+        let mut pointers = [&mut detail as *mut WEBAUTHN_CREDENTIAL_DETAILS];
+        list.cCredentialDetails = 1;
+        list.ppCredentialDetails = pointers.as_mut_ptr();
+        assert_eq!(copy_platform_ids(&list).unwrap(), vec![vec![1, 2, 3]]);
+        detail.cbCredentialID = 0;
+        assert_eq!(detail.cbCredentialID, 0);
+        assert_eq!(unsafe { (**list.ppCredentialDetails).cbCredentialID }, 0);
+        assert!(copy_platform_ids(&list).is_err());
+        detail.cbCredentialID = MAX_API_BUFFER as u32 + 1;
+        assert_eq!(detail.cbCredentialID, MAX_API_BUFFER as u32 + 1);
+        assert!(copy_platform_ids(&list).is_err()); // reject before dereferencing pbCredentialID
+        pointers[0] = ptr::null_mut();
+        assert!(pointers[0].is_null());
+        assert!(copy_platform_ids(&list).is_err());
+    }
+
+    #[test]
+    fn wh_d3_platform_ffi_source_contracts() {
+        let source = include_str!("windows_webauthn.rs");
+        let start = source
+            .find("fn make_platform_credential_with_diagnostics(")
+            .unwrap();
+        let end = source[start..].find("fn get_hmac_secret(").unwrap() + start;
+        let body = &source[start..end];
+        for needle in [
+            "dwVersion: 8",
+            "bEnablePrf: 1",
+            "bRequireResidentKey: 1",
+            "WEBAUTHN_AUTHENTICATOR_ATTACHMENT_PLATFORM",
+            "WEBAUTHN_USER_VERIFICATION_REQUIREMENT_REQUIRED",
+            "WEBAUTHN_COSE_ALGORITHM_ECDSA_P256_WITH_SHA256",
+            "WEBAUTHN_COSE_ALGORITHM_RSASSA_PKCS1_V1_5_WITH_SHA256",
+            "p_prf_global_eval: &mut eval",
+            "dwFlags: raw_hmac_secret_flag()",
+            "CredentialList: exclude_list",
+            "PendingPlatformCredential(credential_id)",
+        ] {
+            assert!(
+                body.contains(needle),
+                "missing platform creation wire: {needle}"
+            );
+        }
+        let start = source
+            .find(concat!("fn get_hmac_secret_for_any_with_", "diagnostics("))
+            .unwrap();
+        let end = source[start..]
+            .find(concat!("impl FidoBackend for ", "WindowsWebAuthnBackend"))
+            .unwrap()
+            + start;
+        let body = &source[start..end];
+        assert!(body.contains("validate_selected_credential_id(credential_ids, &selected_id)"));
+        assert!(body.contains("pHmacSecretSaltValues: &mut salt_values"));
+        assert!(body.contains("WEBAUTHN_AUTHENTICATOR_ATTACHMENT_PLATFORM"));
+        assert!(body.contains("WEBAUTHN_USER_VERIFICATION_REQUIREMENT_REQUIRED"));
+    }
+
     // ── D6：excludeCredentials ──
 
     #[test]
@@ -2878,9 +3730,7 @@ mod tests {
         fn identity(&mut self, hwnd: isize) -> Option<WindowIdentity> {
             self.trace.push("identity");
             self.identity_hwnds.push(hwnd);
-            if self.inaccessible_hwnd == Some(hwnd)
-                || self.session_unavailable_hwnd == Some(hwnd)
-            {
+            if self.inaccessible_hwnd == Some(hwnd) || self.session_unavailable_hwnd == Some(hwnd) {
                 return None;
             }
             if self.transient_identity_failures.front() == Some(&hwnd) {
@@ -3399,7 +4249,11 @@ mod tests {
             assert!(gate_held, "terminal state must synchronize with activation");
             assert!(system.trace.contains(&"activate"));
             assert_eq!(
-                system.trace.iter().filter(|event| **event == "activate").count(),
+                system
+                    .trace
+                    .iter()
+                    .filter(|event| **event == "activate")
+                    .count(),
                 1,
                 "a committed activation is attempted at most once"
             );
@@ -3871,6 +4725,34 @@ mod tests {
             Some(broker)
         );
         assert!(!system.trace.contains(&"activate"));
+    }
+
+    #[test]
+    fn wh_d3_followup_l1_platform_worker_observes_without_activation_roaming_stays_active() {
+        for platform in [true, false] {
+            let (mut system, baseline, owner, _) = handoff_fixture();
+            system.foreground = owner.hwnd;
+            assert!(baseline.local_console);
+            let cancelled = AtomicBool::new(false);
+            let returned = AtomicBool::new(false);
+            let terminal = MonitorTerminal::default();
+            let armed = AtomicBool::new(true);
+            let accepted = Mutex::new(None);
+            let passive = AtomicBool::new(false);
+            let reason = Mutex::new(None);
+            run_monitor_worker_with_policy(&mut system, owner.hwnd, baseline, MonitorWorkerChannels {
+                cancelled: &cancelled, api_returned: &returned, terminal_gate: &terminal,
+                armed: &armed, accepted: &accepted, passive_safe: &passive, reason: &reason,
+            }, ForegroundMonitorPolicy::for_platform(platform));
+            let activations = system.trace.iter().filter(|event| **event == "activate").count();
+            assert_eq!(activations, if platform { 0 } else { 1 }, "platform worker must never activate a genuine broker candidate");
+            if platform {
+                assert_eq!(system.foreground, owner.hwnd);
+                assert!(accepted.lock().unwrap().is_none());
+            } else {
+                assert!(accepted.lock().unwrap().is_some());
+            }
+        }
     }
 
     #[test]
@@ -4581,7 +5463,11 @@ mod tests {
             assert_eq!(reason, Some(expected));
             assert!(accepted.lock().unwrap().is_none());
             assert_eq!(
-                system.trace.iter().filter(|event| **event == "activate").count(),
+                system
+                    .trace
+                    .iter()
+                    .filter(|event| **event == "activate")
+                    .count(),
                 0,
                 "terminal transition at the final activation boundary must prevent activation"
             );
@@ -4774,9 +5660,21 @@ mod tests {
                 &accepted,
             );
 
-            assert_eq!(reason, Some(MonitorStop::Ambiguous), "after scan {after_scan}");
-            assert_eq!(activation_count(&system), activations, "after scan {after_scan}");
-            assert_eq!(terminal.phase.load(Ordering::Acquire), phase, "after scan {after_scan}");
+            assert_eq!(
+                reason,
+                Some(MonitorStop::Ambiguous),
+                "after scan {after_scan}"
+            );
+            assert_eq!(
+                activation_count(&system),
+                activations,
+                "after scan {after_scan}"
+            );
+            assert_eq!(
+                terminal.phase.load(Ordering::Acquire),
+                phase,
+                "after scan {after_scan}"
+            );
             assert!(!passive_safe);
             assert!(accepted.lock().unwrap().is_none());
         }
@@ -6802,7 +7700,11 @@ mod tests {
             session: 2,
         };
         let baseline = HashSet::from([existing]);
-        assert!(!is_new_window_identity(existing, &baseline, &HashSet::new()));
+        assert!(!is_new_window_identity(
+            existing,
+            &baseline,
+            &HashSet::new()
+        ));
         assert!(is_new_window_identity(
             WindowIdentity {
                 hwnd: existing.hwnd,
@@ -6919,7 +7821,7 @@ mod tests {
             .expect("constructor");
         let end = start
             + source[start..]
-                .find(concat!("fn ", "hwnd("))
+                .find(concat!("fn ", "require_platform_available("))
                 .expect("constructor end");
         let constructor = &source[start..end];
         let guard = constructor

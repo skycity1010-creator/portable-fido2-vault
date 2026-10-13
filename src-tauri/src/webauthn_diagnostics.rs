@@ -596,7 +596,7 @@ mod tests {
         for (start, end, ffi) in [
             (
                 "fn make_credential_with_diagnostics(",
-                "fn get_hmac_secret(",
+                "fn make_platform_credential(",
                 "WebAuthNAuthenticatorMakeCredential(",
             ),
             (
@@ -1043,7 +1043,7 @@ mod tests {
             ),
             (
                 "fn make_credential_with_diagnostics(",
-                "fn get_hmac_secret(",
+                "fn make_platform_credential(",
                 ".map(WebAuthnForegroundMonitor::finish_observation)",
                 ".map(drop)",
                 "NATIVE_RETURN_SHUTDOWN",
@@ -1307,13 +1307,18 @@ mod tests {
             ("GetAssertion", "GET_OPERATION_WRAPPER"),
         ] {
             let wrapper = format!("diagnose(\n            Operation::{operation}");
-            let mutant = mutate_unique(
-                &source,
-                "impl WindowsWebAuthnBackend",
-                "impl FidoBackend for WindowsWebAuthnBackend",
-                &wrapper,
-                "removed_wrapper(",
-            );
+            let (start, end) = if operation == "MakeCredential" {
+                (
+                    "    fn make_credential(",
+                    "    fn make_credential_with_diagnostics(",
+                )
+            } else {
+                (
+                    "    fn get_hmac_secret_for_any(",
+                    "    fn get_platform_secret(",
+                )
+            };
+            let mutant = mutate_unique(&source, start, end, &wrapper, "removed_wrapper(");
             assert_wiring_rejected_for_both_line_endings(&mutant, tag);
         }
     }
@@ -1327,14 +1332,14 @@ mod tests {
         let removed = mutate_unique(
             &source,
             "pub fn new(hwnd:",
-            "fn hwnd(",
+            "fn require_platform_available(",
             "capability_record(",
             "removed_capability(",
         );
         let mutant = mutate_unique(
             &removed,
             "pub fn new(hwnd:",
-            "fn hwnd(",
+            "fn require_platform_available(",
             guard,
             &format!("{guard}\ncapability_record();"),
         );
@@ -1349,7 +1354,7 @@ mod tests {
         for (start, end, ffi) in [
             (
                 "fn make_credential_with_diagnostics(",
-                "fn get_hmac_secret(",
+                "fn make_platform_credential(",
                 "WebAuthNAuthenticatorMakeCredential(",
             ),
             (
@@ -1376,7 +1381,7 @@ mod tests {
         for (start, end, ffi) in [
             (
                 "fn make_credential_with_diagnostics(",
-                "fn get_hmac_secret(",
+                "fn make_platform_credential(",
                 "WebAuthNAuthenticatorMakeCredential(",
             ),
             (
@@ -1395,7 +1400,11 @@ mod tests {
     fn assert_backend_wiring(source: &str) {
         // Normalize checkout line endings only; preserve every statement and space.
         let source = source.replace("\r\n", "\n");
-        let constructor = contract_section(&source, "pub fn new(hwnd:", "fn hwnd(");
+        let constructor = contract_section(
+            &source,
+            "pub fn new(hwnd:",
+            "fn require_platform_available(",
+        );
         let capability = contract_position(constructor, "capability_record(", "CAPABILITY_PRESENT");
         let guard = contract_position(
             constructor,
@@ -1410,7 +1419,7 @@ mod tests {
         for (start, end, ffi) in [
             (
                 "fn make_credential_with_diagnostics(",
-                "fn get_hmac_secret(",
+                "fn make_platform_credential(",
                 "WebAuthNAuthenticatorMakeCredential(",
             ),
             (
@@ -1431,11 +1440,21 @@ mod tests {
             assert_eq!(gap.trim(), ";\n        if let Some(monitor) = focus_monitor.as_ref() {\n            monitor.arm();\n        }\n        let hr = unsafe {");
         }
         assert!(
-            source.contains("diagnose(\n            Operation::MakeCredential"),
+            contract_section(
+                &source,
+                "    fn make_credential(",
+                "    fn make_credential_with_diagnostics("
+            )
+            .contains("diagnose(\n            Operation::MakeCredential"),
             "CONTRACT:MAKE_OPERATION_WRAPPER"
         );
         assert!(
-            source.contains("diagnose(\n            Operation::GetAssertion"),
+            contract_section(
+                &source,
+                "    fn get_hmac_secret_for_any(",
+                "    fn get_platform_secret("
+            )
+            .contains("diagnose(\n            Operation::GetAssertion"),
             "CONTRACT:GET_OPERATION_WRAPPER"
         );
     }
