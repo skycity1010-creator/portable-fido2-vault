@@ -170,7 +170,7 @@ v1 不變，`KeySlot` 新增：
 - [x] D2（2026-10-12，見 §11 D2）
 - [x] D3（2026-10-13，FFI、兩位 completed-code reviewer、本機驗證完成；見 §11 D3）
 - [x] D4（2026-10-13，本機實作／兩位 completed-code review 完成；Hosted CI 結果以 §11 D4 的發布 receipt／Kanban 為準）
-- [ ] D5
+- [x] D5（2026-10-13，本機 IPC／兩位 completed-code review／回歸及建置完成；Hosted CI 以 §11 D5 的發布 receipt／Kanban 為準）
 - [ ] D6
 - [ ] D7
 - [ ] D8
@@ -291,3 +291,31 @@ v1 不變，`KeySlot` 新增：
 - Native `Internal` 契約仍無法細分取消與未 typed 原生拒絕，因此保守不記已證實 auth failure；沒有新增取消 variant 或修改 FFI。原有 PRE-S1／PRE-S2 shared native assertion 問題未修，caller zeroization 不等同 native memory wiping 或編譯器暫存器擦除證據。
 - Post-create RP-list proof 失敗不可盲刪不明 credential；best-effort delete 也可能失敗，因此可能有 Windows credential 殘留。D6 應呈現消歧 label、typed 手動清理警告及 proof-failure 殘留提示；D9 補原生 roaming 拒收 platform IDs、取消 sidecar 空及 Console V1–V9 實機回歸。這些是交接，不是已開始 D6／D9 或已報物理 PASS。
 - 證據：`D:\project\_archives\portable-fido2-vault\wh-d4-review-20261013-R5\`；完整 TDD／suite 原始 logs：`D:\scratch\wh-d4-20261013\`。本項收尾後停止，等待使用者下一項指示。
+
+### D5（2026-10-13）Windows Hello IPC 與 Console／edition 守門
+
+- **範圍：** production 只有 `src-tauri/src/lib.rs`，source commit `e100881`；新增並真正註冊 `platform_status`、`register_windows_hello`、`login_windows_hello`。不接受 frontend 指定 edition、attachment、computer name、PRF 或 Hello credential；未修改 UI／KeyInfo、Vault／FFI／crypto、Cargo／lock。D6–D9 未開始，未 merge／deploy／GUI／native WebAuthn／實體金鑰／使用者金庫操作。
+- **Status：** 安全回應只有 `api_ok`／`uvpa`／`console`／`local_credential`。single 版讀共用 checked persisted header，RP-local credential 與 slot IDs 交集包含 R3 lost marker；無金庫回 local false、discovery／header error 不冒充成功。query 無 prompt、解密或寫回；dual 在 backend 前拒絕。
+- **註冊／登入：** single／unlocked registration／fresh API+UVPA+Console 守門先於 window activation 與 mutating backend，活 HWND 經既有 helper 交給 backend，再呼叫 D4 API。電腦名稱由 Rust 讀 `COMPUTERNAME`，讀取失敗明確拒絕。Hello 完整認證、成功 persist、取得 entries、發布 unlocked Vault 與清 CSV／dual pending 在同一 state lock；失敗不發布或清 pending。主密碼 single path 接入 D4 authenticated R3 save，dual 仍沿既有 password path。
+- **移除：** single 接入 D4 persist→fresh RP membership→best-effort delete，回安全 typed `removed`／`manual_removal_required`＋`not_local`／`discovery_failed`／`delete_failed`；dual 與已確認 roaming 的 JSON `null` 回應保留。D6 才呈現 cleanup warning，現有 UI 忽略回傳值的相容性已靜態核對，未宣稱警告畫面完成。
+
+#### TDD、完成程式碼審查與測試修補
+
+- 原 writer 6 組 assertion RED→GREEN、13 GREEN→GREEN controls；parent 核實每組來源 snapshot、log、exit code、精確 test name／正整數執行數。首次 compile／fixture-oracle 失敗保留，不列為 production RED。Claude Code 首次 API 429 `usage_limit_reached` 未執行且來源未變，改用 per-run `gpt-6.1-sol/openai-codex` Hermes CLI，未修改持久 configuration，未使用 Codex CLI。
+- **R1 Reviewer 拒絕原 verdict 保留：** D5-T1 fixture 硬編碼作者 D: 路徑；D5-T2 `remove_key` wiring oracle 匹配自身測試字串、漏看 production body。兩項各有 parent 直接 assertion RED exit101／1 failed→GREEN exit0／1 passed。測試改為非空 TMPDIR／OS temp root、原子 `create_dir`（不採納 existing dir）與 scoped owner cleanup；wiring oracle 限 production prefix、匹配真實多行宣告、拒絕缺少／重複宣告，負向 string fixture 真正移除第一個 production helper call 後 oracle 必須拒絕。production prefix 對 R1 byte-identical。
+- **最終 R2：** 共 21 新 D5 tests；原 6＋parent 2 組直接 RED→GREEN及13 controls。C: Hermes 指定 scratch 作 TMPDIR，兩 features 各 **21/21**，執行後 fixture root 為空。證明可配置與 scoped cleanup，不宣稱已在實體只有 C: 的電腦上測試。
+- Reviewer 與 Officer 皆 `passed=true`／`coverage_complete=true`，security／logic／test arrays 空；manifest SHA256 `ba9822500c6c6a0a370f89b4941b797302bafaa6a0ca5523e6b6c6166d3ec8fb`。Parent 核196檔 hashes與兩位完整 raw verdict；Officer 經既有授權 SSH/scp 取得 bundle，獨立核 source receipt，首次 A2A timeout 不當作拒絕或完成。Parent 另核 Reviewer 實際 numbered read stream：1191-line full patch、192-line delta、1137 added source lines 全讀，與 frozen source 逐行相符；不是只信 coverage 自述。
+
+#### Parent 自動驗證、建置與發布 gate
+
+- 只在 R2 review gate 通過後執行長驗證。MSVC lib suites：`real-ctap` **427/427**，`real-ctap,dual-control` **427/427**；Node **108/108**；既有 mock Gate **20/20**、dual Gate **25/25**（MSVC mock CLI、合成 fixtures，非 D7 Hello 新 Gate／非硬體結果）。`node --check`／`rustfmt --check`／`git diff --check` 通過；test／mock CLI compile 無 warning。
+- GNU locked/offline Release single `--features real-ctap --bin portable-fido-vault` 與 dual `--features real-ctap,dual-control --bin portable-fido-vault-dual` 均成功；各保留既有 `MonitorTerminal::try_lock` dead_code warning，PE imports 為 x64。single EXE SHA256 `220d9c1c7a8381c5e7732aed8bbd67d1e2c9512507288173f93323b91db75953`（7,312,896 bytes）；dual `19a8d979088571181a0557b78489f154da5031179f54cbe7e4333358c74629d2`（7,322,624 bytes）。兩者 **NOT-DEPLOYABLE**，UI 尚未接線且 D9 物理驗收未做。
+- Tests／Release 使用分離且 hash-verified source mirrors；writer／test mirror196檔前後一致。Build mirror 僅 Tauri 自動生成的兩份 schema 變動，reviewed runtime source 不變。發布 commit 的 Git blob provenance 由 parent 另核。
+- PR #30 保持 OPEN Draft，功能卡 `t_01329074` 保持 blocked／parent-controlled。Hosted **exact-head／current-integration CI** 在發布後讀回 run、jobs、named steps 與完整 logs；**未讀回前不宣稱 D5 收尾完成**。最終 CI、tested merge parents、counts 與收尾結論以 `ci-final-receipt.json`／`D5-final-closeout-receipt.json` 及 Kanban 收尾留言為準。
+
+#### 保留限制與 D6 交接
+
+- Mock Console／HWND seam 不是物理 Windows Hello、提示前景或 GUI event-loop scheduling／deadlock 驗證；D9 補 Console V1–V9。`platform_status` 在 unlocked session 重讀 checked persisted `v.path`，外部檔案變更仍可能使 query 與 session header 不同。
+- D6 需接入 status／登入／註冊元素、platform 標示及 typed cleanup warning／proof-failure 殘留提示；KeyInfo 本次未擴充。D4 best-effort R3 discovery／credential cleanup 的限制不變；source-text oracle 是 frozen source 格式的文字檢查，不是 AST 或任意 source mutation 的語意保證；scoped cleanup 為 best effort，不保證所有 OS／權限／open-handle 情境都無殘留。
+- PRE-L1 既有 roaming／dual two-lock publication race、PRE-S1／PRE-S2 shared native assertion version／PRF wipe 問題未修，另案處理；不因本次 Hello single-lock publish 或 caller zeroization 宣稱已修。
+- 原 R1 拒絕與 R2 verdict／全部限制保留。證據：`D:\project\_archives\portable-fido2-vault\wh-d5-review-20261013-R2\`；完整原始 TDD／suite／build logs：`D:\scratch\wh-d5-20261013\`。D5 收尾後停止，等待使用者下一項指示。
