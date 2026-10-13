@@ -168,7 +168,7 @@ v1 不變，`KeySlot` 新增：
 - [x] 設計文件
 - [x] D1（2026-10-12，見 §11 D1）
 - [x] D2（2026-10-12，見 §11 D2）
-- [ ] D3
+- [x] D3（2026-10-13，FFI、兩位 completed-code reviewer、本機驗證完成；見 §11 D3）
 - [ ] D4
 - [ ] D5
 - [ ] D6
@@ -231,3 +231,34 @@ v1 不變，`KeySlot` 新增：
 - 格式：兩檔在 base 為 rustfmt 乾淨，整檔格式化後 diff 只有新增行（538 行）。
 - D2 不含 FFI／金鑰派生：未派 reviewer（D3 FFI 才派兩位）；未做 Release 建置。
 - 證據目錄：`D:\scratch\windows-hello-single-20261012\d2\`。
+
+### D3（2026-10-13）Windows Hello 平台 FFI 與審查修補
+
+- **範圍：** `windows_webauthn.rs`、`webauthn_diagnostics.rs`；D4 的 Vault 流程、D5 IPC、D6 UI 與 D9 實機操作尚未開始。本項不是 Windows Hello 端到端登入驗收。
+- API v8、UVPA 與有效本機 Active Console 守門；平台 MakeCredential 使用 PLATFORM、UV REQUIRED、resident key、ES256／RS256 與固定 raw PRF salt。以 v8 options 擴充及 v7 attestation prefix 讀取 creation PRF；platform assertion 保留 allow-list membership 與 32-byte output 守門。
+- 平台 credential list 限定 `fido-vault.local`、筆數／累計大小／指標與長度；僅 `NTE_NOT_FOUND` 轉空清單，其餘失敗不冒充空清單。delete 原生 API 無 RP 參數，本 RP／本機 membership 的端到端守門屬 D4 caller，未宣稱已完成。
+- 指定 HRESULT 轉 closed typed errors；新增診斷僅含白名單分類、布林值與長度，不輸出 PRF／credential bytes。建立後解析失敗由 `PendingPlatformCredential` best-effort 清理當次 credential；返回後的二次斷言、PRF 相等比對、wrap／寫檔失敗清理留 D4。
+
+#### Completed-code review 與修補
+
+1. 原始 Reviewer 與 Officer 獨立確認 D3-S1（原生 creation PRF 只 free、未顯式 wipe）及 D3-L1（平台沿用 active monitor，與 passive 設計不符）。原始拒絕 verdict 保留，不以建置成功代替審查。
+2. 平台專用 `PlatformAttestationGuard` 在 native return 後立即取得配置，涵蓋成功與 early-error 路徑；已知 v7／v8 中 first／second output 各自以非 NULL、恰 32 bytes 守門，zeroize 後 free 一次。roaming `AttestationGuard` 不變。
+3. `ForegroundMonitorPolicy::ObservationOnly` 沿 prepare／worker／observe 真正接線；平台 worker activation count 為 0，roaming active control 維持 1；既有 owner preflight 與最後前景採樣到 FFI 的無 blocking／logging gap 保留。
+4. 第一輪複審：Officer 通過，Reviewer 拒絕 parser 接受 v9+、cleanup 只認 v7／v8 的不對稱。parent 先跑 1 個 assertion RED，再以共用 `platform_attestation_version_supported` 統一兩者接受域。v9／`u32::MAX` 在讀 flags／extension 前 fail closed，dangling extension fixture 不被讀取；v7／v8 正向與 error／first／second 控制保留。
+5. 最終 candidate2 的 Reviewer 與 Officer gate verdict 都為 `passed=true`、`coverage_complete=true`、`security_concerns=[]`、`logic_errors=[]`，manifest SHA256 `41975a277771c0715120f41e4a03c13ee98009917a34e78237da600c9532bc13`。Officer 原非 blocking 分類與後續 gate 分類兩檔並存，技術限制未刪除。
+6. Parent 另核對 Reviewer 實際 numbered read stream：兩份完整 D3／followup patch 與增量 patch 全讀；最終 changed regions 無漏讀，讀取內容與快照逐行相符。不是只依 `coverage_complete` 自述。
+
+#### ABI 與自動驗證
+
+- 官方 `microsoft/webauthn` header 固定 commit `0ef86c2fe31e5b0608cc4fce4820935bd644cabb`，SHA256 `da82d5be6b90a2706185ae44ad93649bcefc0f89c97ab930ec4e6f0abb7b2283`；官方 C++ checker 對照實際 Rust emitter 的 65 筆 field offset／field size、7 筆 structure size，72 列一致。僅 x64 layout／contract 證據，不是硬體結果。
+- Writer 保留 4 組 assertion RED→GREEN；parent 追加上述 unknown-version RED→GREEN。compile／fixture setup failure 另留紀錄，不計為 RED。
+- Parent 重新執行：`real-ctap` **365/365**、`real-ctap,dual-control` **365/365**，0 failed、0 test-compile warning；Node **108/108**；`node --check`、`git diff --check` 通過，來源 hash-lock 前後一致。
+- GNU Release 單人版 `--features real-ctap` 建置成功，EXE SHA256 `c35bb922cf88b6071882df03402a01753d4914c2f9c09960e3c921256fc03a5b`、7,257,088 bytes；保留既有 `MonitorTerminal::try_lock` dead_code warning。產物標為 **NOT-DEPLOYABLE**，沒有 staging／launch／實機 WebAuthn。建置使用獨立 source mirror，僅 Tauri 自動生成的兩份 schema 有變動；runtime source 與 reviewed snapshot 一致。初始重疊建置已停止並保存 SUPERSEDED 紀錄，不列為成功證據。
+- Hosted exact-head／current-integration CI 由 parent 在發布後讀回 run、jobs、named steps 與完整 logs；結果及測試 checkout parents 以 Kanban 收尾留言與 `ci-final-receipt.json` 為準，不以 D2 的舊綠燈代替。
+
+#### 保留限制與 D4 交接
+
+- Native buffers 的有效性／可寫性依賴可信 Windows API 契約；NULL、未知版本及非法長度守門不代表任意 dangling pointer 都安全。未知未來 attestation 版本刻意 fail closed，支援新版本須以官方證據同步擴充 parser 與 cleanup。
+- 既有 shared assertion response-version／原生 PRF wipe／普通陣列回傳問題保留為 PRE-S1／PRE-S2，未擴大重構 roaming 範圍、未宣稱已修。ObservationOnly 的 candidate-foreground publication 沒有平台 downstream handoff 效果；foreground-to-FFI 仍非 OS 原子操作。
+- D4 需補建立後斷言比對、失敗清理、slot persistence、edition 守門與刪除前 membership。D4–D9 仍未勾選；本項完成後停止，等待使用者下一項指示。
+- 證據：`D:\project\_archives\portable-fido2-vault\wh-d3-followup-20261013-085634\`。原始快照另保存在 `wh-d3-review-20261013-081309`，兩者均不改寫歷史 verdict。
