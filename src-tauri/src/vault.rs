@@ -104,6 +104,21 @@ impl From<CryptoError> for VaultError {
     }
 }
 
+/// Cleanup never rolls back a successfully persisted slot removal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlatformCleanupOutcome {
+    NotApplicable,
+    Removed,
+    ManualRemovalRequired(PlatformCleanupWarning),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlatformCleanupWarning {
+    NotLocal,
+    DiscoveryFailed,
+    DeleteFailed,
+}
+
 // ─────────────────────────── 資料模型 ───────────────────────────
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -897,17 +912,39 @@ impl Vault {
         Self::open_password_with_edition(path, password, Edition::Single)
     }
 
+    /// Backend-aware password seam for R3; the original password API stays intact.
+    pub fn open_password_with_platform(
+        path: &Path,
+        password: &str,
+        edition: Edition,
+        backend: &mut (dyn FidoBackend + 'static),
+    ) -> Result<Self, VaultError> {
+        Self::open_password_with_optional_platform(path, password, edition, Some(backend))
+    }
+
     fn open_password_with_edition(
         path: &Path,
         password: &str,
         edition: Edition,
+    ) -> Result<Self, VaultError> {
+        Self::open_password_with_optional_platform(path, password, edition, None)
+    }
+
+    fn open_password_with_optional_platform(
+        path: &Path,
+        password: &str,
+        edition: Edition,
+        backend: Option<&mut (dyn FidoBackend + 'static)>,
     ) -> Result<Self, VaultError> {
         // 雙群組控管版的主密碼登入是 break-glass，稽核 method 與一般登入區分。
         let method = match edition {
             Edition::Single => "password",
             Edition::Dual => "password-breakglass",
         };
-        let (header, payload) = Self::read_file(path, edition)?;
+        let (mut header, payload) = Self::read_file(path, edition)?;
+        if let Some(backend) = backend {
+            classify_platform_best_effort(&mut header, backend)?;
+        }
         let salt = base64_decode(&header.argon2.salt)
             .map_err(|_| VaultError::Format("argon2 salt 解碼失敗".into()))?;
         let k = argon2id_derive(password.as_bytes(), &salt).map_err(VaultError::Crypto)?;
@@ -928,6 +965,77 @@ impl Vault {
         }
     }
 
+    /// Platform login is edition-explicit and never uses edition::current().
+    pub fn open_windows_hello(
+        path: &Path,
+        backend: &mut (dyn FidoBackend + 'static),
+        edition: Edition,
+    ) -> Result<Self, VaultError> {
+        let (mut header, payload) = Self::read_file(path, edition)?;
+        if edition != Edition::Single {
+            return Err(VaultError::Format("Windows Hello 僅支援單人版".into()));
+        }
+        if !backend.platform_status().available() {
+            return Err(
+                FidoError::NotSupported(crate::fido2::PLATFORM_UNSUPPORTED_MSG.into()).into(),
+            );
+        }
+        let local = backend.list_platform_credentials()?;
+        classify_local_platform_slots(&mut header, &local)?;
+        let slots: Vec<&KeySlot> = header
+            .key_slots
+            .iter()
+            .filter(|slot| slot.authenticator == Some(SlotAuthenticator::Platform))
+            .collect();
+        let ids = decode_credential_ids(&slots)?
+            .into_iter()
+            .filter(|id| local.contains(id))
+            .collect::<Vec<_>>();
+        if ids.is_empty() {
+            return Err(FidoError::PlatformCredentialMissing.into());
+        }
+        let failure_label = slots
+            .iter()
+            .find(|slot| base64_decode(&slot.credential_id).is_ok_and(|id| ids.contains(&id)))
+            .ok_or(FidoError::PlatformCredentialMissing)?
+            .label
+            .clone();
+        let (selected, mut raw) = match backend.get_platform_prf_secret(&ids) {
+            Ok(result) => result,
+            Err(error) => {
+                // Only a typed authentication rejection is evidence of a failed
+                // login. Native cancellation and other opaque HRESULTs arrive as
+                // Internal in the existing backend; never infer auth failure (or
+                // cancellation) by parsing its human-readable error string.
+                if matches!(error, FidoError::PinRejected) {
+                    record_login_failure(path, &format!("windows-hello:{failure_label}"))?;
+                }
+                return Err(error.into());
+            }
+        };
+        let secret = Zeroizing::new(raw);
+        raw.zeroize();
+        if !ids.contains(&selected) {
+            let fallback = slots
+                .iter()
+                .find(|slot| base64_decode(&slot.credential_id).is_ok_and(|id| ids.contains(&id)))
+                .ok_or(FidoError::PlatformCredentialMissing)?;
+            record_login_failure(path, &format!("windows-hello:{}", fallback.label))?;
+            return Err(FidoError::PlatformCredentialMissing.into());
+        }
+        let selected_b64 = base64_encode(&selected);
+        let slot = header
+            .key_slots
+            .iter()
+            .find(|slot| {
+                slot.credential_id == selected_b64
+                    && slot.authenticator == Some(SlotAuthenticator::Platform)
+            })
+            .ok_or(FidoError::PlatformCredentialMissing)?
+            .clone();
+        Self::open_with_key_secret(path, header, payload, slot, secret)
+    }
+
     /// FIDO2 金鑰登入（credential_id_b64 須為 header.key_slots 之一）。
     pub fn open_key(
         path: &Path,
@@ -935,18 +1043,21 @@ impl Vault {
         pin: Option<&str>,
         backend: &mut (dyn FidoBackend + 'static),
     ) -> Result<Self, VaultError> {
-        let (header, payload) = Self::read_file(path, Edition::Single)?;
+        let (mut header, payload) = Self::read_file(path, Edition::Single)?;
+        classify_platform_best_effort(&mut header, backend)?;
         let slot = header
             .key_slots
             .iter()
-            .find(|s| s.credential_id == credential_id_b64)
+            .find(|s| s.credential_id == credential_id_b64 && s.authenticator.is_none())
             .ok_or(VaultError::Fido(FidoError::NoDevice))?
             .clone();
 
         let cred_id = base64_decode(&slot.credential_id)
             .map_err(|_| VaultError::Format("credential_id 解碼失敗".into()))?;
         // PinRequired → 尚未真正嘗試，不記失敗（使用者只是還沒提供 PIN）。
-        let secret = backend.get_prf_secret(&cred_id, pin)?;
+        let mut raw = backend.get_prf_secret(&cred_id, pin)?;
+        let secret = Zeroizing::new(raw);
+        raw.zeroize();
         Self::open_with_key_secret(path, header, payload, slot, secret)
     }
 
@@ -956,10 +1067,12 @@ impl Vault {
         pin: Option<&str>,
         backend: &mut (dyn FidoBackend + 'static),
     ) -> Result<Self, VaultError> {
-        let (header, payload) = Self::read_file(path, Edition::Single)?;
+        let (mut header, payload) = Self::read_file(path, Edition::Single)?;
+        classify_platform_best_effort(&mut header, backend)?;
         let credential_ids = header
             .key_slots
             .iter()
+            .filter(|slot| slot.authenticator.is_none())
             .map(|slot| {
                 base64_decode(&slot.credential_id)
                     .map_err(|_| VaultError::Format("credential_id 解碼失敗".into()))
@@ -969,7 +1082,15 @@ impl Vault {
             return Err(VaultError::Fido(FidoError::NoDevice));
         }
 
-        let (selected_id, secret) = backend.get_prf_secret_for_any(&credential_ids, pin)?;
+        let (selected_id, mut raw) = backend.get_prf_secret_for_any(&credential_ids, pin)?;
+        let secret = Zeroizing::new(raw);
+        raw.zeroize();
+        if !credential_ids.contains(&selected_id) {
+            return Err(FidoError::Internal(
+                "backend selected a credential outside the roaming allow-list".into(),
+            )
+            .into());
+        }
         let selected_id_b64 = base64_encode(&selected_id);
         let slot = header
             .key_slots
@@ -989,27 +1110,26 @@ impl Vault {
         header: Header,
         payload: EncryptedPayload,
         slot: KeySlot,
-        secret: [u8; 32],
+        secret: Zeroizing<[u8; 32]>,
     ) -> Result<Self, VaultError> {
-        let k = kek_from_prf_secret(&secret);
+        let k = Zeroizing::new(kek_from_prf_secret(&secret));
+        let method = if slot.authenticator == Some(SlotAuthenticator::Platform) {
+            format!("windows-hello:{}", slot.label)
+        } else {
+            format!("fido2:{}", slot.label)
+        };
         let nonce = slot_nonce(&slot.nonce)?;
         let ct =
             base64_decode(&slot.ct).map_err(|_| VaultError::Format("key slot 解碼失敗".into()))?;
 
-        match aes_gcm_decrypt(&k, &nonce, &ct) {
+        match aes_gcm_decrypt(&k, &nonce, &ct).map(Zeroizing::new) {
             Ok(kek_bytes) if kek_bytes.len() == 32 => {
-                let mut kek = [0u8; 32];
+                let mut kek = Zeroizing::new([0u8; 32]);
                 kek.copy_from_slice(&kek_bytes);
-                Self::unlock(
-                    path,
-                    header,
-                    payload,
-                    Zeroizing::new(kek),
-                    &format!("fido2:{}", slot.label),
-                )
+                Self::unlock(path, header, payload, kek, &method)
             }
             _ => {
-                record_login_failure(path, &format!("fido2:{}", slot.label))?;
+                record_login_failure(path, &method)?;
                 Err(VaultError::Crypto(CryptoError::DecryptFailed))
             }
         }
@@ -1106,6 +1226,20 @@ impl Vault {
     /// 只讀 header（不需 KEK），供登入畫面列出金鑰；同樣先檢查版本。
     pub fn read_header(path: &Path, edition: Edition) -> Result<Header, VaultError> {
         Self::read_file(path, edition).map(|(header, _)| header)
+    }
+
+    /// Read-only R3 classification seam; errors remain visible to its caller.
+    pub fn read_header_with_platform(
+        path: &Path,
+        edition: Edition,
+        backend: &mut (dyn FidoBackend + 'static),
+    ) -> Result<Header, VaultError> {
+        let mut header = Self::read_header(path, edition)?;
+        if edition == Edition::Single && backend.platform_status().available() {
+            let local = backend.list_platform_credentials()?;
+            classify_local_platform_slots(&mut header, &local)?;
+        }
+        Ok(header)
     }
 
     fn decrypt_payload(
@@ -1413,6 +1547,135 @@ impl Vault {
         Ok(())
     }
 
+    /// Windows Hello registration; caller supplies the local computer name.
+    pub fn register_windows_hello(
+        &mut self,
+        backend: &mut (dyn FidoBackend + 'static),
+        computer_name: &str,
+        edition: Edition,
+    ) -> Result<RegisteredCredential, VaultError> {
+        check_header_edition(&self.header, edition)?;
+        if edition != Edition::Single {
+            return Err(VaultError::Format("Windows Hello 僅支援單人版".into()));
+        }
+        let computer_name = validate_key_label(computer_name, &[])?;
+        let candidate = format!("Windows Hello（本機 {computer_name}）");
+        validate_key_label(&candidate, &[])?;
+        if !backend.platform_status().available() {
+            return Err(
+                FidoError::NotSupported(crate::fido2::PLATFORM_UNSUPPORTED_MSG.into()).into(),
+            );
+        }
+        let local_before = backend.list_platform_credentials()?;
+        let mut classified_header = self.header.clone();
+        classify_local_platform_slots(&mut classified_header, &local_before)?;
+        let slots: Vec<&KeySlot> = classified_header
+            .key_slots
+            .iter()
+            .filter(|slot| slot.authenticator == Some(SlotAuthenticator::Platform))
+            .collect();
+        let exclude = decode_credential_ids(&slots)?;
+        if exclude.iter().any(|id| local_before.contains(id)) {
+            return Err(FidoError::PlatformCredentialExists.into());
+        }
+        // Display names are not machine/account identities. RP-local membership
+        // above owns the duplicate decision; disambiguate identical computer names.
+        let label = match self.validate_new_key_label(&candidate) {
+            Ok(label) => label,
+            Err(_) => {
+                let existing = self
+                    .header
+                    .key_slots
+                    .iter()
+                    .map(|s| s.label.as_str())
+                    .collect::<Vec<_>>();
+                (2..=existing.len().saturating_add(2))
+                    .find_map(|suffix| {
+                        let suffix_text = format!(" {suffix}");
+                        let budget = MAX_KEY_LABEL_CHARS
+                            - "Windows Hello（本機 ）".chars().count()
+                            - suffix_text.chars().count();
+                        let shortened: String = computer_name.chars().take(budget).collect();
+                        let label = format!("Windows Hello（本機 {shortened}）{suffix_text}");
+                        validate_key_label(&label, &existing).ok()
+                    })
+                    .ok_or_else(|| VaultError::Format("無法產生唯一的 Windows Hello 名稱".into()))?
+            }
+        };
+        let registration = backend.register_platform_credential(&label, &exclude)?;
+        let reg = registration.credential;
+        let all = decode_credential_ids(&self.header.key_slots.iter().collect::<Vec<_>>())?;
+        if reg.credential_id.is_empty()
+            || all.contains(&reg.credential_id)
+            || local_before.contains(&reg.credential_id)
+        {
+            // An existing ID is not evidence of a newly-created credential; never delete it.
+            return Err(FidoError::PlatformCredentialExists.into());
+        }
+        // The RP-scoped local list must prove ownership before assertion or cleanup.
+        if !backend
+            .list_platform_credentials()?
+            .contains(&reg.credential_id)
+        {
+            return Err(FidoError::PlatformCredentialMissing.into());
+        }
+        let (selected, mut raw) =
+            match backend.get_platform_prf_secret(&[reg.credential_id.clone()]) {
+                Ok(result) => result,
+                Err(error) => {
+                    let _ = backend.delete_platform_credential(&reg.credential_id);
+                    return Err(error.into());
+                }
+            };
+        let secret = Zeroizing::new(raw);
+        raw.zeroize();
+        if selected != reg.credential_id {
+            let _ = backend.delete_platform_credential(&reg.credential_id);
+            return Err(FidoError::PlatformCredentialMissing.into());
+        }
+        // CtOutput's PartialEq uses the digest crate's constant-time equality.
+        // Use the existing hmac re-export (no new direct dependency); wipe both copies.
+        let creation =
+            hmac::digest::CtOutput::<sha2::Sha256>::new((*registration.creation_prf).into());
+        let assertion = hmac::digest::CtOutput::<sha2::Sha256>::new((*secret).into());
+        let matches = creation == assertion;
+        creation.into_bytes().as_mut_slice().zeroize();
+        assertion.into_bytes().as_mut_slice().zeroize();
+        if !matches {
+            let _ = backend.delete_platform_credential(&reg.credential_id);
+            return Err(FidoError::PlatformPrfUnsupported.into());
+        }
+        let wrap = Zeroizing::new(kek_from_prf_secret(&secret));
+        let nonce = random_nonce();
+        let ct = aes_gcm_encrypt(&wrap, &nonce, self.kek.as_slice());
+        let previous_header = self.header.clone();
+        let previous_audit = self.data.audit.clone();
+        self.header.key_slots.push(KeySlot {
+            credential_id: base64_encode(&reg.credential_id),
+            aaguid: hex32_16(reg.aaguid),
+            label,
+            key_type: KeyKind::WindowsManaged,
+            group: None,
+            authenticator: Some(SlotAuthenticator::Platform),
+            nonce: base64_encode(&nonce),
+            ct: base64_encode(&ct),
+        });
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(&reg.credential_id);
+        let fingerprint = hex32(&digest[..4]);
+        if let Err(error) = self.record(
+            "key_registered",
+            &format!("register_key:windows-hello:{fingerprint}"),
+            "type=WindowsManaged",
+        ) {
+            self.header = previous_header;
+            self.data.audit = previous_audit;
+            let _ = backend.delete_platform_credential(&reg.credential_id);
+            return Err(error);
+        }
+        Ok(reg)
+    }
+
     // ── FIDO2 金鑰管理（需已解鎖）──
 
     /// 偵測 + 註冊新金鑰：以目前 KEK 包出新槽位。
@@ -1598,14 +1861,96 @@ impl Vault {
             return Err(VaultError::LastKeyInGroup(group));
         }
         let label = self.header.key_slots[idx].label.clone();
+        let method =
+            if self.header.key_slots[idx].authenticator == Some(SlotAuthenticator::Platform) {
+                format!("windows-hello:{label}")
+            } else {
+                format!("fido2:{label}")
+            };
         let group = self.header.key_slots[idx].group;
         self.header.key_slots.remove(idx);
         let detail = match group {
             Some(group) => format!("金鑰槽已移除（該金鑰無法再解鎖） group={}", group.as_str()),
             None => "金鑰槽已移除（該金鑰無法再解鎖）".to_owned(),
         };
-        self.record("key_removed", &format!("fido2:{label}"), &detail)?;
+        self.record("key_removed", &method, &detail)?;
         Ok(())
+    }
+
+    /// Backend-aware removal; existing remove_key remains available.
+    pub fn remove_key_with_platform(
+        &mut self,
+        credential_id_b64: &str,
+        backend: &mut (dyn FidoBackend + 'static),
+        edition: Edition,
+    ) -> Result<PlatformCleanupOutcome, VaultError> {
+        check_header_edition(&self.header, edition)?;
+        if edition != Edition::Single {
+            return Err(VaultError::Format("Windows Hello 僅支援單人版".into()));
+        }
+        let mut classified_header = self.header.clone();
+        let discovery_failed = if backend.platform_status().available() {
+            match backend.list_platform_credentials() {
+                Ok(local) => {
+                    classify_local_platform_slots(&mut classified_header, &local)?;
+                    false
+                }
+                Err(_) => true,
+            }
+        } else {
+            // Without discovery, an unmarked slot may be a marker-lost platform
+            // credential; removal succeeds but must warn about possible residue.
+            true
+        };
+        let slot = classified_header
+            .key_slots
+            .iter()
+            .find(|slot| slot.credential_id == credential_id_b64)
+            .ok_or(FidoError::NoDevice)?
+            .clone();
+        let id = base64_decode(&slot.credential_id)
+            .map_err(|_| VaultError::Format("credential_id 解碼失敗".into()))?;
+        let previous_header = std::mem::replace(&mut self.header, classified_header);
+        let previous_audit = self.data.audit.clone();
+        if let Err(error) = self.remove_key(credential_id_b64) {
+            self.header = previous_header;
+            self.data.audit = previous_audit;
+            return Err(error);
+        }
+        if slot.authenticator != Some(SlotAuthenticator::Platform) {
+            return Ok(if discovery_failed {
+                PlatformCleanupOutcome::ManualRemovalRequired(
+                    PlatformCleanupWarning::DiscoveryFailed,
+                )
+            } else {
+                PlatformCleanupOutcome::NotApplicable
+            });
+        }
+        // Native delete has no RP argument: fresh RP-scoped membership is mandatory.
+        if !backend.platform_status().available() {
+            return Ok(PlatformCleanupOutcome::ManualRemovalRequired(
+                PlatformCleanupWarning::DiscoveryFailed,
+            ));
+        }
+        let local = match backend.list_platform_credentials() {
+            Ok(local) => local,
+            Err(_) => {
+                return Ok(PlatformCleanupOutcome::ManualRemovalRequired(
+                    PlatformCleanupWarning::DiscoveryFailed,
+                ))
+            }
+        };
+        if !local.contains(&id) {
+            return Ok(PlatformCleanupOutcome::ManualRemovalRequired(
+                PlatformCleanupWarning::NotLocal,
+            ));
+        }
+        match backend.delete_platform_credential(&id) {
+            Ok(()) => Ok(PlatformCleanupOutcome::Removed),
+            Err(_) => Ok(PlatformCleanupOutcome::ManualRemovalRequired(
+                PlatformCleanupWarning::DeleteFailed,
+            )),
+        }
     }
 
     // ── 上鎖 ──
@@ -1626,6 +1971,36 @@ impl Vault {
 }
 
 // ─────────────────────────── 輔助 ───────────────────────────
+
+/// Classify only verified RP-scoped local IDs, never labels/AAGUID/prefixes.
+fn classify_local_platform_slots(header: &mut Header, local: &[Vec<u8>]) -> Result<(), VaultError> {
+    if edition_of(header) != Edition::Single {
+        return Ok(());
+    }
+    // Decode before mutating so malformed metadata cannot leave a partial repair.
+    let ids = decode_credential_ids(&header.key_slots.iter().collect::<Vec<_>>())?;
+    for (slot, id) in header.key_slots.iter_mut().zip(ids) {
+        if slot.authenticator.is_none() && local.contains(&id) {
+            slot.authenticator = Some(SlotAuthenticator::Platform);
+        }
+    }
+    Ok(())
+}
+
+/// Legacy password/roaming remain usable if platform discovery is unavailable.
+/// A list error is NOT an empty list: skip R3 repair, retain explicit markers.
+/// read_header_with_platform exposes the error to callers needing strict discovery.
+fn classify_platform_best_effort(
+    header: &mut Header,
+    backend: &mut (dyn FidoBackend + 'static),
+) -> Result<(), VaultError> {
+    if edition_of(header) == Edition::Single && backend.platform_status().available() {
+        if let Ok(local) = backend.list_platform_credentials() {
+            classify_local_platform_slots(header, &local)?;
+        }
+    }
+    Ok(())
+}
 
 fn random_bytes(n: usize) -> Vec<u8> {
     let mut b = vec![0u8; n];
@@ -1695,6 +2070,1311 @@ mod tests {
     use super::*;
     use crate::fido2::{FidoBackend, FidoError, KeyKind, MockBackend};
     use std::env;
+
+    // Recording/malicious mock only: never invokes native authenticator APIs.
+    struct WhBackend {
+        inner: MockBackend,
+        calls: std::cell::Cell<usize>,
+        available: bool,
+        list_error: bool,
+        delete_error: bool,
+        assertion_error: Option<FidoError>,
+        selected: Option<Vec<u8>>,
+        collision: Option<Vec<u8>>,
+        wrong_secret: bool,
+        allow: Vec<Vec<u8>>,
+        exclude: Vec<Vec<u8>>,
+        deleted: Vec<Vec<u8>>,
+        roaming: Vec<Vec<u8>>,
+        removal_path: Option<PathBuf>,
+        deletion_saw_persisted: bool,
+        scripted_lists: std::collections::VecDeque<Result<Vec<Vec<u8>>, FidoError>>,
+    }
+
+    impl WhBackend {
+        fn new() -> Self {
+            Self {
+                inner: MockBackend::new(),
+                calls: std::cell::Cell::new(0),
+                available: true,
+                list_error: false,
+                delete_error: false,
+                assertion_error: None,
+                selected: None,
+                collision: None,
+                wrong_secret: false,
+                allow: vec![],
+                exclude: vec![],
+                deleted: vec![],
+                roaming: vec![],
+                removal_path: None,
+                deletion_saw_persisted: false,
+                scripted_lists: std::collections::VecDeque::new(),
+            }
+        }
+        fn touch(&self) {
+            self.calls.set(self.calls.get() + 1);
+        }
+    }
+
+    impl FidoBackend for WhBackend {
+        fn detect(&mut self) -> Result<crate::fido2::DetectedKey, FidoError> {
+            self.touch();
+            self.inner.detect()
+        }
+        fn register_credential(
+            &mut self,
+            d: &crate::fido2::DetectedKey,
+            p: Option<&str>,
+        ) -> Result<RegisteredCredential, FidoError> {
+            self.touch();
+            self.inner.register_credential(d, p)
+        }
+        fn get_prf_secret(&mut self, id: &[u8], p: Option<&str>) -> Result<[u8; 32], FidoError> {
+            self.touch();
+            self.roaming = vec![id.to_vec()];
+            self.inner.get_prf_secret(id, p)
+        }
+        fn get_prf_secret_for_any(
+            &mut self,
+            ids: &[Vec<u8>],
+            p: Option<&str>,
+        ) -> Result<(Vec<u8>, [u8; 32]), FidoError> {
+            self.touch();
+            self.roaming = ids.to_vec();
+            if let Some(id) = &self.selected {
+                return Ok((id.clone(), MockBackend::prf_for_credential(id)));
+            }
+            self.inner.get_prf_secret_for_any(ids, p)
+        }
+        fn prf_supported(&self) -> bool {
+            true
+        }
+        fn platform_status(&self) -> crate::fido2::PlatformStatus {
+            self.touch();
+            crate::fido2::PlatformStatus {
+                api_ok: self.available,
+                uvpa: self.available,
+                console: self.available,
+            }
+        }
+        fn list_platform_credentials(&mut self) -> Result<Vec<Vec<u8>>, FidoError> {
+            self.touch();
+            if let Some(result) = self.scripted_lists.pop_front() {
+                return result;
+            }
+            if self.list_error {
+                return Err(FidoError::PlatformPrfUnsupported);
+            }
+            self.inner.list_platform_credentials()
+        }
+        fn register_platform_credential(
+            &mut self,
+            label: &str,
+            ids: &[Vec<u8>],
+        ) -> Result<crate::fido2::PlatformRegistration, FidoError> {
+            self.touch();
+            self.exclude = ids.to_vec();
+            if let Some(id) = &self.collision {
+                return Ok(crate::fido2::PlatformRegistration {
+                    credential: RegisteredCredential {
+                        credential_id: id.clone(),
+                        aaguid: [0; 16],
+                        label: label.into(),
+                        kind: KeyKind::WindowsManaged,
+                    },
+                    creation_prf: Zeroizing::new(MockBackend::prf_for_credential(id)),
+                });
+            }
+            self.inner.register_platform_credential(label, ids)
+        }
+        fn get_platform_prf_secret(
+            &mut self,
+            ids: &[Vec<u8>],
+        ) -> Result<(Vec<u8>, [u8; 32]), FidoError> {
+            self.touch();
+            self.allow = ids.to_vec();
+            if let Some(error) = self.assertion_error.take() {
+                return Err(error);
+            }
+            if let Some(id) = &self.selected {
+                // Deliberately return the requested PRF with a rogue selected ID.
+                return Ok((id.clone(), MockBackend::prf_for_credential(&ids[0])));
+            }
+            if self.wrong_secret {
+                return Ok((ids[0].clone(), [17; 32]));
+            }
+            self.inner.get_platform_prf_secret(ids)
+        }
+        fn delete_platform_credential(&mut self, id: &[u8]) -> Result<(), FidoError> {
+            self.touch();
+            self.deleted.push(id.to_vec());
+            if let Some(path) = &self.removal_path {
+                self.deletion_saw_persisted =
+                    Vault::read_header(path, Edition::Single).is_ok_and(|h| {
+                        h.key_slots
+                            .iter()
+                            .all(|slot| slot.credential_id != base64_encode(id))
+                    });
+            }
+            if self.delete_error {
+                return Err(FidoError::PlatformPrfUnsupported);
+            }
+            self.inner.delete_platform_credential(id)
+        }
+    }
+
+    fn wh_drop_platform_marker(v: &mut Vault) {
+        for slot in &mut v.header.key_slots {
+            slot.authenticator = None;
+        }
+        v.write_file().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wh_d4_remove_persist_failure_restores_memory_before_cleanup() {
+        for rename_failure in [false, true] {
+            let p = fresh_path(if rename_failure {
+                "wh-d4-remove-save-rename"
+            } else {
+                "wh-d4-remove-save-tmp"
+            });
+            let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+            let mut b = WhBackend::new();
+            let reg = v.register_windows_hello(&mut b, "TEST-PC", Edition::Single);
+            assert!(reg.is_ok());
+            let reg = reg.unwrap();
+            v.data.audit = (0..MAX_AUDIT)
+                .map(|index| AuditEvent {
+                    ts: index.to_string(),
+                    event: "synthetic".into(),
+                    method: "test".into(),
+                    detail: index.to_string(),
+                })
+                .collect();
+            v.write_file().unwrap();
+            let disk = fs::read(&p).unwrap();
+            let header = serde_json::to_vec(&v.header).unwrap();
+            let audit = serde_json::to_vec(&v.data.audit).unwrap();
+            use std::os::windows::fs::OpenOptionsExt;
+            let _guard = if rename_failure {
+                Some(
+                    fs::OpenOptions::new()
+                        .read(true)
+                        .share_mode(1)
+                        .open(&p)
+                        .unwrap(),
+                )
+            } else {
+                fs::create_dir(p.with_extension("db.tmp")).unwrap();
+                None
+            };
+            let result = v.remove_key_with_platform(
+                &base64_encode(&reg.credential_id),
+                &mut b,
+                Edition::Single,
+            );
+            assert!(matches!(result, Err(VaultError::Io(_))));
+            assert!(
+                serde_json::to_vec(&v.header).unwrap() == header,
+                "failed remove persist must restore header"
+            );
+            assert!(
+                serde_json::to_vec(&v.data.audit).unwrap() == audit,
+                "failed remove persist must restore trimmed audit"
+            );
+            assert!(fs::read(&p).unwrap() == disk);
+            assert!(
+                b.deleted.is_empty(),
+                "no native deletion before successful persist"
+            );
+            assert_eq!(b.inner.platform_credential_ids().len(), 1);
+        }
+    }
+
+    #[test]
+    fn wh_d4_review_l3_lost_marker_unavailable_warns_without_native_calls() {
+        let p = fresh_path("wh-d4-review-l3");
+        let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+        let mut b = WhBackend::new();
+        let reg = v.register_windows_hello(&mut b, "TEST-PC", Edition::Single);
+        assert!(reg.is_ok());
+        let reg = reg.unwrap();
+        wh_drop_platform_marker(&mut v);
+        b.available = false;
+        b.calls.set(0);
+        let result =
+            v.remove_key_with_platform(&base64_encode(&reg.credential_id), &mut b, Edition::Single);
+        assert!(
+            matches!(
+                result,
+                Ok(PlatformCleanupOutcome::ManualRemovalRequired(
+                    PlatformCleanupWarning::DiscoveryFailed
+                ))
+            ),
+            "unavailable discovery cannot rule out an unmarked platform credential"
+        );
+        assert!(Vault::read_header(&p, Edition::Single)
+            .unwrap()
+            .key_slots
+            .is_empty());
+        assert!(b.deleted.is_empty());
+        assert_eq!(
+            b.calls.get(),
+            1,
+            "only passive availability query; no native list or delete"
+        );
+        assert_eq!(b.inner.platform_credential_ids().len(), 1);
+    }
+
+    #[test]
+    fn wh_d4_review_control_post_create_discovery_error_never_blind_deletes() {
+        let p = fresh_path("wh-d4-review-post-create-list");
+        let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+        let mut b = WhBackend::new();
+        b.scripted_lists.push_back(Ok(vec![]));
+        b.scripted_lists
+            .push_back(Err(FidoError::Internal("synthetic list failure".into())));
+        let before = fs::read(&p).unwrap();
+        let result = v.register_windows_hello(&mut b, "TEST-PC", Edition::Single);
+        assert!(matches!(
+            result,
+            Err(VaultError::Fido(FidoError::Internal(_)))
+        ));
+        assert!(b.scripted_lists.is_empty());
+        assert!(
+            b.deleted.is_empty(),
+            "unproved returned ID must never be blindly deleted"
+        );
+        assert!(b.allow.is_empty());
+        assert!(v.header.key_slots.is_empty());
+        assert!(fs::read(&p).unwrap() == before);
+        assert_eq!(
+            b.inner.platform_credential_ids().len(),
+            1,
+            "possible native residue is disclosed, not falsely claimed cleaned"
+        );
+    }
+
+    #[test]
+    fn wh_d4_review_control_empty_and_existing_local_nonvault_collision() {
+        for empty in [true, false] {
+            let p = fresh_path(if empty {
+                "wh-d4-review-empty"
+            } else {
+                "wh-d4-review-local-nonvault"
+            });
+            let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+            let mut b = WhBackend::new();
+            let id = if empty { vec![] } else { vec![99; 32] };
+            if !empty {
+                b.inner = MockBackend::new().with_platform_credentials(vec![id.clone()]);
+            }
+            b.collision = Some(id);
+            let before = fs::read(&p).unwrap();
+            let result = v.register_windows_hello(&mut b, "TEST-PC", Edition::Single);
+            assert!(matches!(
+                result,
+                Err(VaultError::Fido(FidoError::PlatformCredentialExists))
+            ));
+            assert!(b.deleted.is_empty());
+            assert!(b.allow.is_empty());
+            assert!(v.header.key_slots.is_empty());
+            assert!(fs::read(&p).unwrap() == before);
+        }
+    }
+
+    #[test]
+    fn wh_d4_review_control_removal_rechecks_fresh_list() {
+        for error in [true, false] {
+            let p = fresh_path(if error {
+                "wh-d4-review-fresh-error"
+            } else {
+                "wh-d4-review-fresh-missing"
+            });
+            let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+            let mut b = WhBackend::new();
+            let reg = v.register_windows_hello(&mut b, "TEST-PC", Edition::Single);
+            assert!(reg.is_ok());
+            let id = reg.unwrap().credential_id;
+            b.scripted_lists.push_back(Ok(vec![id.clone()]));
+            b.scripted_lists.push_back(if error {
+                Err(FidoError::Internal("synthetic list failure".into()))
+            } else {
+                Ok(vec![])
+            });
+            let result = v.remove_key_with_platform(&base64_encode(&id), &mut b, Edition::Single);
+            let expected = if error {
+                PlatformCleanupWarning::DiscoveryFailed
+            } else {
+                PlatformCleanupWarning::NotLocal
+            };
+            assert!(
+                matches!(result, Ok(PlatformCleanupOutcome::ManualRemovalRequired(w)) if w == expected)
+            );
+            assert!(
+                b.scripted_lists.is_empty(),
+                "after-persist list must actually be queried"
+            );
+            assert!(b.deleted.is_empty());
+            assert!(Vault::read_header(&p, Edition::Single)
+                .unwrap()
+                .key_slots
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn wh_d4_review_control_save_and_cleanup_failure_keep_primary_error() {
+        let p = fresh_path("wh-d4-review-save-delete-errors");
+        let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+        let mut b = WhBackend::new();
+        b.delete_error = true;
+        let before = fs::read(&p).unwrap();
+        let audit = serde_json::to_vec(&v.data.audit).unwrap();
+        fs::create_dir(p.with_extension("db.tmp")).unwrap();
+        let result = v.register_windows_hello(&mut b, "TEST-PC", Edition::Single);
+        assert!(
+            matches!(result, Err(VaultError::Io(_))),
+            "cleanup failure must not mask original persist error"
+        );
+        assert!(v.header.key_slots.is_empty());
+        assert!(serde_json::to_vec(&v.data.audit).unwrap() == audit);
+        assert!(fs::read(&p).unwrap() == before);
+        assert_eq!(b.deleted.len(), 1);
+        assert_eq!(b.inner.platform_credential_ids().len(), 1);
+    }
+
+    #[test]
+    fn wh_d4_review_s2_removal_audit_names_platform_method() {
+        let p = fresh_path("wh-d4-review-s2");
+        let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+        let mut b = WhBackend::new();
+        let reg = v.register_windows_hello(&mut b, "TEST-PC", Edition::Single);
+        assert!(reg.is_ok());
+        let removed = v.remove_key_with_platform(
+            &base64_encode(&reg.unwrap().credential_id),
+            &mut b,
+            Edition::Single,
+        );
+        assert!(removed.is_ok());
+        let event = v.audit().last().unwrap();
+        assert_eq!(event.event, "key_removed");
+        assert_eq!(event.method, "windows-hello:Windows Hello（本機 TEST-PC）");
+    }
+
+    #[test]
+    fn wh_d4_review_s1_lost_marker_discovery_failure_warns() {
+        let p = fresh_path("wh-d4-review-s1");
+        let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+        let mut b = WhBackend::new();
+        let reg = v.register_windows_hello(&mut b, "TEST-PC", Edition::Single);
+        assert!(reg.is_ok());
+        let reg = reg.unwrap();
+        wh_drop_platform_marker(&mut v);
+        b.list_error = true;
+        let removed =
+            v.remove_key_with_platform(&base64_encode(&reg.credential_id), &mut b, Edition::Single);
+        assert!(
+            matches!(
+                removed,
+                Ok(PlatformCleanupOutcome::ManualRemovalRequired(
+                    PlatformCleanupWarning::DiscoveryFailed
+                ))
+            ),
+            "unknown type after discovery failure must warn of possible residue"
+        );
+        assert!(v.header.key_slots.is_empty());
+        assert!(Vault::read_header(&p, Edition::Single)
+            .unwrap()
+            .key_slots
+            .is_empty());
+        assert!(b.deleted.is_empty());
+        assert_eq!(b.inner.platform_credential_ids().len(), 1);
+    }
+
+    #[test]
+    fn wh_d4_review_l2_opaque_native_cancellation_not_auth_failure() {
+        let p = fresh_path("wh-d4-review-l2-cancel");
+        let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+        let mut b = WhBackend::new();
+        assert!(v
+            .register_windows_hello(&mut b, "TEST-PC", Edition::Single)
+            .is_ok());
+        drop(v);
+        // Actual platform_prf_error/api_error contract maps cancellation (and
+        // other unclassified HRESULTs) to Internal, not the mock NoDevice.
+        b.assertion_error = Some(FidoError::Internal(
+            "Windows WebAuthn GetAssertion failed: NotAllowedError (HRESULT 0x800704C7)".into(),
+        ));
+        let result = Vault::open_windows_hello(&p, &mut b, Edition::Single);
+        assert!(matches!(
+            result,
+            Err(VaultError::Fido(FidoError::Internal(_)))
+        ));
+        assert!(
+            read_failure_sidecar(&p).is_empty(),
+            "opaque native cancellation is not proven authentication rejection"
+        );
+        assert!(!failures_path(&p).exists());
+        b.assertion_error = Some(FidoError::PinRejected);
+        assert!(Vault::open_windows_hello(&p, &mut b, Edition::Single).is_err());
+        assert_eq!(
+            read_failure_sidecar(&p).len(),
+            1,
+            "known typed rejection still audited"
+        );
+    }
+
+    #[test]
+    fn wh_d4_review_l1_same_hostname_distinct_accounts() {
+        for name in [
+            "TEST-PC".to_owned(),
+            "測".repeat(MAX_KEY_LABEL_CHARS - "Windows Hello（本機 ）".chars().count()),
+        ] {
+            let p = fresh_path(if name == "TEST-PC" {
+                "wh-d4-review-l1-short"
+            } else {
+                "wh-d4-review-l1-long"
+            });
+            let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+            let mut a = WhBackend::new();
+            let mut b = WhBackend::new();
+            assert!(v
+                .register_windows_hello(&mut a, &name, Edition::Single)
+                .is_ok());
+            let second = v.register_windows_hello(&mut b, &name, Edition::Single);
+            assert!(
+                second.is_ok(),
+                "same COMPUTERNAME on another account/machine must not be identity duplicate"
+            );
+            assert_eq!(v.header.key_slots.len(), 2);
+            assert_ne!(v.header.key_slots[0].label, v.header.key_slots[1].label);
+            assert!(v
+                .header
+                .key_slots
+                .iter()
+                .all(|s| s.label.chars().count() <= MAX_KEY_LABEL_CHARS));
+            assert!(v.header.key_slots[1].label.ends_with("） 2"));
+            let duplicate = v.register_windows_hello(&mut a, &name, Edition::Single);
+            assert!(matches!(
+                duplicate,
+                Err(VaultError::Fido(FidoError::PlatformCredentialExists))
+            ));
+        }
+    }
+
+    // Additional unchanged-behavior safety controls (GREEN -> GREEN, not RED).
+    #[test]
+    fn wh_d4_control_edition_guards_before_backend() {
+        let p = fresh_path("wh-d4-control-dual");
+        let mut v = Vault::create_for(&p, "Synthetic-Pw-12345", Edition::Dual).unwrap();
+        let mut b = WhBackend::new();
+        assert!(Vault::open_windows_hello(&p, &mut b, Edition::Dual).is_err());
+        assert!(Vault::open_windows_hello(&p, &mut b, Edition::Single).is_err());
+        assert!(v
+            .remove_key_with_platform("unused", &mut b, Edition::Dual)
+            .is_err());
+        assert!(Vault::read_header_with_platform(&p, Edition::Dual, &mut b).is_ok());
+        let result =
+            Vault::open_password_with_platform(&p, "Synthetic-Pw-12345", Edition::Dual, &mut b);
+        assert!(result.is_ok());
+        assert_eq!(
+            b.calls.get(),
+            0,
+            "v2 must never probe or repair platform credentials"
+        );
+    }
+
+    #[test]
+    fn wh_d4_control_legacy_login_despite_platform_discovery_errors() {
+        for unavailable in [true, false] {
+            let p = fresh_path(if unavailable {
+                "wh-d4-control-unavailable"
+            } else {
+                "wh-d4-control-list-error"
+            });
+            let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+            let mut b = WhBackend::new();
+            let roaming = v.register_key(&mut b, None);
+            assert!(roaming.is_ok());
+            let roaming = roaming.unwrap();
+            assert!(v
+                .register_windows_hello(&mut b, "TEST-PC", Edition::Single)
+                .is_ok());
+            drop(v);
+            b.available = !unavailable;
+            b.list_error = !unavailable;
+            let query = Vault::read_header_with_platform(&p, Edition::Single, &mut b);
+            assert_eq!(
+                query.is_err(),
+                !unavailable,
+                "list error must stay visible in strict query"
+            );
+            assert!(Vault::open_password_with_platform(
+                &p,
+                "Synthetic-Pw-12345",
+                Edition::Single,
+                &mut b
+            )
+            .is_ok());
+            assert!(Vault::open_any_key(&p, None, &mut b).is_ok());
+            assert!(b.roaming == vec![roaming.credential_id.clone()]);
+            assert!(
+                Vault::open_key(&p, &base64_encode(&roaming.credential_id), None, &mut b).is_ok()
+            );
+            let h = Vault::read_header(&p, Edition::Single).unwrap();
+            assert_eq!(
+                h.key_slots[1].authenticator,
+                Some(SlotAuthenticator::Platform)
+            );
+            b.allow.clear();
+            assert!(Vault::open_windows_hello(&p, &mut b, Edition::Single).is_err());
+            assert!(
+                b.allow.is_empty(),
+                "discovery failure must not prompt assertion"
+            );
+        }
+    }
+
+    #[test]
+    fn wh_d4_control_metadata_tamper_cannot_bypass_aead() {
+        let p = fresh_path("wh-d4-control-tamper");
+        let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+        let mut b = WhBackend::new();
+        assert!(v.register_key(&mut b, None).is_ok());
+        assert!(v
+            .register_windows_hello(&mut b, "TEST-PC", Edition::Single)
+            .is_ok());
+        // Point the password-independent platform path at a roaming slot's wrapped KEK.
+        v.header.key_slots[1].ct = v.header.key_slots[0].ct.clone();
+        v.header.key_slots[1].nonce = v.header.key_slots[0].nonce.clone();
+        v.write_file().unwrap();
+        drop(v);
+        let result = Vault::open_windows_hello(&p, &mut b, Edition::Single);
+        assert!(matches!(
+            result,
+            Err(VaultError::Crypto(CryptoError::DecryptFailed))
+        ));
+        assert!(
+            Vault::open_password(&p, "Synthetic-Pw-12345").is_ok(),
+            "password fallback remains independent"
+        );
+    }
+
+    #[test]
+    fn wh_d4_control_removal_membership_and_persist_order() {
+        let p = fresh_path("wh-d4-control-delete-order");
+        let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+        let mut a = WhBackend::new();
+        let mut b = WhBackend::new();
+        let first = v.register_windows_hello(&mut a, "PC-A", Edition::Single);
+        assert!(first.is_ok());
+        let first = first.unwrap();
+        let second = v.register_windows_hello(&mut b, "PC-B", Edition::Single);
+        assert!(second.is_ok());
+        let second = second.unwrap();
+        let remote = v.remove_key_with_platform(
+            &base64_encode(&second.credential_id),
+            &mut a,
+            Edition::Single,
+        );
+        assert!(matches!(
+            remote,
+            Ok(PlatformCleanupOutcome::ManualRemovalRequired(
+                PlatformCleanupWarning::NotLocal
+            ))
+        ));
+        assert!(a.deleted.is_empty());
+        assert_eq!(b.inner.platform_credential_ids().len(), 1);
+        a.removal_path = Some(p.clone());
+        assert!(matches!(
+            v.remove_key_with_platform(
+                &base64_encode(&first.credential_id),
+                &mut a,
+                Edition::Single
+            ),
+            Ok(PlatformCleanupOutcome::Removed)
+        ));
+        assert!(
+            a.deletion_saw_persisted,
+            "delete callback must observe already-persisted removal"
+        );
+        let roaming = v.register_key(&mut a, None);
+        assert!(roaming.is_ok());
+        let deleted_before = a.deleted.len();
+        assert!(matches!(
+            v.remove_key_with_platform(
+                &base64_encode(&roaming.unwrap().credential_id),
+                &mut a,
+                Edition::Single
+            ),
+            Ok(PlatformCleanupOutcome::NotApplicable)
+        ));
+        assert_eq!(
+            a.deleted.len(),
+            deleted_before,
+            "roaming metadata never triggers platform deletion"
+        );
+    }
+
+    #[test]
+    fn wh_d4_control_cancel_and_cleanup_failure_preserve_primary_error() {
+        let p = fresh_path("wh-d4-control-cancel");
+        let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+        let mut b = WhBackend::new();
+        b.assertion_error = Some(FidoError::NoDevice);
+        b.delete_error = true;
+        let before = fs::read(&p).unwrap();
+        let result = v.register_windows_hello(&mut b, "TEST-PC", Edition::Single);
+        assert!(matches!(result, Err(VaultError::Fido(FidoError::NoDevice))));
+        assert_eq!(
+            b.deleted.len(),
+            1,
+            "cancel still attempts owned-new-credential cleanup"
+        );
+        assert!(v.header.key_slots.is_empty());
+        assert!(fs::read(&p).unwrap() == before);
+        assert!(!failures_path(&p).exists());
+    }
+
+    #[test]
+    fn wh_d4_remove_unavailable_never_deletes() {
+        let p = fresh_path("wh-d4-remove-unavailable");
+        let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+        let mut b = WhBackend::new();
+        let reg = v.register_windows_hello(&mut b, "TEST-PC", Edition::Single);
+        assert!(reg.is_ok());
+        let reg = reg.unwrap();
+        b.available = false;
+        let result =
+            v.remove_key_with_platform(&base64_encode(&reg.credential_id), &mut b, Edition::Single);
+        assert!(matches!(
+            result,
+            Ok(PlatformCleanupOutcome::ManualRemovalRequired(
+                PlatformCleanupWarning::DiscoveryFailed
+            ))
+        ));
+        assert!(
+            b.deleted.is_empty(),
+            "unavailable platform cleanup must not delete"
+        );
+        assert!(v.header.key_slots.is_empty());
+    }
+
+    #[test]
+    fn wh_d4_r3_remove_classifies_local_credential() {
+        let p = fresh_path("wh-d4-r3-remove");
+        let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+        let mut b = WhBackend::new();
+        let reg = v.register_windows_hello(&mut b, "TEST-PC", Edition::Single);
+        assert!(reg.is_ok());
+        let reg = reg.unwrap();
+        wh_drop_platform_marker(&mut v);
+        let result =
+            v.remove_key_with_platform(&base64_encode(&reg.credential_id), &mut b, Edition::Single);
+        assert!(
+            matches!(result, Ok(PlatformCleanupOutcome::Removed)),
+            "R3 local marker-loss must still clean platform credential"
+        );
+        assert!(b.inner.platform_credential_ids().is_empty());
+    }
+
+    #[test]
+    fn wh_d4_remove_cleanup_errors_are_nonblocking() {
+        for discovery in [true, false] {
+            let p = fresh_path("wh-d4-remove-warning");
+            let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+            let mut b = WhBackend::new();
+            let reg = v.register_windows_hello(&mut b, "TEST-PC", Edition::Single);
+            assert!(reg.is_ok());
+            let reg = reg.unwrap();
+            b.list_error = discovery;
+            b.delete_error = !discovery;
+            let result = v.remove_key_with_platform(
+                &base64_encode(&reg.credential_id),
+                &mut b,
+                Edition::Single,
+            );
+            let expected = if discovery {
+                PlatformCleanupWarning::DiscoveryFailed
+            } else {
+                PlatformCleanupWarning::DeleteFailed
+            };
+            assert!(
+                matches!(result, Ok(PlatformCleanupOutcome::ManualRemovalRequired(w)) if w == expected),
+                "cleanup error must not report persisted removal as failure"
+            );
+            assert!(v.header.key_slots.is_empty());
+            assert!(Vault::read_header(&p, Edition::Single)
+                .unwrap()
+                .key_slots
+                .is_empty());
+            assert_eq!(b.deleted.len(), usize::from(!discovery));
+            assert_eq!(b.inner.platform_credential_ids().len(), 1);
+        }
+    }
+
+    #[test]
+    fn wh_d4_remove_local_platform_after_persist() {
+        let p = fresh_path("wh-d4-remove-local");
+        let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+        let mut b = WhBackend::new();
+        let reg = v.register_windows_hello(&mut b, "TEST-PC", Edition::Single);
+        assert!(reg.is_ok());
+        let reg = reg.unwrap();
+        let result =
+            v.remove_key_with_platform(&base64_encode(&reg.credential_id), &mut b, Edition::Single);
+        assert!(
+            matches!(result, Ok(PlatformCleanupOutcome::Removed)),
+            "local platform removal must clean owned credential"
+        );
+        assert!(v.header.key_slots.is_empty());
+        assert!(Vault::read_header(&p, Edition::Single)
+            .unwrap()
+            .key_slots
+            .is_empty());
+        assert!(b.deleted == vec![reg.credential_id]);
+        assert!(b.inner.platform_credential_ids().is_empty());
+    }
+
+    #[test]
+    fn wh_d4_r3_registration_duplicate_is_platform_exists() {
+        let p = fresh_path("wh-d4-r3-duplicate");
+        let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+        let mut b = WhBackend::new();
+        assert!(v
+            .register_windows_hello(&mut b, "PC-A", Edition::Single)
+            .is_ok());
+        wh_drop_platform_marker(&mut v);
+        let before = fs::read(&p).unwrap();
+        let result = v.register_windows_hello(&mut b, "PC-A", Edition::Single);
+        assert!(
+            matches!(
+                result,
+                Err(VaultError::Fido(FidoError::PlatformCredentialExists))
+            ),
+            "lost marker must still count as same-machine platform"
+        );
+        assert_eq!(b.inner.platform_credential_ids().len(), 1);
+        assert!(fs::read(&p).unwrap() == before);
+        assert_eq!(
+            v.header.key_slots[0].authenticator, None,
+            "rejected registration must not persist or mutate repair"
+        );
+    }
+
+    #[test]
+    fn wh_d4_r3_password_repairs_only_after_authentication() {
+        let p = fresh_path("wh-d4-r3-password");
+        let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+        let mut b = WhBackend::new();
+        assert!(v
+            .register_windows_hello(&mut b, "TEST-PC", Edition::Single)
+            .is_ok());
+        wh_drop_platform_marker(&mut v);
+        drop(v);
+        let before = fs::read(&p).unwrap();
+        let wrong = Vault::open_password_with_platform(&p, "wrong", Edition::Single, &mut b);
+        assert!(matches!(wrong, Err(VaultError::WrongPassword)));
+        assert!(fs::read(&p).unwrap() == before);
+        let opened =
+            Vault::open_password_with_platform(&p, "Synthetic-Pw-12345", Edition::Single, &mut b);
+        assert!(opened.is_ok());
+        assert_eq!(
+            Vault::read_header(&p, Edition::Single).unwrap().key_slots[0].authenticator,
+            Some(SlotAuthenticator::Platform)
+        );
+    }
+
+    #[test]
+    fn wh_d4_r3_roaming_classifies_before_allow_and_save() {
+        let p = fresh_path("wh-d4-r3-roaming");
+        let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+        let mut b = WhBackend::new();
+        let roaming = v.register_key(&mut b, None);
+        assert!(roaming.is_ok());
+        let roaming = roaming.unwrap();
+        let platform = v.register_windows_hello(&mut b, "TEST-PC", Edition::Single);
+        assert!(platform.is_ok());
+        let platform = platform.unwrap();
+        wh_drop_platform_marker(&mut v);
+        drop(v);
+        b.roaming.clear();
+        let before = fs::read(&p).unwrap();
+        let direct = Vault::open_key(&p, &base64_encode(&platform.credential_id), None, &mut b);
+        assert!(direct.is_err());
+        assert!(
+            b.roaming.is_empty(),
+            "R3 platform ID must not reach explicit roaming assertion"
+        );
+        assert!(fs::read(&p).unwrap() == before);
+        let opened = Vault::open_any_key(&p, None, &mut b);
+        assert!(opened.is_ok());
+        assert!(b.roaming == vec![roaming.credential_id]);
+        assert_eq!(
+            Vault::read_header(&p, Edition::Single).unwrap().key_slots[1].authenticator,
+            Some(SlotAuthenticator::Platform)
+        );
+    }
+
+    #[test]
+    fn wh_d4_r3_platform_login_repairs_on_authenticated_save() {
+        let p = fresh_path("wh-d4-r3-platform");
+        let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+        let mut b = WhBackend::new();
+        assert!(v
+            .register_windows_hello(&mut b, "TEST-PC", Edition::Single)
+            .is_ok());
+        wh_drop_platform_marker(&mut v);
+        drop(v);
+        let result = Vault::open_windows_hello(&p, &mut b, Edition::Single);
+        assert!(
+            result.is_ok(),
+            "R3 local credential must remain platform-login usable"
+        );
+        assert_eq!(
+            Vault::read_header(&p, Edition::Single).unwrap().key_slots[0].authenticator,
+            Some(SlotAuthenticator::Platform)
+        );
+    }
+
+    #[test]
+    fn wh_d4_r3_readonly_local_list_classification() {
+        let p = fresh_path("wh-d4-r3-read");
+        let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+        let mut a = WhBackend::new();
+        let mut b = WhBackend::new();
+        assert!(v
+            .register_windows_hello(&mut a, "PC-A", Edition::Single)
+            .is_ok());
+        assert!(v
+            .register_windows_hello(&mut b, "PC-B", Edition::Single)
+            .is_ok());
+        wh_drop_platform_marker(&mut v);
+        drop(v);
+        let before = fs::read(&p).unwrap();
+        let h = Vault::read_header_with_platform(&p, Edition::Single, &mut a);
+        assert!(h.is_ok());
+        let h = h.unwrap();
+        assert_eq!(
+            h.key_slots[0].authenticator,
+            Some(SlotAuthenticator::Platform),
+            "verified local credential must classify platform"
+        );
+        assert_eq!(
+            h.key_slots[1].authenticator, None,
+            "unknown other-machine ID must not be guessed"
+        );
+        assert!(
+            fs::read(&p).unwrap() == before,
+            "query must not persist repair"
+        );
+        assert!(!failures_path(&p).exists());
+    }
+
+    #[test]
+    fn wh_d4_roaming_rejects_backend_selected_platform() {
+        let p = fresh_path("wh-d4-roaming-rogue");
+        let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+        let mut b = WhBackend::new();
+        assert!(v.register_key(&mut b, None).is_ok());
+        let reg = v.register_windows_hello(&mut b, "TEST-PC", Edition::Single);
+        assert!(reg.is_ok());
+        b.selected = Some(reg.unwrap().credential_id);
+        drop(v);
+        let before = fs::read(&p).unwrap();
+        let result = Vault::open_any_key(&p, None, &mut b);
+        assert!(
+            matches!(result, Err(VaultError::Fido(FidoError::Internal(_)))),
+            "backend must not bypass allow-list"
+        );
+        assert!(fs::read(&p).unwrap() == before);
+    }
+
+    #[test]
+    fn wh_d4_roaming_excludes_marked_platform() {
+        let p = fresh_path("wh-d4-roaming-filter");
+        let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+        let mut b = WhBackend::new();
+        let roaming = v.register_key(&mut b, None);
+        assert!(roaming.is_ok());
+        let roaming = roaming.unwrap();
+        let platform = v.register_windows_hello(&mut b, "TEST-PC", Edition::Single);
+        assert!(platform.is_ok());
+        let platform = platform.unwrap();
+        drop(v);
+        b.roaming.clear();
+        let result = Vault::open_any_key(&p, None, &mut b);
+        assert!(result.is_ok());
+        assert!(
+            b.roaming == vec![roaming.credential_id],
+            "roaming allow-list must exclude platform"
+        );
+        drop(result);
+        b.roaming.clear();
+        let result = Vault::open_key(&p, &base64_encode(&platform.credential_id), None, &mut b);
+        assert!(matches!(result, Err(VaultError::Fido(FidoError::NoDevice))));
+        assert!(
+            b.roaming.is_empty(),
+            "explicit platform ID must not reach roaming backend"
+        );
+    }
+
+    #[test]
+    fn wh_d4_platform_rejection_audit() {
+        let p = fresh_path("wh-d4-login-rejection");
+        let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+        let mut b = WhBackend::new();
+        assert!(v
+            .register_windows_hello(&mut b, "TEST-PC", Edition::Single)
+            .is_ok());
+        drop(v);
+        b.assertion_error = Some(FidoError::PinRejected);
+        let rejected = Vault::open_windows_hello(&p, &mut b, Edition::Single);
+        assert!(matches!(
+            rejected,
+            Err(VaultError::Fido(FidoError::PinRejected))
+        ));
+        assert_eq!(
+            read_failure_sidecar(&p).len(),
+            1,
+            "actual rejection must record failure"
+        );
+        b.assertion_error = Some(FidoError::NoDevice);
+        assert!(Vault::open_windows_hello(&p, &mut b, Edition::Single).is_err());
+        assert_eq!(
+            read_failure_sidecar(&p).len(),
+            1,
+            "cancel/no-device must not record"
+        );
+        b.wrong_secret = true;
+        let wrong = Vault::open_windows_hello(&p, &mut b, Edition::Single);
+        assert!(matches!(
+            wrong,
+            Err(VaultError::Crypto(CryptoError::DecryptFailed))
+        ));
+        let stamps = read_failure_sidecar(&p);
+        assert_eq!(stamps.len(), 2);
+        assert!(stamps
+            .iter()
+            .all(|s| s.method == "windows-hello:Windows Hello（本機 TEST-PC）"));
+    }
+
+    #[test]
+    fn wh_d4_platform_returned_id_membership() {
+        let p = fresh_path("wh-d4-login-membership");
+        let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+        let mut b = WhBackend::new();
+        assert!(v
+            .register_windows_hello(&mut b, "PC-A", Edition::Single)
+            .is_ok());
+        let mut other = WhBackend::new();
+        let remote = v.register_windows_hello(&mut other, "PC-B", Edition::Single);
+        assert!(remote.is_ok());
+        b.selected = Some(remote.unwrap().credential_id);
+        drop(v);
+        let result = Vault::open_windows_hello(&p, &mut b, Edition::Single);
+        assert!(matches!(
+            result,
+            Err(VaultError::Fido(FidoError::PlatformCredentialMissing))
+        ));
+        assert_eq!(b.allow.len(), 1);
+        let failures = read_failure_sidecar(&p);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(
+            failures[0].method,
+            "windows-hello:Windows Hello（本機 PC-A）"
+        );
+    }
+
+    #[test]
+    fn wh_d4_platform_roundtrip_restart_and_sidecar() {
+        let p = fresh_path("wh-d4-roundtrip");
+        let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+        v.add_entry("synthetic-site", "test", "synthetic-secret", "")
+            .unwrap();
+        let mut b = WhBackend::new();
+        let reg = v.register_windows_hello(&mut b, "TEST-PC", Edition::Single);
+        assert!(reg.is_ok());
+        let reg = reg.unwrap();
+        let local = b.inner.platform_credential_ids().to_vec();
+        drop(v);
+        record_login_failure(&p, "password").unwrap();
+        b.inner = MockBackend::new().with_platform_credentials(local);
+        let opened = Vault::open_windows_hello(&p, &mut b, Edition::Single);
+        assert!(opened.is_ok(), "platform PRF must unlock after restart");
+        let v = opened.unwrap();
+        assert_eq!(v.entries().len(), 1);
+        assert!(b.allow == vec![reg.credential_id]);
+        assert!(!failures_path(&p).exists());
+        assert_eq!(
+            v.audit().last().unwrap().method,
+            "windows-hello:Windows Hello（本機 TEST-PC）"
+        );
+        assert!(v
+            .audit()
+            .iter()
+            .any(|e| e.event == "login_failed" && e.method == "password"));
+        assert!(v
+            .audit()
+            .iter()
+            .any(|e| e.method.starts_with("register_key:windows-hello:")));
+    }
+
+    fn wh_registration_fixture_tag(rename_failure: bool) -> &'static str {
+        if rename_failure {
+            "wh-d4-save-failure-rename"
+        } else {
+            "wh-d4-save-failure-tmp"
+        }
+    }
+
+    #[test]
+    fn wh_d4_registration_failure_fixtures_are_disjoint() {
+        assert_ne!(
+            wh_registration_fixture_tag(false),
+            wh_registration_fixture_tag(true),
+            "parallel tmp/rename rollback tests must not share a vault path"
+        );
+    }
+
+    fn wh_registration_save_failure(rename_failure: bool) {
+        let p = fresh_path(wh_registration_fixture_tag(rename_failure));
+        let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+        v.data.audit = (0..MAX_AUDIT)
+            .map(|index| AuditEvent {
+                ts: index.to_string(),
+                event: "synthetic".into(),
+                method: "test".into(),
+                detail: index.to_string(),
+            })
+            .collect();
+        v.write_file().unwrap();
+        let disk = fs::read(&p).unwrap();
+        let header = serde_json::to_vec(&v.header).unwrap();
+        let audit = serde_json::to_vec(&v.data.audit).unwrap();
+        let tmp = p.with_extension("db.tmp");
+        #[cfg(windows)]
+        let _guard = if rename_failure {
+            use std::os::windows::fs::OpenOptionsExt;
+            Some(
+                fs::OpenOptions::new()
+                    .read(true)
+                    .share_mode(1)
+                    .open(&p)
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
+        if !rename_failure {
+            fs::create_dir(&tmp).unwrap();
+        }
+        let mut b = WhBackend::new();
+        let result = v.register_windows_hello(&mut b, "TEST-PC", Edition::Single);
+        assert!(matches!(result, Err(VaultError::Io(_))));
+        assert!(
+            serde_json::to_vec(&v.header).unwrap() == header,
+            "failed persist must restore all slots"
+        );
+        assert!(
+            serde_json::to_vec(&v.data.audit).unwrap() == audit,
+            "audit cap trimming must be undone"
+        );
+        assert!(fs::read(&p).unwrap() == disk);
+        assert!(b.inner.platform_credential_ids().is_empty());
+        assert_eq!(b.deleted.len(), 1);
+    }
+
+    #[test]
+    fn wh_d4_register_tmp_write_rollback() {
+        wh_registration_save_failure(false);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wh_d4_register_rename_rollback() {
+        wh_registration_save_failure(true);
+    }
+
+    #[test]
+    fn wh_d4_register_rogue_assertion_id() {
+        let p = fresh_path("wh-d4-register-rogue");
+        let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+        let mut b = WhBackend::new();
+        b.selected = Some(vec![99; 32]);
+        let result = v.register_windows_hello(&mut b, "TEST-PC", Edition::Single);
+        assert!(matches!(
+            result,
+            Err(VaultError::Fido(FidoError::PlatformCredentialMissing))
+        ));
+        assert_eq!(b.deleted.len(), 1);
+        assert!(b.deleted == b.allow);
+        assert!(b.inner.platform_credential_ids().is_empty());
+        assert!(v.header.key_slots.is_empty());
+    }
+
+    #[test]
+    fn wh_d4_creation_requires_local_ownership() {
+        let p = fresh_path("wh-d4-ownership");
+        let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+        let mut b = WhBackend::new();
+        b.collision = Some(vec![99; 32]);
+        let result = v.register_windows_hello(&mut b, "TEST-PC", Edition::Single);
+        assert!(matches!(
+            result,
+            Err(VaultError::Fido(FidoError::PlatformCredentialMissing))
+        ));
+        assert!(b.deleted.is_empty());
+        assert!(b.allow.is_empty());
+        assert!(v.header.key_slots.is_empty());
+    }
+
+    #[test]
+    fn wh_d4_creation_collision_never_deletes_existing() {
+        let p = fresh_path("wh-d4-collision");
+        let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+        let mut b = WhBackend::new();
+        let roaming = v.register_key(&mut b, None);
+        assert!(roaming.is_ok());
+        let roaming = roaming.unwrap();
+        b.collision = Some(roaming.credential_id);
+        b.assertion_error = Some(FidoError::PlatformPrfUnsupported);
+        let before = fs::read(&p).unwrap();
+        let result = v.register_windows_hello(&mut b, "TEST-PC", Edition::Single);
+        assert!(result.is_err());
+        assert!(
+            b.deleted.is_empty(),
+            "a colliding creation ID must never be deleted"
+        );
+        assert!(b.allow.is_empty(), "collision precedes assertion");
+        assert!(fs::read(&p).unwrap() == before);
+        assert_eq!(v.header.key_slots.len(), 1);
+    }
+
+    #[test]
+    fn wh_d4_register_exclude_and_machine_scope() {
+        let p = fresh_path("wh-d4-exclude");
+        let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+        let mut first = WhBackend::new();
+        let result = v.register_windows_hello(&mut first, "PC-A", Edition::Single);
+        assert!(result.is_ok());
+        let reg = result.unwrap();
+        assert!(first.allow == vec![reg.credential_id.clone()]);
+        let mut second = WhBackend::new();
+        let result = v.register_windows_hello(&mut second, "PC-B", Edition::Single);
+        assert!(result.is_ok());
+        assert!(
+            second.exclude == vec![reg.credential_id.clone()],
+            "other machine must receive all vault platform IDs"
+        );
+        let count = first.inner.platform_credential_ids().len();
+        let duplicate = v.register_windows_hello(&mut first, "PC-A", Edition::Single);
+        assert!(matches!(
+            duplicate,
+            Err(VaultError::Fido(FidoError::PlatformCredentialExists))
+        ));
+        assert_eq!(first.inner.platform_credential_ids().len(), count);
+        assert_eq!(v.header.key_slots.len(), 2);
+    }
+
+    #[test]
+    fn wh_d4_register_unavailable_no_prompt() {
+        let p = fresh_path("wh-d4-unavailable");
+        let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+        let mut b = WhBackend::new();
+        b.available = false;
+        let result = v.register_windows_hello(&mut b, "TEST-PC", Edition::Single);
+        assert!(matches!(
+            result,
+            Err(VaultError::Fido(FidoError::NotSupported(_)))
+        ));
+        assert_eq!(b.calls.get(), 1);
+        assert!(b.inner.platform_credential_ids().is_empty());
+    }
+
+    #[test]
+    fn wh_d4_register_edition_gate_no_backend() {
+        for (vault_edition, requested) in [
+            (Edition::Dual, Edition::Single),
+            (Edition::Single, Edition::Dual),
+        ] {
+            let p = fresh_path("wh-d4-edition");
+            let mut v = Vault::create_for(&p, "Synthetic-Pw-12345", vault_edition).unwrap();
+            let mut b = WhBackend::new();
+            let result = v.register_windows_hello(&mut b, "TEST-PC", requested);
+            assert!(result.is_err(), "non-single registration must reject");
+            assert_eq!(b.calls.get(), 0, "edition gate precedes every backend call");
+        }
+    }
+
+    #[test]
+    fn wh_d4_creation_mismatch_cleanup() {
+        let p = fresh_path("wh-d4-mismatch");
+        let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+        let mut b = MockBackend::new()
+            .with_platform_mode(crate::fido2::MockPlatformMode::CreationPrfMismatch);
+        let result = v.register_windows_hello(&mut b, "TEST-PC", Edition::Single);
+        assert!(matches!(
+            result,
+            Err(VaultError::Fido(FidoError::PlatformPrfUnsupported))
+        ));
+        assert!(b.platform_credential_ids().is_empty());
+        assert!(v.header.key_slots.is_empty());
+    }
+
+    #[test]
+    fn wh_d4_registration_prf_failure_cleanup() {
+        use crate::fido2::MockPlatformMode;
+        for mode in [MockPlatformMode::AssertionPrfFails] {
+            let p = fresh_path("wh-d4-prf-failure");
+            let created = Vault::create(&p, "Synthetic-Pw-12345");
+            assert!(created.is_ok());
+            let mut v = created.unwrap();
+            let before = fs::read(&p).unwrap();
+            let mut b = MockBackend::new().with_platform_mode(mode);
+            let result = v.register_windows_hello(&mut b, "TEST-PC", Edition::Single);
+            assert!(matches!(
+                result,
+                Err(VaultError::Fido(FidoError::PlatformPrfUnsupported))
+            ));
+            assert!(
+                b.platform_credential_ids().is_empty(),
+                "failed verification must clean up new credential"
+            );
+            assert!(v.header.key_slots.is_empty());
+            assert!(fs::read(&p).unwrap() == before);
+        }
+    }
+
+    #[test]
+    fn wh_d4_register_verified_slot() {
+        let p = fresh_path("wh-d4-register");
+        let created = Vault::create(&p, "Synthetic-Pw-12345");
+        assert!(created.is_ok());
+        let mut v = created.unwrap();
+        let mut b = MockBackend::new();
+        let result = v.register_windows_hello(&mut b, "TEST-PC", Edition::Single);
+        assert!(
+            result.is_ok(),
+            "verified platform registration must succeed"
+        );
+        let reg = result.unwrap();
+        assert_eq!(v.header.key_slots.len(), 1);
+        let slot = &v.header.key_slots[0];
+        assert_eq!(slot.authenticator, Some(SlotAuthenticator::Platform));
+        assert_eq!(slot.label, "Windows Hello（本機 TEST-PC）");
+        assert_eq!(slot.credential_id, base64_encode(&reg.credential_id));
+        assert_eq!(
+            Vault::read_header(&p, Edition::Single)
+                .unwrap()
+                .key_slots
+                .len(),
+            1
+        );
+    }
 
     #[test]
     fn d13_sidecar_events_follow_existing_audit_before_success() {
