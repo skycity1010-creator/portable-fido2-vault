@@ -1,10 +1,12 @@
 # 可攜式 FIDO2 密碼金庫（portable-fido2-vault）— 專案彙整文件
 
-> 彙整日期：2026-10-11｜建置機：WS2｜部署/驗證機：Win11-NB（`C:\FidoVault`）
+> 彙整日期：2026-10-13｜建置機：WS2｜既有部署/驗證機：Win11-NB（`C:\FidoVault`）
 > 本檔彙整 README.md、docs/spec.md、docs/user-verification-steps.md 與近期修復紀錄（§9），
 > 作為單一入口文件；細節以各原始文件為準。
-> 本檔保留各次工程驗證、部署與使用者回報的歷史快照；最新狀態（Console 前景、RDP 支援、WebAuthn 不可用時保留主密碼登入與 2026-10-11 正式部署）見 §17；§16 以前為歷史快照。歷史雜湊／槽位數不代表驗收後目標金庫的即時狀態。
-> 雙群組控管版（開發中，PR #29 draft，未合併／未部署）見 §18。
+> 本檔保留各次工程驗證、部署與使用者回報的歷史快照；RDP／既有正式部署見 §17，Windows Hello 分支狀態見 §19。歷史雜湊／槽位數不代表驗收後目標金庫的即時狀態。
+> 雙群組控管版（開發中，PR #29 draft，未合併／未部署）見 §18；單人版 Windows Hello（PR #30 OPEN Draft、未合併／未部署）見 §19。
+
+- **Windows Hello（單人版，PR #30）**：D1–D7 實作與 mock 驗證完成；目前 D8 文件更新待 Officer 確認，D9 Release/staging/本機 Console V1–V9 尚未執行。PR 為 OPEN Draft，未合併、未部署；詳見本文件 §19。Windows Hello 的成功範圍目前僅是 Mock Gate，不是實體裝置支援宣告。
 
 ## 1. 專案概況
 
@@ -31,7 +33,7 @@ portable-fido2-vault/
 ├─ README.md                  簡易說明
 ├─ docs/
 │  ├─ spec.md                 技術規格（本檔細化來源）
-│  ├─ user-verification-steps.md  NB 桌面驗證步驟（既有 Gate 流程與 Feature 1–7 驗收紀錄）
+│  ├─ user-verification-steps.md  NB 驗證步驟（既有功能與待執行 Windows Hello V1–V9）
 │  └─ PROJECT.md              ← 本檔（彙整）
 ├─ src/                       前端（純靜態 HTML/JS/CSS，繁中 UI）
 ├─ src-tauri/                 Tauri v2 (Rust) 後端
@@ -166,6 +168,8 @@ cargo +stable-x86_64-pc-windows-gnu build --release --features real-ctap --bin p
 | 11 | 註冊時設定安全性金鑰本機別名 | ✅ 同次 2026-10-02 集中驗收全部 PASS；別名驗證、註冊與重登入結果見使用者驗收文件 |
 | 12 | RDP（WebAuthn 重新導向）使用金鑰 | ✅ R6 GO（2026-10-10），限已測矩陣；殘餘未測見 §17 |
 | 13 | WebAuthn 不可用時保留主密碼登入 | ✅ 2026-10-10 WS2 RDP W1–W6 PASS（PR #25） |
+| 14 | Windows Hello 單人版 Mock Gate | ✅ 9 cases／29 checks，exact-head CI PASS；僅 mock，不是實體驗收 |
+| 15 | Windows Hello 本機 Console 實體 V1–V9 | ⏳ D9 尚未執行；使用隔離測試金庫，未碰正式 vault |
 
 ### 已確認功能彙整
 
@@ -182,6 +186,7 @@ cargo +stable-x86_64-pc-windows-gnu build --release --features real-ctap --bin p
 | 修正 | Console 金鑰提示前景（PR #23） | ✅ 2026-10-10 C1–C6 PASS；已知 F2：同一操作第二個安全性視窗可能在背景（使用者接受） |
 | 功能 | RDP 支援（PR #20–#22、#24、#26） | ✅ R2–R5 實機驗收、R6 GO（限已測矩陣） |
 | 修正 | WebAuthn 不可用時保留主密碼登入（PR #25） | ✅ 2026-10-10 W1–W6 PASS；2026-10-11 正式部署 |
+| 功能 | 單人版 Windows Hello（PR #30） | ✅ D1–D7 mock／程式完成；D8 文件待 Officer 確認；D9 實體 V1–V9 未測，PR Draft 未部署 |
 
 先前 PR #13/#14/#15 均已合併，當時 8 張 `[FidoVault]` Kanban 卡已完成；新增刪除確認任務 `t_7001952b` 的使用者結果為 D1–D5 PASS，D6 歷史未測、目前已免測且排除待辦，已授權收尾及合併，實際狀態以 PR #17／該卡片讀回為準。驗收、PR 合併與任務完成不等同所有舊模板都逐項人工 PASS：`user-verification-steps.md` 的 A–C/E/F 保留未勾選，D5 為未回報的選測；Gate 8 仍僅有上述 mock 證據。RDP 已於 2026-10-10 R6 GO（限已測矩陣，§17）；raw CTAP CLI 實體路線為已退役／由 GUI 驗收取代（superseded），不是待驗項。
 
@@ -295,3 +300,13 @@ cargo +stable-x86_64-pc-windows-gnu build --release --features real-ctap --bin p
 - **範圍邊界**：不提供 v1↔v2 轉換；`vault_cli` 不支援 v2；`dual_vault_cli` 只供 mock E2E，不隨產品發佈；原生視窗標題不改（使用者決定，以畫面內「雙群組控管版」標示為準）。
 - **殘餘風險／後續**：(1) 既有、兩版共用：`enterMain` 在 Rust 已解鎖後若 DOM 切換或設定／audit 讀取失敗，畫面可能停在登入頁或閒置上鎖不啟動（使用者決定另開維護項目）；(2) 既有：`write_data` rename 失敗會留下 `vault.db.tmp`；(3) excludeList 依賴 authenticator 行為（設計 §7 R6），Windows 實際錯誤碼與 UI 待實機確認（R1）；(4) mock E2E 不涵蓋 Tauri IPC、計時執行緒實際觸發、Windows broker 與實體金鑰。
 - **待辦**：D13 — 在 Win11-NB 以獨立資料夾 staging（不碰 `C:\FidoVault\vault.db`），由使用者在本機 Console 依 `docs/user-verification-steps.md` 末節逐項驗收。實機 PASS 前 PR #29 維持 draft、Kanban `t_21ae2fd3` 維持 blocked，不合併、不部署。
+
+## 19. 2026-10-13：單人版 Windows Hello（PR #30，D7 完成／D8 文件同步）
+
+- **範圍與分支狀態：** 此功能只屬單人版 v1；dual-control 版本在 backend 前拒絕。PR #30 為 OPEN Draft，分支 `feature/windows-hello-single-20261012`；未合併、未部署。此段紀錄分支候選，不改寫 `main`／`C:\FidoVault` 的正式部署狀態。
+- **D7 已驗收的自動化：** 新增獨立 Windows Hello Mock Gate 與測試 CLI，保留既有 single Gate 20/20 及 dual Gate 25/25。新 Gate 兩種 feature 各 9 cases／29 checks；Node 123/123、Rust `real-ctap` 與 `real-ctap,dual-control` 各 428/428。歷史 D7／R2 候選的 Reviewer verdict：`passed=true`、`coverage_complete=true`（僅適用該次候選，非本次 D8／R3 verdict），R1 的否決保留。最終 source+doc head `054f525e694d05d460f09119aa6611311d3f0e07` CI run `38402500039` success；D7 closeout docs-only head `b4930ad0fdb1229ed9bcf3f32fe97d2a90dbe288` CI run `38406623319` success。這些是 mock／程式與 CI 證據，不是 Windows Hello 實體驗收。
+- **技術邊界：**API v8+、Windows Hello platform authenticator 可用性及本機 Console 三者皆須成立；RDP／session 0 不支援 Hello。backend 目前用 v8 options 請求 `PLATFORM` attachment，未使用 API v9 authenticator-list／authenticator-ID 指定 provider；僅支援 Windows 本機 Hello provider，須由 Windows 設定及使用者核對，第三方同步 provider 不在範圍，且此限制不是程式強制保證。建 credential 後須立即 assertion 驗證 PRF，再新增 vault slot；若 assertion／清理失敗，slot 不寫入，但 OS 端可能殘留 test credential。主密碼及已註冊 YubiKey 是備援。複製 vault 檔案本身不傳輸 credential；V9 只可在已確認本機 provider 的條件下驗收跨機邊界，不能從 mock 推定。
+- **D8 文件範圍：** `README.md` 說明狀態、使用邊界與備援；`docs/spec.md` 記錄 API／PRF／slot／清理契約；本文件同步 Gate 與分支狀態；`docs/plans/windows-hello-single.md` 同步 V9/V7 順序與 provider/consent 前置條件；`docs/user-verification-steps.md` 新增隔離安全規則及 V1–V9。目前文件候選已起草，**尚待 Officer 獨立確認**；未收到 Officer PASS 前不勾 D8。
+- 測試前的 passkey provider 與應用程式存取同意需一併記錄：Windows「設定 → 隱私權與安全性 → Passkey access」可能需逐應用程式同意；未經核准不得更改全域／組織政策。若被拒，驗收標為受阻／未測，不可混同 PRF failure。
+- **D9 尚未執行：** Release build／獨立 staging／SKYCITY-PC 正向、Win11-NB PRF 負向、跨機複製等 V1–V9 均未進行。只有使用者在本機 Console 回報結果後才能逐項更新清單；不得把 checklist 或 Mock Gate 改寫成人工 PASS。
+- **安全限制：** 不操作正式金庫，不貼出密碼、PIN、credential ID、PRF、KEK，不執行 GUI／WebAuthn 於 WinRM 或 RDP，不重設整體 Windows Hello 容器。PR #30 保持 Draft，feature Kanban `t_01329074` 保持 blocked；D8 完成不等同 D9、部署或合併。

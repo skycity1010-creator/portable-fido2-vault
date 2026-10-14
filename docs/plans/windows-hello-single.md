@@ -1,6 +1,6 @@
 # 單人版 Windows Hello 登入／解鎖（windows-hello-single）
 
-> 狀態：實作中（2026-10-12 使用者授權「開始 D1」；逐項進行，每項完成後停下等下一個指示）。
+> 狀態：D1–D7 完成；D8 文件候選整理中並待 Officer 獨立確認；D9 實機尚未執行。PR #30 維持 OPEN Draft，未合併／未部署。
 > 範圍：只有單人版 `portable-fido-vault.exe`。雙群組控管版（`portable-fido-vault-dual.exe`，v2）**不動**。
 
 ## 0 目標
@@ -31,7 +31,7 @@ Windows Hello 必須以密碼學綁定金庫（PRF／hmac-secret 包裝 KEK）�
 
 可直接沿用的技術事實：
 - 平台路徑 COSE 參數必須是 `[ES256, RS256]`（TPM 1.2／software KSP 只產 RSA）。
-- PRF 必須走 API v8：MakeCredential options v8 `pPRFGlobalEval` + `dwFlags=WEBAUTHN_AUTHENTICATOR_HMAC_SECRET_VALUES_FLAG`，讀 attestation v7 `pHmacSecret`；舊的 `hmac-secret` extension／v6 `bEnablePrf` 單獨使用時 `bPrfEnabled=false`。
+- PRF 建立使用 API v8 MakeCredential options 的 `pPRFGlobalEval`，搭配 `dwFlags=WEBAUTHN_AUTHENTICATOR_HMAC_SECRET_VALUES_FLAG` 傳入 raw HMAC-secret salt，並核對 attestation v7 `pHmacSecret`；舊的 `hmac-secret` extension／v6 `bEnablePrf` 單獨使用時 `bPrfEnabled=false`。Microsoft header 的基礎 MakeCredential `dwFlags` 欄位註記為 reserved，但 v8 `pPRFGlobalEval` 欄位說明明確列出此 flag 作為 raw-salt 選項；請 Officer 確認此版本化說明與目標 Windows SDK/API 相符，不可只讀基礎欄位註記。
 - 斷言用現行的 global raw salt（`crypto::prf_salt_bytes()` + raw flag）即可，與 YubiKey slot 的 KDF 相同。
 - 建立時有 PRF ≠ 斷言時有 PRF（Win11-NB），所以註冊必須額外做一次斷言驗證。
 
@@ -125,9 +125,10 @@ v1 不變，`KeySlot` 新增：
 - 全部既有 Rust／Node／Gate E2E 套件不變通過。
 
 ### 6.2 本機 Console 驗收（隔離測試金庫，不碰正式 `C:\FidoVault\vault.db`）
-- SKYCITY-PC（正向）：V1 建立測試金庫 → V2 註冊 Windows Hello（兩次提示，slot +1）→ V3 鎖定後 Windows Hello 解鎖 → V4 重啟 GUI 後 Windows Hello 登入 → V5 同機再註冊 → 被擋 → V6 YubiKey 與主密碼仍可解鎖 → V7 刪除 Windows Hello slot，設定 → 通行金鑰 無殘留。
-- Win11-NB（負向）：V8 註冊 → 第二次提示後顯示「不支援 PRF」，slot 數不變、Windows 無殘留通行金鑰。
-- 跨機：V9 把 SKYCITY-PC 測試金庫複製到 Win11-NB → 不顯示 Windows Hello 按鈕，YubiKey／主密碼可解鎖。
+- 測試前記錄 Windows passkey access consent 與 provider 設定；只有確認使用裝置本機 Windows passkey provider 時才繼續。未獲核准／遭拒時列為受阻未測，不視為 PRF 失敗；若第三方同步 provider 啟用或狀態不明，取消並標示超出功能範圍，不建立測試 credential。
+- SKYCITY-PC（正向）：V1 建立測試金庫 → V2 註冊 Windows Hello（Create 與 PRF assertion 各自記錄提示前景，slot +1；access consent 另計）→ V3 鎖定後 Windows Hello 解鎖 → V4 重啟 GUI 後 Windows Hello 登入 → V5 同機再註冊 → 被擋 → V6 YubiKey 與主密碼仍可解鎖 → **V9 跨機複製（必須在 V7 移除 slot 前執行）** → V7 刪除 Windows Hello slot，檢查本機及 provider 的特定測試 passkey。
+- Win11-NB（負向）：V8 註冊 → 若 passkey access/provider 前置條件不滿足，列受阻／未測並停止；只有在同意已核准且使用本機 provider 時，才驗證第二階段 PRF assertion 被拒、slot 數不變。程式會嘗試清理；若提示可能有殘留，按單一測試 passkey 規則逐項核對，不可預設 Windows 無殘留。
+- 跨機 V9 預期 Win11-NB 不顯示可用 Windows Hello 按鈕，YubiKey／主密碼仍可解鎖；若 provider 同步使 Hello 可用，記 V9 FAIL、停止並重新評估範圍，不更動全域設定。
 - 每個提示框都要回報是否在前景（Windows Hello 對話框可能不是 `CredentialUIBroker`，見 R2）。
 
 ## 7 風險與待實機確認
@@ -175,6 +176,14 @@ v1 不變，`KeySlot` 新增：
 - [x] D7（2026-10-13，R2 Reviewer PASS、本機回歸與 source+doc head `054f525` exact-head CI `38402500039` PASS；見 §11 D7）
 - [ ] D8
 - [ ] D9
+
+### D8（2026-10-13）文件候選，待 Officer 確認
+
+- 同步範圍：`README.md`、`docs/spec.md`、`docs/PROJECT.md`、`docs/user-verification-steps.md`；本計畫亦同步 passkey access consent、provider 限定及 V9 必須先於 V7 的次序，避免手動驗收互相矛盾。
+- 文件界定單人版 Windows Hello 的 API v8+／PRF assertion／本機 Console、dual-control 拒絕、slot 及清理行為；清楚分隔 Mock Gate 與實體驗收，標示 PR #30 Draft／未部署；並明示 backend 目前使用 v8、僅請求 PLATFORM attachment，尚未使用 API v9 authenticator ID 鎖 provider，因此 Windows 本機 provider 是必要前置而非程式保證。
+- V1–V9 只列待測，加入隔離金庫、主密碼與測試 YubiKey 備援、Windows consent/provider 檢查、提示前景觀察、單項 passkey 清理與停損規則；不重設 Windows Hello 容器、不碰正式金庫、不輸出憑證資料。
+- Microsoft 官方來源已連結，用於 Windows WebAuthn/platform-versus-plugin provider、PRF/raw hmac-secret option 欄位、Windows passkey access consent 及本機/同步 provider 管理。V1–V9 均未實測；D9 build/staging/GUI 尚未執行。
+- 本候選尚未獲 Officer verdict；D8 勾選保持未完成，Officer 的獨立結果與最終文件狀態應於本節追加記錄。
 
 ## 11 驗證紀錄
 

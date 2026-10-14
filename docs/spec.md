@@ -213,6 +213,19 @@ KEK（隨機 256-bit，加解密 payload；與 v1 相同）
 
 **金鑰刪除**：刪除後該群組會剩 0 支 → `LastKeyInGroup`，拒絕且槽位數不變（vault 層強制）。
 
+### 5.6 單人版 Windows Hello（本機平台憑證）
+
+此功能只屬於單人版 v1；雙群組版在呼叫平台 backend 前拒絕 Windows Hello。它是主密碼與外接 FIDO2/YubiKey 以外的另一種解鎖方式，不取代既有備援。
+
+- **可用條件：**不跳提示地檢查 WebAuthn API v8+、Windows Hello 平台驗證器可用（UVPA）及本機 Console session；三項都成立才顯示可用。從 Windows 11 24H2 起，Windows 可能要求逐應用程式 passkey access consent；拒絕／政策阻擋不是 PRF 能力結論，也不得藉此更動組織設定。第三方同步 passkey manager 不在本功能支援範圍。RDP、session 0、API 不足或能力檢查錯誤均 fail closed；不可因此停用主密碼或切回 MockBackend。外接金鑰原有 API v4+／RDP 矩陣不代表 Windows Hello 可在 RDP 使用。
+- **註冊：**要求 platform authenticator、使用者驗證及 resident credential，並在建立時要求 HMAC-secret/PRF。建立回傳 PRF 並不足以證明之後能解鎖：Vault 會立即再做一次 assertion，要求回傳 credential ID 符合預期且 PRF 為相同 32 bytes；通過後才包裝 KEK 並寫入 v1 slot。失敗不寫 slot，並嘗試刪除剛建立的 credential；原生刪除若失敗，Windows 端可能留下孤兒 credential，UI 必須提示人工清理。
+- **格式：**v1 `KeySlot.authenticator` 可選值 `platform` 標記 Windows Hello slot；舊 roaming slot 不帶此欄位且序列化保持相容。platform credential ID 用於將 Windows 回傳 credential 與 vault slot 配對；它不是 PRF／KEK 等解密祕密，但仍應避免放入 log 或對使用者不必要的畫面。v2 不接受 platform marker。
+- **本機配對與登入：**目前 backend 使用 v8 options，要求 `PLATFORM` attachment，但未呼叫 v9 `WebAuthNGetAuthenticatorList`／設定 authenticator ID，因此沒有指定或鎖定特定 passkey provider；Windows 11 24H2 可支援 plugin passkey managers，實際 provider 由 Windows 選擇。Microsoft API v9 有 targeting 能力，但本功能尚未實作，故「只支援 Windows 裝置本機 Windows Hello provider、不支援第三方同步 manager」是 OS 設定與驗收前置條件，不是程式強制保證。provider 不明或非本機 Hello 時，不得宣稱符合範圍。UI 只在 credential ID 與 vault platform slot 相符時顯示 Hello 登入入口。登入 assertion allow-list 僅包含配對的 platform IDs，並核對回傳 ID／PRF 後解鎖。credential 不保存在 `vault.db`，複製 vault 檔案本身不會匯出 credential。
+- **刪除與清理：**先移除並保存 vault slot，再做 fresh 本機 credential discovery，最後 best-effort 刪除對應 Windows credential。若 discovery／原生刪除失敗，UI 回報可能需手動清理；不可把 warning 說成已清乾淨，也不可重設整個 Windows Hello 容器來清理單一測試憑證。
+- **邊界：**PRF assertion 不支援時顯示原因、不新增 vault slot，建 credential 後的 cleanup 仍可能失敗。以專用測試 credential 驗收；不要輸出密碼、PIN、PRF 或 KEK，不要對正式金庫測試。實機驗收清單 V1–V9 見 `docs/user-verification-steps.md`。
+
+Microsoft 參考： [Windows WebAuthn API](https://learn.microsoft.com/en-us/windows/win32/api/_webauthn/)；[Microsoft WebAuthn SDK header（PRF／raw hmac-secret 欄位定義）](https://github.com/microsoft/webauthn/blob/master/webauthn.h)；[WebAuthNGetAuthenticatorList（API v9 authenticator targeting）](https://learn.microsoft.com/en-us/windows/win32/api/webauthn/nf-webauthn-webauthngetauthenticatorlist)；[Windows WebAuthn APIs 與 plugin passkey managers](https://learn.microsoft.com/en-us/windows/security/identity-protection/hello-for-business/webauthn-apis)；[建立 credential 的 API options（含 PRF 欄位）](https://learn.microsoft.com/en-us/windows/win32/api/webauthn/ns-webauthn-webauthn_authenticator_make_credential_options)；[Windows passkey access consent](https://learn.microsoft.com/en-us/windows/security/identity-protection/passkeys/)；[管理儲存在 Windows 或同步 provider 的 passkeys](https://support.microsoft.com/en-us/accounts-billing/security/manage-your-saved-passkeys)。
+
 ## 6. 軌跡紀錄（audit）
 
 事件集：`vault_created, login_success, login_failed, key_registered, key_removed, entry_added, entry_updated, entry_deleted, entries_imported, auto_lock, manual_lock`。
