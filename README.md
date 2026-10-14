@@ -23,7 +23,7 @@ Windows 桌面、**完全離線**、**portable 免安裝**的 FIDO2 密碼金庫
 - `main` 已包含 PR #2–#26；目前 Win11-NB 正式部署 GUI 來自 PR #25（commit `5b943c7`，`main` `5073642` 起），SHA-256 `3b3f7367be81baab1a37c5249788f815c397b9e5241289880a3e6f7618996322`，2026-10-11 部署至 `C:\FidoVault`。
 - 自動化驗證（GitHub Actions，Windows）：UI 65/65、Rust `--features real-ctap` 200/200、mock Gate E2E 20/20。
 - 部署、驗收與殘餘未測項目見 `docs/PROJECT.md` §17、`docs/user-verification-steps.md` 末節與 `docs/rdp-webauthn-verification.md` R6。
-- **單人版 Windows Hello（PR #30，Draft）**：D1–D7 程式及 Mock Gate 已完成；D8 文件同步進行中，D9 Release／隔離 staging／實機驗收尚未完成。PR 未合併、未部署；目前正式安裝版本沒有由本分支交付的 Windows Hello，不能把 mock 通過當成實機支援。細節見下方「單人版 Windows Hello」、`docs/spec.md` 與 `docs/user-verification-steps.md` 的 V1–V9。
+- **單人版 Windows Hello（PR #30，Draft）**：D1–D7 程式及 Mock Gate 已完成；D8 文件同步已審查完成；D9 Release／隔離 staging／實機驗收尚未完成。PR 未合併、未部署；目前正式安裝版本沒有由本分支交付的 Windows Hello，不能把 mock 通過當成實機支援。細節見下方「單人版 Windows Hello」、`docs/spec.md` 與 `docs/user-verification-steps.md` 的 V1–V9。
 - **雙群組控管版（開發中）**：分支 `feature/dual-control-20261011`、draft PR #29。D1–D11（程式與全套自動化驗證）已完成，Win11-NB 實機驗收（D13）尚未執行；**未合併、未部署，不是可發佈產物**。見下方「雙群組控管版」與 `docs/plans/dual-control.md`。
 
 ## 目錄結構

@@ -1,6 +1,6 @@
 # 單人版 Windows Hello 登入／解鎖（windows-hello-single）
 
-> 狀態：D1–D7 完成；D8 文件候選整理中並待 Officer 獨立確認；D9 實機尚未執行。PR #30 維持 OPEN Draft，未合併／未部署。
+> 狀態：D1–D8 完成；D9 Release／隔離 staging／實機 V1–V9 尚未執行。PR #30 維持 OPEN Draft，未合併／未部署。
 > 範圍：只有單人版 `portable-fido-vault.exe`。雙群組控管版（`portable-fido-vault-dual.exe`，v2）**不動**。
 
 ## 0 目標
@@ -174,16 +174,17 @@ v1 不變，`KeySlot` 新增：
 - [x] D5（2026-10-13，本機 IPC／兩位 completed-code review／回歸及建置完成；Hosted CI 以 §11 D5 的發布 receipt／Kanban 為準）
 - [x] D6（R3 雙審查、本機回歸與 source+doc head `27553a2` exact-head CI `38392679679` PASS；見 §11 D6）
 - [x] D7（2026-10-13，R2 Reviewer PASS、本機回歸與 source+doc head `054f525` exact-head CI `38402500039` PASS；見 §11 D7）
-- [ ] D8
+- [x] D8（2026-10-14，Officer R3 完整文件審查 PASS＋Reviewer R3→R4 增量 PASS；reviewed 文件 commit `bbc731f`；見下方 D8 節）
 - [ ] D9
 
-### D8（2026-10-13）文件候選，待 Officer 確認
+### D8（2026-10-13～14）文件同步與審查
 
 - 同步範圍：`README.md`、`docs/spec.md`、`docs/PROJECT.md`、`docs/user-verification-steps.md`；本計畫亦同步 passkey access consent、provider 限定及 V9 必須先於 V7 的次序，避免手動驗收互相矛盾。
 - 文件界定單人版 Windows Hello 的 API v8+／PRF assertion／本機 Console、dual-control 拒絕、slot 及清理行為；清楚分隔 Mock Gate 與實體驗收，標示 PR #30 Draft／未部署；並明示 backend 目前使用 v8、僅請求 PLATFORM attachment，尚未使用 API v9 authenticator ID 鎖 provider，因此 Windows 本機 provider 是必要前置而非程式保證。
 - V1–V9 只列待測，加入隔離金庫、主密碼與測試 YubiKey 備援、Windows consent/provider 檢查、提示前景觀察、單項 passkey 清理與停損規則；不重設 Windows Hello 容器、不碰正式金庫、不輸出憑證資料。
 - Microsoft 官方來源已連結，用於 Windows WebAuthn/platform-versus-plugin provider、PRF/raw hmac-secret option 欄位、Windows passkey access consent 及本機/同步 provider 管理。V1–V9 均未實測；D9 build/staging/GUI 尚未執行。
-- 本候選尚未獲 Officer verdict；D8 勾選保持未完成，Officer 的獨立結果與最終文件狀態應於本節追加記錄。
+- **審查：** Officer R3 全新唯讀審查（manifest SHA256 `deb5e7b0…a061`、patch `21c4bf31…f4a7`）`passed=true`、`coverage_complete=true`，3 項非阻斷建議。Reviewer 獨立確認建議 1–3 應採納並同意安全邊界；R4（manifest `3f32fb80…d0e2`、patch `59726bb8…d4e0`）落實三項，Reviewer `WH-D8-R4-DELTA-RETRY-2` 5/5 checks PASS（完整性依據為 parent-verified；199 檔逐 byte 與來源一致）。使用者 2026-10-14 決定 R4 以 Reviewer 審查即可，不再送 Officer。
+- **發布：** reviewed R4 內容原樣提交為 `bbc731f`（逐檔 EOL 正規化後與 R4 snapshot 相同）；本狀態同步為獨立 docs-only commit。D8 只涵蓋文件；V1–V9 仍全部未測，D9、部署與合併未開始。
 
 ## 11 驗證紀錄
 
