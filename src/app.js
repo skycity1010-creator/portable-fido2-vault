@@ -4,6 +4,55 @@ const { invoke } = window.__TAURI__.core;
 const $ = (id) => document.getElementById(id);
 
 let selectedKey = null;
+let registrationCleanupReceipt = null;
+let registrationCleanupQuerySequence = 0;
+let registrationHandoffReceiptTimer = null;
+let registrationCleanupAckInFlight = false;
+// One policy for the acknowledge button: never while an ack is in flight, never for the
+// journal-unavailable notice (it cannot be acknowledged).
+function registrationCleanupAckDisabled() {
+  return registrationCleanupAckInFlight || registrationCleanupReceipt?.id === "journal-unavailable";
+}
+const CLEANUP_WARNING = "本次建立的 Windows Hello 憑證未能自動刪除，請到「設定 → 帳戶 → 通行金鑰」只刪除本次測試項目。確認已閱讀後，按「我已知悉」。";
+// 無法重新證明本機持有時程式刻意不刪除（避免誤刪），但憑證仍可能存在。
+const UNVERIFIED_CLEANUP_WARNING = "本次建立的 Windows Hello 憑證無法確認是否已清除（程式未刪除無法證明的項目），請到「設定 → 帳戶 → 通行金鑰」只檢查並刪除本次測試項目。確認已閱讀後，按「我已知悉」。";
+async function refreshRegistrationCleanupWarning() {
+  const sequence = ++registrationCleanupQuerySequence;
+  const receipts = await invoke("registration_cleanup_status");
+  if (sequence !== registrationCleanupQuerySequence) return;
+  registrationCleanupReceipt = Array.isArray(receipts)
+    ? receipts.find((receipt) => receipt?.cleanup === "manual_removal_required"
+        && receipt.reason === "storage_unavailable")
+      || receipts.find((receipt) => receipt?.cleanup === "manual_removal_required") || null : null;
+  if (registrationCleanupReceipt) {
+    const unavailable = registrationCleanupReceipt.reason === "storage_unavailable";
+    $("registration-cleanup-message").textContent = unavailable
+      ? `清理通知的儲存位置無法使用，關閉程式後可能無法保留警告。若本次 Windows Hello 憑證未能自動清理，請只檢查本次測試項目；${CLEANUP_WARNING}`
+      : registrationCleanupReceipt.reason === "unverified" ? UNVERIFIED_CLEANUP_WARNING : CLEANUP_WARNING;
+    $("btn-acknowledge-registration-cleanup").disabled = registrationCleanupAckDisabled();
+    show("registration-cleanup-warning");
+  } else {
+    $("registration-cleanup-message").textContent = "";
+    hide("registration-cleanup-warning");
+  }
+}
+async function acknowledgeRegistrationCleanup() {
+  const receipt = registrationCleanupReceipt;
+  if (!receipt) return;
+  const button = $("btn-acknowledge-registration-cleanup");
+  if (button.disabled || registrationCleanupAckInFlight) return;
+  registrationCleanupAckInFlight = true;
+  button.disabled = true;
+  try {
+    await invoke("acknowledge_registration_cleanup", { id: receipt.id });
+    await refreshRegistrationCleanupWarning();
+  } catch (e) {
+    $("registration-cleanup-message").textContent = `${CLEANUP_WARNING} 確認失敗：${String(e)}`;
+  } finally {
+    registrationCleanupAckInFlight = false;
+    button.disabled = registrationCleanupAckDisabled();
+  }
+}
 let brokeredKeyLogin = false;
 let idleTimer = null;
 let idleMinutes = 5;
@@ -83,6 +132,7 @@ async function boot() {
   try {
     await loadEdition();
     const info = await invoke("boot_info");
+    try { await refreshRegistrationCleanupWarning(); } catch { /* 登入仍可用，下一次操作再查。 */ }
     if (info.has_vault) {
       show("screen-login");
       hide("setup-panel");
@@ -266,6 +316,8 @@ async function enterMain(entries, options = {}) {
   const audit = await invoke("list_audit");
   if (session !== entryDeleteSession) return;
   entryDeleteLocking = false;
+  try { await refreshRegistrationCleanupWarning(); } catch { /* 保留既有警告，下次再查。 */ }
+  if (session !== entryDeleteSession) return;
   renderEntries(entries);
   renderAudit(audit);
   renderKeys();
@@ -667,8 +719,10 @@ async function renderKeys() {
     const rm = document.createElement("button");
     rm.textContent = "移除";
     rm.style.marginLeft = "auto";
+    // 註冊待確認期間停用金鑰管理（Rust 端移除前也會先取消 pending）。
+    rm.disabled = Boolean(registrationHandoff);
     rm.onclick = async () => {
-      if (rm.disabled) return;
+      if (rm.disabled || registrationHandoff) return;
       if (!confirm(`確定移除金鑰「${k.label}」？\n移除後該金鑰無法再解鎖（不可逆）。`)) return;
       rm.disabled = true;
       keyRemovalFeedback("正在移除金鑰…");
@@ -686,7 +740,7 @@ async function renderKeys() {
         await renderKeys();
       } catch (e) {
         keyRemovalFeedback(`移除失敗：${String(e)}`);
-      } finally { rm.disabled = false; }
+      } finally { rm.disabled = Boolean(registrationHandoff); }
     };
     div.appendChild(rm);
     box.appendChild(div);
@@ -746,8 +800,9 @@ function dualKeyItem(key) {
     remove.title = `不可刪除 ${groupName(key.group)}的最後一支金鑰（A、B 群組各須保留至少一支）`;
     remove.setAttribute("aria-disabled", "true");
   }
+  if (registrationHandoff) remove.disabled = true;
   remove.onclick = async () => {
-    if (remove.disabled) return;
+    if (remove.disabled || registrationHandoff) return;
     if (!confirm(`確定移除${groupName(key.group)}金鑰「${key.label}」？\n移除後該金鑰無法再解鎖（不可逆）。`)) return;
     await invoke("remove_key", { credentialId: key.credential_id }).then(() => renderKeys()).catch((e) => alert(String(e)));
   };
@@ -842,28 +897,154 @@ function bindKeyNameDialog() {
   $("btn-cancel-key-name").onclick = () => dialog.close("cancel");
 }
 
+// ─────────────── D9-F1：註冊第二階段前景交接 ───────────────
+// 第一個 ceremony 已建立 credential，但 Windows 未把焦點交回 → Rust 保留 pending 註冊。
+// 使用者點「繼續驗證」本身讓 FidoVault 成為前景，再以全新斷言完成；或點「取消」放棄。
+let registrationHandoff = null; // { kind: "key" | "hello", group }
+let registrationHandoffInFlight = false;
+const CANCEL_CLEANUP_MESSAGES = {
+  removed: "已取消註冊，並已刪除本次建立的 Windows Hello 憑證；金庫未新增金鑰槽。",
+  manual_removal_required: "已取消註冊（金庫未新增金鑰槽），但無法自動刪除本次建立的 Windows Hello 憑證；請到「設定 → 帳戶 → 通行金鑰」只刪除本次測試項目。",
+  discarded: "已取消註冊；金庫未新增金鑰槽。",
+  none: "已取消（沒有待完成的註冊）；金庫未新增金鑰槽。",
+};
+
+function registrationStatusId(kind) {
+  return kind === "hello" ? "hello-register-status" : "register-status";
+}
+
+function registrationFailureText(kind, error) {
+  return kind === "hello"
+    ? `註冊失敗：${String(error)}。若 Windows 通行金鑰仍有殘留，請到 設定 → 帳戶 → 通行金鑰 手動刪除。`
+    : "失敗：" + String(error);
+}
+
+function setRegistrationHandoffButtonsDisabled(disabled) {
+  $("btn-continue-registration").disabled = disabled;
+  $("btn-cancel-registration").disabled = disabled;
+}
+
+function showRegistrationHandoff(kind, message, group) {
+  registrationHandoff = { kind, group: group || null };
+  const handoff = registrationHandoff;
+  const checkReceipt = async () => {
+    registrationHandoffReceiptTimer = null;
+    if (registrationHandoff !== handoff) return;
+    try {
+      await refreshRegistrationCleanupWarning();
+    } catch {
+      console.error("registration cleanup status unavailable");
+    }
+    if (registrationHandoff === handoff) {
+      registrationHandoffReceiptTimer = setTimeout(checkReceipt, 3000);
+    }
+  };
+  if (registrationHandoffReceiptTimer !== null) clearTimeout(registrationHandoffReceiptTimer);
+  registrationHandoffReceiptTimer = setTimeout(checkReceipt, 3000);
+  // 訊息一律以 textContent 呈現，不經 innerHTML。
+  $("registration-handoff-message").textContent = String(message ?? "");
+  show("registration-handoff");
+  setRegistrationHandoffButtonsDisabled(false);
+  $("btn-register-key").disabled = true;
+  $("btn-register-hello").disabled = true;
+  $(registrationStatusId(kind)).textContent = "金鑰已建立，尚未加入金庫；請選擇「繼續驗證」或「取消」。";
+  renderKeys();
+}
+
+function hideRegistrationHandoff() {
+  if (registrationHandoffReceiptTimer !== null) {
+    clearTimeout(registrationHandoffReceiptTimer);
+    registrationHandoffReceiptTimer = null;
+  }
+  registrationHandoff = null;
+  $("registration-handoff-message").textContent = "";
+  hide("registration-handoff");
+  $("btn-register-key").disabled = false;
+  $("btn-register-hello").disabled = false;
+}
+
+// 共用：register_key / register_windows_hello / continue_registration 的回應。
+async function applyRegisterResult(kind, result, group) {
+  if (result?.status === "handoff_required") {
+    showRegistrationHandoff(kind, result.message, group);
+    return;
+  }
+  if (result?.status !== "registered" || !result.credential) throw Error("未知的註冊回應");
+  if (registrationHandoff) hideRegistrationHandoff();
+  const reg = result.credential;
+  if (kind === "hello") {
+    $("hello-register-status").textContent = `已註冊 Windows Hello：${reg.label}`;
+    await renderKeys();
+  } else {
+    $("register-status").textContent = group
+      ? `已註冊：${reg.label}（${reg.key_type}）— ${groupName(group)}`
+      : `已註冊：${reg.label}（${reg.key_type}）`;
+    renderKeys();
+  }
+}
+
+async function continueRegistration() {
+  const handoff = registrationHandoff;
+  if (!handoff || registrationHandoffInFlight) return;
+  registrationHandoffInFlight = true;
+  setRegistrationHandoffButtonsDisabled(true);
+  $(registrationStatusId(handoff.kind)).textContent = handoff.kind === "hello"
+    ? "請依 Windows Hello 提示完成驗證…"
+    : "請依 Windows 安全性視窗提示完成金鑰驗證";
+  try {
+    const result = await invoke("continue_registration");
+    await applyRegisterResult(handoff.kind, result, handoff.group);
+  } catch (e) {
+    $(registrationStatusId(handoff.kind)).textContent = registrationFailureText(handoff.kind, e);
+    if (/沒有待完成|逾時|金庫已變更/.test(String(e))) hideRegistrationHandoff();
+    try { await refreshRegistrationCleanupWarning(); } catch { /* 保留既有警告。 */ }
+  } finally {
+    registrationHandoffInFlight = false;
+    setRegistrationHandoffButtonsDisabled(false);
+  }
+}
+
+async function cancelRegistration() {
+  const handoff = registrationHandoff;
+  if (!handoff || registrationHandoffInFlight) return;
+  registrationHandoffInFlight = true;
+  setRegistrationHandoffButtonsDisabled(true);
+  try {
+    const result = await invoke("cancel_registration");
+    hideRegistrationHandoff();
+    $(registrationStatusId(handoff.kind)).textContent = CANCEL_CLEANUP_MESSAGES[result?.cleanup]
+      || "已取消註冊；清理結果未知，請確認金庫與 Windows 通行金鑰狀態。";
+    await renderKeys();
+    try { await refreshRegistrationCleanupWarning(); } catch { /* 已顯示取消結果，不覆蓋警告。 */ }
+  } catch (e) {
+    $(registrationStatusId(handoff.kind)).textContent = `取消失敗：${String(e)}`;
+  } finally {
+    registrationHandoffInFlight = false;
+    setRegistrationHandoffButtonsDisabled(false);
+  }
+}
+
 async function registerHello() {
   if (!helloEditionConfirmed) return;
   const button = $("btn-register-hello");
-  if (button.disabled || button.classList.contains("hidden")) return;
+  if (button.disabled || button.classList.contains("hidden") || registrationHandoff) return;
   button.disabled = true;
   button.setAttribute("aria-busy", "true");
   $("hello-register-status").textContent = "請依 Windows Hello 提示完成建立與再次驗證…";
   try {
-    const reg = await invoke("register_windows_hello");
-    $("hello-register-status").textContent = `已註冊 Windows Hello：${reg.label}`;
-    await renderKeys();
+    await applyRegisterResult("hello", await invoke("register_windows_hello"), null);
   } catch (e) {
-    $("hello-register-status").textContent = `註冊失敗：${String(e)}。若 Windows 通行金鑰仍有殘留，請到 設定 → 帳戶 → 通行金鑰 手動刪除。`;
+    $("hello-register-status").textContent = registrationFailureText("hello", e);
   } finally {
-    button.disabled = false;
+    try { await refreshRegistrationCleanupWarning(); } catch { /* 保留既有警告。 */ }
+    button.disabled = Boolean(registrationHandoff);
     button.removeAttribute?.("aria-busy");
   }
 }
 
 async function registerKey() {
   const registerButton = $("btn-register-key");
-  if (registerButton.disabled) return;
+  if (registerButton.disabled || registrationHandoff) return;
   registerButton.disabled = true;
   registerButton.setAttribute("aria-busy", "true");
   $("register-status").textContent = "請先為此金鑰命名";
@@ -890,14 +1071,11 @@ async function registerKey() {
     }
     const args = { pin, label };
     if (isDual()) args.group = group;
-    const reg = await invoke("register_key", args);
-    $("register-status").textContent = isDual()
-      ? `已註冊：${reg.label}（${reg.key_type}）— ${groupName(group)}`
-      : `已註冊：${reg.label}（${reg.key_type}）`;
-    renderKeys();
-  } catch (e) { $("register-status").textContent = "失敗：" + String(e); }
+    await applyRegisterResult("key", await invoke("register_key", args), isDual() ? group : null);
+  } catch (e) { $("register-status").textContent = registrationFailureText("key", e); }
   finally {
-    registerButton.disabled = false;
+    try { await refreshRegistrationCleanupWarning(); } catch { /* 保留既有警告。 */ }
+    registerButton.disabled = Boolean(registrationHandoff);
     registerButton.removeAttribute?.("aria-busy");
   }
 }
@@ -1229,6 +1407,9 @@ document.addEventListener("DOMContentLoaded", () => {
   $("btn-toggle-ed-pass").onclick = () => togglePasswordVisibility("ed-pass", "btn-toggle-ed-pass");
   $("btn-register-key").onclick = registerKey;
   $("btn-register-hello").onclick = registerHello;
+  $("btn-continue-registration").onclick = continueRegistration;
+  $("btn-cancel-registration").onclick = cancelRegistration;
+  $("btn-acknowledge-registration-cleanup").onclick = acknowledgeRegistrationCleanup;
   bindKeyNameDialog();
   $("btn-set-idle").onclick = setIdle;
   $("btn-set-password-history-limit").onclick = setPasswordHistoryLimit;

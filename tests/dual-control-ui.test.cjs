@@ -127,7 +127,7 @@ function loadUi({ edition = "dual", keys = KEYS_AB, brokered = true, handlers = 
     suggest_key_label: () => "安全性金鑰",
     validate_key_label: () => undefined,
     detect_key: () => ({ key_type: "windows_managed", label: "Windows" }),
-    register_key: (args) => ({ label: args.label, key_type: "windows_managed" }),
+    register_key: (args) => ({ status: "registered", credential: { label: args.label, key_type: "windows_managed" } }),
     remove_key: () => undefined,
     set_dual_step_timeout: () => undefined,
     lock: () => ({}),

@@ -112,11 +112,103 @@ pub enum PlatformCleanupOutcome {
     ManualRemovalRequired(PlatformCleanupWarning),
 }
 
+/// Non-secret result of cleaning a newly-created platform credential after a failed
+/// registration. `NotAttempted` means the credential could not be re-proven local (or a
+/// precondition failed) so it was deliberately not deleted, yet may still exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistrationCleanupReport {
+    Removed,
+    DeleteFailed,
+    NotAttempted,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlatformCleanupWarning {
     NotLocal,
     DiscoveryFailed,
     DeleteFailed,
+}
+
+/// 註冊第二階段（驗證斷言）因 Windows 未交回前景而被拒時保留的狀態（D9-F1）。
+/// 只存在 Rust 端記憶體：不可序列化、不可複製；PIN 與建立時 PRF 在 drop 時清零。
+pub enum PendingRegistration {
+    Roaming {
+        credential: RegisteredCredential,
+        pin: Option<Zeroizing<String>>,
+        custom_label: Option<String>,
+        group: Option<KeyGroup>,
+    },
+    Platform {
+        credential: RegisteredCredential,
+        creation_prf: Zeroizing<[u8; 32]>,
+        label: String,
+    },
+}
+
+impl PendingRegistration {
+    pub fn is_platform(&self) -> bool {
+        matches!(self, Self::Platform { .. })
+    }
+}
+
+impl std::fmt::Debug for PendingRegistration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 只顯示種類與 label；不含 PIN、PRF、credential ID。
+        match self {
+            Self::Roaming {
+                credential,
+                custom_label,
+                ..
+            } => f
+                .debug_struct("PendingRegistration::Roaming")
+                .field("label", custom_label.as_ref().unwrap_or(&credential.label))
+                .finish_non_exhaustive(),
+            Self::Platform { label, .. } => f
+                .debug_struct("PendingRegistration::Platform")
+                .field("label", label)
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum RegistrationOutcome {
+    Registered(RegisteredCredential),
+    HandoffRequired(PendingRegistration),
+}
+
+/// 放棄 pending 註冊後的清理結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelOutcome {
+    /// 已刪除本次建立的 Windows Hello credential。
+    Removed,
+    /// 無法證明或無法刪除；需使用者到 Windows 設定手動刪除本次項目。
+    ManualRemovalRequired,
+    /// roaming：金庫未新增槽位，pending 已丟棄（金鑰端無法由程式刪除）。
+    Discarded,
+}
+
+/// 放棄 pending 註冊（D9-F1）。Windows Hello：重新以 RP 清單證明後 best-effort 刪除。
+pub fn cancel_registration(
+    backend: &mut (dyn FidoBackend + 'static),
+    pending: PendingRegistration,
+) -> CancelOutcome {
+    let PendingRegistration::Platform { credential, .. } = pending else {
+        return CancelOutcome::Discarded;
+    };
+    // Native delete has no RP argument: fresh RP-scoped membership is mandatory.
+    if !backend.platform_status().available() {
+        return CancelOutcome::ManualRemovalRequired;
+    }
+    match backend.list_platform_credentials() {
+        Ok(local) if local.contains(&credential.credential_id) => {
+            match backend.delete_platform_credential(&credential.credential_id) {
+                Ok(()) => CancelOutcome::Removed,
+                Err(_) => CancelOutcome::ManualRemovalRequired,
+            }
+        }
+        _ => CancelOutcome::ManualRemovalRequired,
+    }
 }
 
 // ─────────────────────────── 資料模型 ───────────────────────────
@@ -621,6 +713,8 @@ pub struct Vault {
     header: Header,
     data: VaultData,
     kek: Zeroizing<[u8; 32]>,
+    /// Non-secret one-shot side channel; preserves the original typed registration error.
+    registration_cleanup_report: Option<RegistrationCleanupReport>,
 }
 
 impl Vault {
@@ -718,6 +812,7 @@ impl Vault {
             header,
             data,
             kek,
+            registration_cleanup_report: None,
         };
         vault.write_file()?;
         Ok(vault)
@@ -736,6 +831,22 @@ impl Vault {
     /// 這個金庫的版本（由 header.v 決定，read_file 已驗證過形狀）。
     pub fn edition(&self) -> Edition {
         edition_of(&self.header)
+    }
+
+    /// One-shot, non-secret report of a failed deletion following a registration error.
+    /// The caller must consume it after each ceremony; the original VaultError is unchanged.
+    pub fn take_registration_cleanup_report(&mut self) -> Option<RegistrationCleanupReport> {
+        self.registration_cleanup_report.take()
+    }
+
+    /// True when `id` names no existing slot, i.e. it can only be the pending new credential.
+    fn is_new_platform_credential_id(&self, id: &[u8]) -> bool {
+        !id.is_empty()
+            && !self
+                .header
+                .key_slots
+                .iter()
+                .any(|slot| base64_decode(&slot.credential_id).is_ok_and(|known| known == id))
     }
 
     // ── 開啟（解鎖）──
@@ -1185,6 +1296,7 @@ impl Vault {
             header,
             data,
             kek,
+            registration_cleanup_report: None,
         };
         vault.data.audit.push(AuditEvent {
             ts: now_audit_time(),
@@ -1547,13 +1659,30 @@ impl Vault {
         Ok(())
     }
 
-    /// Windows Hello registration; caller supplies the local computer name.
-    pub fn register_windows_hello(
+    /// D9-F1：與 `register_key_for` 相同，但第二個 ceremony 因前景未交回被拒時回 `HandoffRequired`。
+    pub fn begin_register_key_for(
+        &mut self,
+        backend: &mut (dyn FidoBackend + 'static),
+        pin: Option<&str>,
+        candidate_label: &str,
+        group: Option<KeyGroup>,
+    ) -> Result<RegistrationOutcome, VaultError> {
+        // 與 register_key_for → register_key_with_label / register_key_in_group 相同的前置檢查。
+        if group.is_some() && self.edition() != Edition::Dual {
+            return Err(VaultError::Format("單人版金庫不支援金鑰群組".into()));
+        }
+        let label = self.validate_new_key_label(candidate_label)?;
+        self.begin_register_key_internal(backend, pin, Some(&label), group)
+    }
+
+    /// D9-F1：與 `register_windows_hello` 相同，但前景未交回時保留 credential 並回 `HandoffRequired`。
+    pub fn begin_register_windows_hello(
         &mut self,
         backend: &mut (dyn FidoBackend + 'static),
         computer_name: &str,
         edition: Edition,
-    ) -> Result<RegisteredCredential, VaultError> {
+    ) -> Result<RegistrationOutcome, VaultError> {
+        self.registration_cleanup_report = None;
         check_header_edition(&self.header, edition)?;
         if edition != Edition::Single {
             return Err(VaultError::Format("Windows Hello 僅支援單人版".into()));
@@ -1604,7 +1733,13 @@ impl Vault {
         };
         let registration = backend.register_platform_credential(&label, &exclude)?;
         let reg = registration.credential;
-        let all = decode_credential_ids(&self.header.key_slots.iter().collect::<Vec<_>>())?;
+        let all = match decode_credential_ids(&self.header.key_slots.iter().collect::<Vec<_>>()) {
+            Ok(all) => all,
+            Err(error) => {
+                self.registration_cleanup_report = Some(RegistrationCleanupReport::NotAttempted);
+                return Err(error);
+            }
+        };
         if reg.credential_id.is_empty()
             || all.contains(&reg.credential_id)
             || local_before.contains(&reg.credential_id)
@@ -1613,37 +1748,201 @@ impl Vault {
             return Err(FidoError::PlatformCredentialExists.into());
         }
         // The RP-scoped local list must prove ownership before assertion or cleanup.
-        if !backend
-            .list_platform_credentials()?
-            .contains(&reg.credential_id)
-        {
+        // A new credential that cannot be re-proven is never deleted, but is reported.
+        let proven = match backend.list_platform_credentials() {
+            Ok(local) => local.contains(&reg.credential_id),
+            Err(error) => {
+                self.registration_cleanup_report = Some(RegistrationCleanupReport::NotAttempted);
+                return Err(error.into());
+            }
+        };
+        if !proven {
+            self.registration_cleanup_report = Some(RegistrationCleanupReport::NotAttempted);
             return Err(FidoError::PlatformCredentialMissing.into());
         }
+        self.complete_platform_registration(backend, reg, registration.creation_prf, label)
+    }
+
+    /// Windows Hello registration; caller supplies the local computer name.
+    pub fn register_windows_hello(
+        &mut self,
+        backend: &mut (dyn FidoBackend + 'static),
+        computer_name: &str,
+        edition: Edition,
+    ) -> Result<RegisteredCredential, VaultError> {
+        match self.begin_register_windows_hello(backend, computer_name, edition)? {
+            RegistrationOutcome::Registered(reg) => Ok(reg),
+            // Legacy callers have no pending flow: keep delete-on-failure semantics.
+            RegistrationOutcome::HandoffRequired(pending) => {
+                if let PendingRegistration::Platform { credential, .. } = &pending {
+                    let _ = backend.delete_platform_credential(&credential.credential_id);
+                }
+                Err(FidoError::ForegroundHandoffRequired.into())
+            }
+        }
+    }
+
+    /// D9-F1：使用者點擊「繼續驗證」後，以全新的一般斷言完成 pending 註冊。
+    /// 不放寬任何守門：前置條件重新檢查；Windows Hello 先以 RP 清單重新證明本機持有。
+    pub fn continue_registration(
+        &mut self,
+        backend: &mut (dyn FidoBackend + 'static),
+        pending: PendingRegistration,
+        edition: Edition,
+    ) -> Result<RegistrationOutcome, VaultError> {
+        self.registration_cleanup_report = None;
+        let platform_id = match &pending {
+            PendingRegistration::Platform { credential, .. } => {
+                Some(credential.credential_id.clone())
+            }
+            PendingRegistration::Roaming { .. } => None,
+        };
+        let result = self.continue_registration_unreported(backend, pending, edition);
+        // Any failure that consumed a new platform pending without a cleanup verdict
+        // (availability, discovery, membership, label, edition...) leaves a credential that
+        // may still exist: report it conservatively. Existing slot IDs are never "new".
+        if let (Err(_), Some(id)) = (&result, platform_id) {
+            if self.registration_cleanup_report.is_none() && self.is_new_platform_credential_id(&id)
+            {
+                self.registration_cleanup_report = Some(RegistrationCleanupReport::NotAttempted);
+            }
+        }
+        result
+    }
+
+    fn continue_registration_unreported(
+        &mut self,
+        backend: &mut (dyn FidoBackend + 'static),
+        pending: PendingRegistration,
+        edition: Edition,
+    ) -> Result<RegistrationOutcome, VaultError> {
+        check_header_edition(&self.header, edition)?;
+        let existing = decode_credential_ids(&self.header.key_slots.iter().collect::<Vec<_>>())?;
+        match pending {
+            PendingRegistration::Roaming {
+                credential,
+                pin,
+                custom_label,
+                group,
+            } => {
+                let share = self.roaming_group_share(group)?;
+                if credential.credential_id.is_empty()
+                    || existing.contains(&credential.credential_id)
+                {
+                    return Err(FidoError::CredentialExcluded.into());
+                }
+                let custom_label = match custom_label {
+                    Some(label) => Some(self.validate_new_key_label(&label)?),
+                    None => None,
+                };
+                self.complete_roaming_registration(
+                    backend,
+                    credential,
+                    pin,
+                    custom_label,
+                    group,
+                    share,
+                )
+            }
+            PendingRegistration::Platform {
+                credential,
+                creation_prf,
+                label,
+            } => {
+                if edition != Edition::Single {
+                    return Err(VaultError::Format("Windows Hello 僅支援單人版".into()));
+                }
+                // An existing ID is not evidence of a newly-created credential; never delete it.
+                if credential.credential_id.is_empty()
+                    || existing.contains(&credential.credential_id)
+                {
+                    return Err(FidoError::PlatformCredentialExists.into());
+                }
+                let label = self.validate_new_key_label(&label)?;
+                if !backend.platform_status().available() {
+                    return Err(FidoError::NotSupported(
+                        crate::fido2::PLATFORM_UNSUPPORTED_MSG.into(),
+                    )
+                    .into());
+                }
+                // Fresh RP-scoped proof; unproven credentials are never deleted.
+                if !backend
+                    .list_platform_credentials()?
+                    .contains(&credential.credential_id)
+                {
+                    return Err(FidoError::PlatformCredentialMissing.into());
+                }
+                self.complete_platform_registration(backend, credential, creation_prf, label)
+            }
+        }
+    }
+
+    /// Second (assertion) ceremony + constant-time PRF comparison + wrap + audit.
+    /// Membership was proven by the caller. A foreground handoff refusal keeps the
+    /// credential and returns `HandoffRequired`; every other failure attempts deletion.
+    /// A failed deletion is reported on a one-shot side channel without masking the primary error.
+    fn cleanup_failed_platform_registration(
+        &mut self,
+        backend: &mut (dyn FidoBackend + 'static),
+        id: &[u8],
+        error: VaultError,
+    ) -> VaultError {
+        self.registration_cleanup_report = Some(match backend.delete_platform_credential(id) {
+            Ok(()) => RegistrationCleanupReport::Removed,
+            Err(_) => RegistrationCleanupReport::DeleteFailed,
+        });
+        error
+    }
+
+    fn complete_platform_registration(
+        &mut self,
+        backend: &mut (dyn FidoBackend + 'static),
+        reg: RegisteredCredential,
+        creation_prf: Zeroizing<[u8; 32]>,
+        label: String,
+    ) -> Result<RegistrationOutcome, VaultError> {
         let (selected, mut raw) =
             match backend.get_platform_prf_secret(&[reg.credential_id.clone()]) {
                 Ok(result) => result,
+                Err(error) if error.is_foreground_handoff() => {
+                    return Ok(RegistrationOutcome::HandoffRequired(
+                        PendingRegistration::Platform {
+                            credential: reg,
+                            creation_prf,
+                            label,
+                        },
+                    ));
+                }
                 Err(error) => {
-                    let _ = backend.delete_platform_credential(&reg.credential_id);
-                    return Err(error.into());
+                    return Err(self.cleanup_failed_platform_registration(
+                        backend,
+                        &reg.credential_id,
+                        error.into(),
+                    ));
                 }
             };
         let secret = Zeroizing::new(raw);
         raw.zeroize();
         if selected != reg.credential_id {
-            let _ = backend.delete_platform_credential(&reg.credential_id);
-            return Err(FidoError::PlatformCredentialMissing.into());
+            return Err(self.cleanup_failed_platform_registration(
+                backend,
+                &reg.credential_id,
+                FidoError::PlatformCredentialMissing.into(),
+            ));
         }
         // CtOutput's PartialEq uses the digest crate's constant-time equality.
         // Use the existing hmac re-export (no new direct dependency); wipe both copies.
-        let creation =
-            hmac::digest::CtOutput::<sha2::Sha256>::new((*registration.creation_prf).into());
+        let creation = hmac::digest::CtOutput::<sha2::Sha256>::new((*creation_prf).into());
         let assertion = hmac::digest::CtOutput::<sha2::Sha256>::new((*secret).into());
         let matches = creation == assertion;
         creation.into_bytes().as_mut_slice().zeroize();
         assertion.into_bytes().as_mut_slice().zeroize();
         if !matches {
-            let _ = backend.delete_platform_credential(&reg.credential_id);
-            return Err(FidoError::PlatformPrfUnsupported.into());
+            return Err(self.cleanup_failed_platform_registration(
+                backend,
+                &reg.credential_id,
+                FidoError::PlatformPrfUnsupported.into(),
+            ));
         }
         let wrap = Zeroizing::new(kek_from_prf_secret(&secret));
         let nonce = random_nonce();
@@ -1670,10 +1969,13 @@ impl Vault {
         ) {
             self.header = previous_header;
             self.data.audit = previous_audit;
-            let _ = backend.delete_platform_credential(&reg.credential_id);
-            return Err(error);
+            return Err(self.cleanup_failed_platform_registration(
+                backend,
+                &reg.credential_id,
+                error,
+            ));
         }
-        Ok(reg)
+        Ok(RegistrationOutcome::Registered(reg))
     }
 
     // ── FIDO2 金鑰管理（需已解鎖）──
@@ -1771,19 +2073,40 @@ impl Vault {
         custom_label: Option<&str>,
         group: Option<KeyGroup>,
     ) -> Result<RegisteredCredential, VaultError> {
-        // 版本與群組必須一致；不一致時 fail closed，不呼叫 authenticator。
-        let share = match (self.edition(), group) {
-            (Edition::Dual, None) => {
-                return Err(VaultError::Format(
-                    "雙群組控管版註冊金鑰須指定群組（A 或 B）".into(),
-                ));
+        match self.begin_register_key_internal(backend, pin, custom_label, group)? {
+            RegistrationOutcome::Registered(reg) => Ok(reg),
+            // 相容語意：舊呼叫方沒有 pending 流程 → 回報錯誤（roaming credential 無法由程式刪除）。
+            RegistrationOutcome::HandoffRequired(_) => {
+                Err(FidoError::ForegroundHandoffRequired.into())
             }
+        }
+    }
+
+    /// 版本與群組必須一致；不一致時 fail closed，不呼叫 authenticator。
+    fn roaming_group_share(
+        &self,
+        group: Option<KeyGroup>,
+    ) -> Result<Option<Zeroizing<[u8; 32]>>, VaultError> {
+        match (self.edition(), group) {
+            (Edition::Dual, None) => Err(VaultError::Format(
+                "雙群組控管版註冊金鑰須指定群組（A 或 B）".into(),
+            )),
             (Edition::Single, Some(_)) => {
-                return Err(VaultError::Format("單人版金庫不支援金鑰群組".into()));
+                Err(VaultError::Format("單人版金庫不支援金鑰群組".into()))
             }
-            (Edition::Dual, Some(group)) => Some(self.group_share(group)?),
-            (Edition::Single, None) => None,
-        };
+            (Edition::Dual, Some(group)) => Ok(Some(self.group_share(group)?)),
+            (Edition::Single, None) => Ok(None),
+        }
+    }
+
+    fn begin_register_key_internal(
+        &mut self,
+        backend: &mut (dyn FidoBackend + 'static),
+        pin: Option<&str>,
+        custom_label: Option<&str>,
+        group: Option<KeyGroup>,
+    ) -> Result<RegistrationOutcome, VaultError> {
+        let share = self.roaming_group_share(group)?;
         // 雙人版：Q3「同一支實體金鑰只能註冊一筆」→ 以金庫內全部既有 credential（A+B）作
         // excludeCredentials，由 authenticator 拒絕重複。在呼叫 authenticator 之前先解碼完成。
         let exclude = if group.is_some() {
@@ -1808,11 +2131,45 @@ impl Vault {
             return Err(VaultError::Fido(FidoError::PrfNotSupported));
         }
         // 單人版維持原本的註冊呼叫（不帶排除清單）。
-        let mut reg = match exclude.as_deref() {
+        let reg = match exclude.as_deref() {
             Some(exclude) => backend.register_credential_excluding(&detected, pin, exclude)?,
             None => backend.register_credential(&detected, pin)?,
         };
-        let secret = backend.get_prf_secret(&reg.credential_id, pin)?;
+        self.complete_roaming_registration(
+            backend,
+            reg,
+            pin.map(|pin| Zeroizing::new(pin.to_owned())),
+            custom_label.map(str::to_owned),
+            group,
+            share,
+        )
+    }
+
+    /// 第二個 ceremony（驗證斷言）+ 包槽位 + audit。前景未交回 → `HandoffRequired`（金庫不變）。
+    fn complete_roaming_registration(
+        &mut self,
+        backend: &mut (dyn FidoBackend + 'static),
+        mut reg: RegisteredCredential,
+        pin: Option<Zeroizing<String>>,
+        custom_label: Option<String>,
+        group: Option<KeyGroup>,
+        share: Option<Zeroizing<[u8; 32]>>,
+    ) -> Result<RegistrationOutcome, VaultError> {
+        let secret =
+            match backend.get_prf_secret(&reg.credential_id, pin.as_deref().map(String::as_str)) {
+                Ok(secret) => secret,
+                Err(error) if error.is_foreground_handoff() => {
+                    return Ok(RegistrationOutcome::HandoffRequired(
+                        PendingRegistration::Roaming {
+                            credential: reg,
+                            pin,
+                            custom_label,
+                            group,
+                        },
+                    ));
+                }
+                Err(error) => return Err(error.into()),
+            };
         let k = kek_from_prf_secret(&secret);
         let nonce = random_nonce();
         // 單人版：槽位包 KEK。雙人版：槽位只包該群組 share，AAD 綁定群組與 credential_id。
@@ -1827,8 +2184,11 @@ impl Vault {
         };
 
         if let Some(label) = custom_label {
-            reg.label = label.to_owned();
+            reg.label = label;
         }
+        // 落盤失敗時還原完整舊值（含 audit 裁切）；roaming credential 無法由程式刪除，不嘗試。
+        let previous_header = self.header.clone();
+        let previous_audit = self.data.audit.clone();
         self.header.key_slots.push(KeySlot {
             credential_id: base64_encode(&reg.credential_id),
             aaguid: hex32_16(reg.aaguid),
@@ -1844,8 +2204,13 @@ impl Vault {
             Some(group) => format!("type={kind_str} group={}", group.as_str()),
             None => format!("type={kind_str}"),
         };
-        self.record("key_registered", &format!("fido2:{}", reg.label), &detail)?;
-        Ok(reg)
+        if let Err(error) = self.record("key_registered", &format!("fido2:{}", reg.label), &detail)
+        {
+            self.header = previous_header;
+            self.data.audit = previous_audit;
+            return Err(error);
+        }
+        Ok(RegistrationOutcome::Registered(reg))
     }
 
     /// 移除金鑰槽（不可逆：該金鑰將無法再解鎖）。
@@ -6515,5 +6880,776 @@ mod tests {
         assert!(!audit_json.contains("Bank-Pass-000"));
         assert!(!audit_json.contains("Pw-12345"));
         let _ = fs::remove_dir_all(&d);
+    }
+
+    // ── D9-F1：註冊第二階段前景交接 ──
+
+    use crate::fido2::{MockCall, MockHandoffRefusal};
+
+    /// header JSON、audit JSON、磁碟位元組：用來證明 handoff 時金庫完全未變。
+    fn d9f1_snapshot(v: &Vault) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        (
+            serde_json::to_vec(&v.header).unwrap(),
+            serde_json::to_vec(&v.data.audit).unwrap(),
+            fs::read(&v.path).unwrap(),
+        )
+    }
+
+    fn d9f1_roaming_backend(times: usize) -> MockBackend {
+        MockBackend::new()
+            .with_next_kind(KeyKind::TouchOnly)
+            .with_roaming_handoff(MockHandoffRefusal::ForegroundHandoffRequired, times)
+    }
+
+    fn d9f1_pending_id(pending: &PendingRegistration) -> Vec<u8> {
+        match pending {
+            PendingRegistration::Roaming { credential, .. }
+            | PendingRegistration::Platform { credential, .. } => credential.credential_id.clone(),
+        }
+    }
+
+    #[test]
+    fn d9f1_roaming_handoff_keeps_pending_without_slot_audit_or_write() {
+        let p = fresh_path("d9f1-roaming-handoff");
+        let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+        let before = d9f1_snapshot(&v);
+        let mut b = d9f1_roaming_backend(1);
+        let outcome = v.begin_register_key_for(&mut b, Some("1234"), "my-key", None);
+        let pending = match outcome {
+            Ok(RegistrationOutcome::HandoffRequired(pending)) => pending,
+            other => panic!("expected HandoffRequired, got {other:?}"),
+        };
+        assert!(matches!(
+            &pending,
+            PendingRegistration::Roaming { custom_label: Some(l), group: None, pin: Some(_), .. } if l == "my-key"
+        ));
+        assert!(
+            d9f1_snapshot(&v) == before,
+            "handoff must not change header/audit/disk"
+        );
+        assert_eq!(
+            b.calls(),
+            &[
+                MockCall::Detect,
+                MockCall::RegisterCredential,
+                MockCall::GetPrfSecret
+            ]
+        );
+        let shown = format!("{pending:?}");
+        let id_b64 = base64_encode(&d9f1_pending_id(&pending));
+        assert!(shown.contains("my-key"), "{shown}");
+        assert!(
+            !shown.contains("1234") && !shown.contains(&id_b64),
+            "{shown}"
+        );
+        assert!(!shown.contains("credential_id"), "{shown}");
+    }
+
+    #[test]
+    fn d9f1_roaming_continue_single_wraps_kek_and_audits_like_original() {
+        let p = fresh_path("d9f1-roaming-continue");
+        let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+        let mut b = d9f1_roaming_backend(1);
+        let pending = match v.begin_register_key_for(&mut b, None, "my-key", None) {
+            Ok(RegistrationOutcome::HandoffRequired(pending)) => pending,
+            other => panic!("expected HandoffRequired, got {other:?}"),
+        };
+        let id = d9f1_pending_id(&pending);
+        let result = v.continue_registration(&mut b, pending, Edition::Single);
+        let reg = match result {
+            Ok(RegistrationOutcome::Registered(reg)) => reg,
+            other => panic!("expected Registered, got {other:?}"),
+        };
+        assert_eq!(reg.credential_id, id);
+        assert_eq!(reg.label, "my-key");
+        // 只建立一次 credential；第二次斷言是全新的一般斷言。
+        assert_eq!(
+            b.calls(),
+            &[
+                MockCall::Detect,
+                MockCall::RegisterCredential,
+                MockCall::GetPrfSecret,
+                MockCall::GetPrfSecret
+            ]
+        );
+        assert_eq!(v.header.key_slots.len(), 1);
+        let slot = &v.header.key_slots[0];
+        assert_eq!(slot.credential_id, base64_encode(&id));
+        assert_eq!(
+            (slot.label.as_str(), slot.group, slot.authenticator),
+            ("my-key", None, None)
+        );
+        let k = kek_from_prf_secret(&MockBackend::prf_for_credential(&id));
+        let plain = aes_gcm_decrypt(
+            &k,
+            &slot_nonce(&slot.nonce).unwrap(),
+            &base64_decode(&slot.ct).unwrap(),
+        );
+        assert!(matches!(plain, Ok(ref kek) if kek.as_slice() == v.kek.as_slice()));
+        let last = v.data.audit.last().unwrap();
+        assert_eq!(
+            (
+                last.event.as_str(),
+                last.method.as_str(),
+                last.detail.clone()
+            ),
+            (
+                "key_registered",
+                "fido2:my-key",
+                format!("type={}", reg.kind)
+            )
+        );
+        // 落盤且可用該金鑰登入。
+        let reopened = Vault::open_key(&p, &base64_encode(&id), None, &mut MockBackend::new());
+        assert!(reopened.is_ok(), "{:?}", reopened.err());
+    }
+
+    #[test]
+    fn d9f1_roaming_continue_dual_wraps_group_share_with_aad() {
+        let p = fresh_path("d9f1-roaming-dual");
+        let mut v = Vault::create_dual(&p, "Synthetic-Pw-12345").unwrap();
+        let mut b = d9f1_roaming_backend(1);
+        let pending = match v.begin_register_key_for(&mut b, None, "王小明", Some(KeyGroup::A)) {
+            Ok(RegistrationOutcome::HandoffRequired(pending)) => pending,
+            other => panic!("expected HandoffRequired, got {other:?}"),
+        };
+        assert!(v.header.key_slots.is_empty());
+        let result = v.continue_registration(&mut b, pending, Edition::Dual);
+        assert!(
+            matches!(result, Ok(RegistrationOutcome::Registered(_))),
+            "{result:?}"
+        );
+        assert_eq!(v.header.key_slots.len(), 1);
+        let slot = v.header.key_slots[0].clone();
+        assert_eq!(slot.group, Some(KeyGroup::A));
+        let share_a = decode_share(&v.data.dual.clone().unwrap().share_a);
+        let unwrapped = unwrap_group_slot(&slot, &mut MockBackend::new(), KeyGroup::A);
+        assert!(matches!(unwrapped, Ok(ref s) if s.as_slice() == share_a));
+        assert!(unwrap_group_slot(&slot, &mut MockBackend::new(), KeyGroup::B).is_err());
+        let last = v.data.audit.last().unwrap();
+        assert_eq!(last.method, "fido2:王小明");
+        assert!(last.detail.ends_with(" group=A"), "{}", last.detail);
+    }
+
+    #[test]
+    fn d9f1_roaming_continue_handoff_again_returns_same_pending() {
+        let p = fresh_path("d9f1-roaming-again");
+        let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+        let before = d9f1_snapshot(&v);
+        let mut b = d9f1_roaming_backend(2);
+        let pending = match v.begin_register_key_for(&mut b, None, "my-key", None) {
+            Ok(RegistrationOutcome::HandoffRequired(pending)) => pending,
+            other => panic!("expected HandoffRequired, got {other:?}"),
+        };
+        let id = d9f1_pending_id(&pending);
+        let again = match v.continue_registration(&mut b, pending, Edition::Single) {
+            Ok(RegistrationOutcome::HandoffRequired(pending)) => pending,
+            other => panic!("expected HandoffRequired again, got {other:?}"),
+        };
+        assert_eq!(d9f1_pending_id(&again), id);
+        assert!(
+            matches!(&again, PendingRegistration::Roaming { custom_label: Some(l), .. } if l == "my-key")
+        );
+        assert!(d9f1_snapshot(&v) == before);
+        let result = v.continue_registration(&mut b, again, Edition::Single);
+        assert!(
+            matches!(result, Ok(RegistrationOutcome::Registered(_))),
+            "{result:?}"
+        );
+        assert_eq!(v.header.key_slots.len(), 1);
+    }
+
+    #[test]
+    fn d9f1_roaming_continue_rejects_credential_already_in_vault() {
+        let p = fresh_path("d9f1-roaming-dup");
+        let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+        let mut b = MockBackend::new().with_next_kind(KeyKind::TouchOnly);
+        let existing = v.register_key_with_label(&mut b, None, "existing");
+        assert!(existing.is_ok());
+        let existing = existing.unwrap();
+        let before = d9f1_snapshot(&v);
+        let calls_before = b.calls().len();
+        let forged = PendingRegistration::Roaming {
+            credential: existing,
+            pin: None,
+            custom_label: Some("dup".into()),
+            group: None,
+        };
+        let result = v.continue_registration(&mut b, forged, Edition::Single);
+        assert!(
+            matches!(result, Err(VaultError::Fido(FidoError::CredentialExcluded))),
+            "{result:?}"
+        );
+        assert!(d9f1_snapshot(&v) == before);
+        assert_eq!(
+            b.calls().len(),
+            calls_before,
+            "no assertion for a duplicate"
+        );
+    }
+
+    #[test]
+    fn d9f1_roaming_compat_wrapper_reports_handoff_error_without_slot() {
+        let p = fresh_path("d9f1-roaming-compat");
+        let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+        let before = d9f1_snapshot(&v);
+        let mut b = d9f1_roaming_backend(1);
+        let result = v.register_key_for(&mut b, None, "my-key", None);
+        assert!(
+            matches!(
+                result,
+                Err(VaultError::Fido(FidoError::ForegroundHandoffRequired))
+            ),
+            "{result:?}"
+        );
+        assert!(d9f1_snapshot(&v) == before);
+    }
+
+    fn d9f1_platform_backend(refusal: MockHandoffRefusal, times: usize) -> WhBackend {
+        let mut b = WhBackend::new();
+        b.inner.set_platform_handoff(refusal, times);
+        b
+    }
+
+    #[test]
+    fn d9f1_platform_handoff_keeps_credential_without_delete_or_slot() {
+        for refusal in [
+            MockHandoffRefusal::OwnerNotForeground,
+            MockHandoffRefusal::ForegroundHandoffRequired,
+        ] {
+            let p = fresh_path("d9f1-platform-handoff");
+            let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+            let before = d9f1_snapshot(&v);
+            let mut b = d9f1_platform_backend(refusal, 1);
+            let pending = match v.begin_register_windows_hello(&mut b, "TEST-PC", Edition::Single) {
+                Ok(RegistrationOutcome::HandoffRequired(pending)) => pending,
+                other => panic!("expected HandoffRequired, got {other:?}"),
+            };
+            assert!(
+                matches!(&pending, PendingRegistration::Platform { label, .. } if label == "Windows Hello（本機 TEST-PC）")
+            );
+            assert!(
+                b.deleted.is_empty(),
+                "handoff must not delete the new credential"
+            );
+            assert!(b
+                .inner
+                .platform_credential_ids()
+                .contains(&d9f1_pending_id(&pending)));
+            assert!(d9f1_snapshot(&v) == before);
+            assert!(!format!("{pending:?}").contains("creation_prf"));
+        }
+    }
+
+    #[test]
+    fn d9f1_platform_continue_succeeds_with_fresh_membership_proof() {
+        let p = fresh_path("d9f1-platform-continue");
+        let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+        let mut b = d9f1_platform_backend(MockHandoffRefusal::OwnerNotForeground, 1);
+        let pending = match v.begin_register_windows_hello(&mut b, "TEST-PC", Edition::Single) {
+            Ok(RegistrationOutcome::HandoffRequired(pending)) => pending,
+            other => panic!("expected HandoffRequired, got {other:?}"),
+        };
+        let id = d9f1_pending_id(&pending);
+        let lists_before = b
+            .inner
+            .calls()
+            .iter()
+            .filter(|c| **c == MockCall::ListPlatform)
+            .count();
+        let result = v.continue_registration(&mut b, pending, Edition::Single);
+        assert!(
+            matches!(result, Ok(RegistrationOutcome::Registered(ref r)) if r.credential_id == id),
+            "{result:?}"
+        );
+        let lists_after = b
+            .inner
+            .calls()
+            .iter()
+            .filter(|c| **c == MockCall::ListPlatform)
+            .count();
+        assert!(
+            lists_after > lists_before,
+            "continue must re-prove RP membership"
+        );
+        assert!(b.deleted.is_empty());
+        assert_eq!(v.header.key_slots.len(), 1);
+        let slot = &v.header.key_slots[0];
+        assert_eq!(slot.authenticator, Some(SlotAuthenticator::Platform));
+        assert_eq!(slot.label, "Windows Hello（本機 TEST-PC）");
+        assert!(v
+            .data
+            .audit
+            .last()
+            .unwrap()
+            .method
+            .starts_with("register_key:windows-hello:"));
+        let reopened = Vault::open_windows_hello(&p, &mut b, Edition::Single);
+        assert!(reopened.is_ok(), "{:?}", reopened.err());
+    }
+
+    #[test]
+    fn d9f1_platform_continue_unproven_membership_does_not_delete() {
+        let p = fresh_path("d9f1-platform-missing");
+        let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+        let mut b = d9f1_platform_backend(MockHandoffRefusal::OwnerNotForeground, 1);
+        let pending = match v.begin_register_windows_hello(&mut b, "TEST-PC", Edition::Single) {
+            Ok(RegistrationOutcome::HandoffRequired(pending)) => pending,
+            other => panic!("expected HandoffRequired, got {other:?}"),
+        };
+        let id = d9f1_pending_id(&pending);
+        // Simulate the user/Windows removing it meanwhile (bypasses the recording wrapper).
+        assert!(b.inner.delete_platform_credential(&id).is_ok());
+        let before = d9f1_snapshot(&v);
+        let result = v.continue_registration(&mut b, pending, Edition::Single);
+        assert!(
+            matches!(
+                result,
+                Err(VaultError::Fido(FidoError::PlatformCredentialMissing))
+            ),
+            "{result:?}"
+        );
+        assert!(
+            b.deleted.is_empty(),
+            "unproven membership must never delete"
+        );
+        let asserts = b
+            .inner
+            .calls()
+            .iter()
+            .filter(|c| **c == MockCall::GetPlatformPrf)
+            .count();
+        assert_eq!(asserts, 1, "no assertion without membership proof");
+        assert!(d9f1_snapshot(&v) == before);
+    }
+
+    #[test]
+    fn d9f1_platform_continue_prf_mismatch_deletes_credential() {
+        let p = fresh_path("d9f1-platform-mismatch");
+        let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+        let mut b = d9f1_platform_backend(MockHandoffRefusal::OwnerNotForeground, 1);
+        let pending = match v.begin_register_windows_hello(&mut b, "TEST-PC", Edition::Single) {
+            Ok(RegistrationOutcome::HandoffRequired(pending)) => pending,
+            other => panic!("expected HandoffRequired, got {other:?}"),
+        };
+        let id = d9f1_pending_id(&pending);
+        b.wrong_secret = true;
+        let before = d9f1_snapshot(&v);
+        let result = v.continue_registration(&mut b, pending, Edition::Single);
+        assert!(
+            matches!(
+                result,
+                Err(VaultError::Fido(FidoError::PlatformPrfUnsupported))
+            ),
+            "{result:?}"
+        );
+        assert_eq!(b.deleted, vec![id]);
+        assert!(d9f1_snapshot(&v) == before);
+    }
+
+    #[test]
+    fn d9f1_platform_continue_cleanup_failure_is_typed_and_not_silenced() {
+        let p = fresh_path("d9f1-platform-cleanup-failure");
+        let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+        let mut b = d9f1_platform_backend(MockHandoffRefusal::OwnerNotForeground, 1);
+        let pending = match v.begin_register_windows_hello(&mut b, "TEST-PC", Edition::Single) {
+            Ok(RegistrationOutcome::HandoffRequired(pending)) => pending,
+            other => panic!("expected HandoffRequired, got {other:?}"),
+        };
+        let id = d9f1_pending_id(&pending);
+        b.wrong_secret = true;
+        b.delete_error = true;
+        let before = d9f1_snapshot(&v);
+        let result = v.continue_registration(&mut b, pending, Edition::Single);
+        assert!(
+            matches!(
+                result,
+                Err(VaultError::Fido(FidoError::PlatformPrfUnsupported))
+            ),
+            "{result:?}"
+        );
+        assert_eq!(
+            v.take_registration_cleanup_report(),
+            Some(RegistrationCleanupReport::DeleteFailed),
+            "failed deletion must be reported separately"
+        );
+        assert_eq!(
+            v.take_registration_cleanup_report(),
+            None,
+            "report is one-shot"
+        );
+        assert_eq!(b.deleted, vec![id]);
+        assert!(
+            d9f1_snapshot(&v) == before,
+            "failed cleanup must not write a slot"
+        );
+    }
+
+    #[test]
+    fn d9f1_r4_cleanup_report_is_one_shot_and_reset_by_each_ceremony() {
+        // (1) Begin: post-create discovery failure → NotAttempted, never deleted.
+        let p = fresh_path("d9f1-r4-report-reset");
+        let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+        let mut b = d9f1_platform_backend(MockHandoffRefusal::OwnerNotForeground, 1);
+        let pending = match v.begin_register_windows_hello(&mut b, "TEST-PC", Edition::Single) {
+            Ok(RegistrationOutcome::HandoffRequired(pending)) => pending,
+            other => panic!("expected HandoffRequired, got {other:?}"),
+        };
+        assert_eq!(
+            v.take_registration_cleanup_report(),
+            None,
+            "handoff is not a cleanup event"
+        );
+        let current = b.inner.platform_credential_ids().to_vec();
+        b.scripted_lists.push_back(Ok(current));
+        b.scripted_lists.push_back(Err(FidoError::Internal(
+            "synthetic discovery failure".into(),
+        )));
+        let failed = v.begin_register_windows_hello(&mut b, "TEST-PC", Edition::Single);
+        assert!(failed.is_err(), "{failed:?}");
+        assert!(
+            b.deleted.is_empty(),
+            "unproven credential must not be deleted"
+        );
+        // (2) Not taken on purpose: the next ceremony must reset the stale report.
+        let resumed = v.continue_registration(&mut b, pending, Edition::Single);
+        assert!(
+            matches!(resumed, Ok(RegistrationOutcome::Registered(_))),
+            "{resumed:?}"
+        );
+        assert_eq!(
+            v.take_registration_cleanup_report(),
+            None,
+            "a successful continue must not surface a stale report"
+        );
+        // (3) One-shot read (fresh vault: this machine already has a Hello slot in `v`,
+        // so V5 would refuse before creating anything).
+        let p = fresh_path("d9f1-r4-report-one-shot");
+        let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+        let mut b = WhBackend::new();
+        b.scripted_lists.push_back(Ok(Vec::new()));
+        b.scripted_lists.push_back(Err(FidoError::Internal(
+            "synthetic discovery failure".into(),
+        )));
+        assert!(v
+            .begin_register_windows_hello(&mut b, "TEST-PC", Edition::Single)
+            .is_err());
+        assert!(b.deleted.is_empty());
+        assert_eq!(
+            v.take_registration_cleanup_report(),
+            Some(RegistrationCleanupReport::NotAttempted)
+        );
+        assert_eq!(
+            v.take_registration_cleanup_report(),
+            None,
+            "report is one-shot"
+        );
+    }
+
+    #[test]
+    fn d9f1_r4_save_and_assertion_failures_report_delete_outcome_without_masking() {
+        // Save failure + delete failure: primary Io error kept, DeleteFailed reported.
+        let p = fresh_path("d9f1-r4-save-delete");
+        let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+        let mut b = WhBackend::new();
+        b.delete_error = true;
+        fs::create_dir(p.with_extension("db.tmp")).unwrap();
+        let result = v.begin_register_windows_hello(&mut b, "TEST-PC", Edition::Single);
+        assert!(matches!(result, Err(VaultError::Io(_))), "{result:?}");
+        assert_eq!(
+            v.take_registration_cleanup_report(),
+            Some(RegistrationCleanupReport::DeleteFailed)
+        );
+        fs::remove_dir(p.with_extension("db.tmp")).unwrap();
+        // Assertion failure + successful delete: primary error kept, Removed reported.
+        let p = fresh_path("d9f1-r4-assert-delete");
+        let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+        let mut b = WhBackend::new();
+        b.assertion_error = Some(FidoError::NoDevice);
+        let result = v.begin_register_windows_hello(&mut b, "TEST-PC", Edition::Single);
+        assert!(
+            matches!(result, Err(VaultError::Fido(FidoError::NoDevice))),
+            "{result:?}"
+        );
+        assert_eq!(
+            v.take_registration_cleanup_report(),
+            Some(RegistrationCleanupReport::Removed)
+        );
+        assert_eq!(b.deleted.len(), 1);
+    }
+
+    #[test]
+    fn d9f1_r5_begin_resets_stale_report_and_continue_keeps_removed() {
+        // continue: assertion failure + successful delete → Removed (never upgraded).
+        let p = fresh_path("d9f1-r5-continue-removed");
+        let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+        let mut b = d9f1_platform_backend(MockHandoffRefusal::OwnerNotForeground, 1);
+        let pending = match v.begin_register_windows_hello(&mut b, "TEST-PC", Edition::Single) {
+            Ok(RegistrationOutcome::HandoffRequired(pending)) => pending,
+            other => panic!("expected HandoffRequired, got {other:?}"),
+        };
+        b.assertion_error = Some(FidoError::NoDevice);
+        let result = v.continue_registration(&mut b, pending, Edition::Single);
+        assert!(
+            matches!(result, Err(VaultError::Fido(FidoError::NoDevice))),
+            "{result:?}"
+        );
+        assert_eq!(b.deleted.len(), 1);
+        assert_eq!(
+            v.take_registration_cleanup_report(),
+            Some(RegistrationCleanupReport::Removed),
+            "a successful delete must not be reported as NotAttempted"
+        );
+        // continue leaves DeleteFailed un-taken; the next begin must reset it.
+        let mut b = d9f1_platform_backend(MockHandoffRefusal::OwnerNotForeground, 1);
+        let pending = match v.begin_register_windows_hello(&mut b, "TEST-PC", Edition::Single) {
+            Ok(RegistrationOutcome::HandoffRequired(pending)) => pending,
+            other => panic!("expected HandoffRequired, got {other:?}"),
+        };
+        b.wrong_secret = true;
+        b.delete_error = true;
+        assert!(v
+            .continue_registration(&mut b, pending, Edition::Single)
+            .is_err());
+        let mut fresh_backend = WhBackend::new();
+        let registered =
+            v.begin_register_windows_hello(&mut fresh_backend, "TEST-PC", Edition::Single);
+        assert!(
+            matches!(registered, Ok(RegistrationOutcome::Registered(_))),
+            "{registered:?}"
+        );
+        assert_eq!(
+            v.take_registration_cleanup_report(),
+            None,
+            "a successful begin must not surface a stale continue report"
+        );
+    }
+
+    #[test]
+    fn d9f1_platform_continue_handoff_again_keeps_credential() {
+        let p = fresh_path("d9f1-platform-again");
+        let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+        let mut b = d9f1_platform_backend(MockHandoffRefusal::OwnerNotForeground, 2);
+        let pending = match v.begin_register_windows_hello(&mut b, "TEST-PC", Edition::Single) {
+            Ok(RegistrationOutcome::HandoffRequired(pending)) => pending,
+            other => panic!("expected HandoffRequired, got {other:?}"),
+        };
+        let id = d9f1_pending_id(&pending);
+        let again = v.continue_registration(&mut b, pending, Edition::Single);
+        assert!(
+            matches!(&again, Ok(RegistrationOutcome::HandoffRequired(p)) if d9f1_pending_id(p) == id),
+            "{again:?}"
+        );
+        assert!(b.deleted.is_empty());
+        assert!(v.header.key_slots.is_empty());
+    }
+
+    #[test]
+    fn d9f1_platform_compat_wrapper_deletes_and_reports_handoff() {
+        let p = fresh_path("d9f1-platform-compat");
+        let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+        let before = d9f1_snapshot(&v);
+        let mut b = d9f1_platform_backend(MockHandoffRefusal::OwnerNotForeground, 1);
+        let result = v.register_windows_hello(&mut b, "TEST-PC", Edition::Single);
+        assert!(
+            matches!(
+                result,
+                Err(VaultError::Fido(FidoError::ForegroundHandoffRequired))
+            ),
+            "{result:?}"
+        );
+        assert_eq!(b.deleted.len(), 1, "legacy wrapper keeps delete-on-failure");
+        assert!(b.inner.platform_credential_ids().is_empty());
+        assert!(d9f1_snapshot(&v) == before);
+    }
+
+    #[test]
+    fn d9f1_cancel_platform_removes_or_requires_manual_removal() {
+        for delete_error in [false, true] {
+            let p = fresh_path("d9f1-cancel-platform");
+            let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+            let mut b = d9f1_platform_backend(MockHandoffRefusal::OwnerNotForeground, 1);
+            let pending = match v.begin_register_windows_hello(&mut b, "TEST-PC", Edition::Single) {
+                Ok(RegistrationOutcome::HandoffRequired(pending)) => pending,
+                other => panic!("expected HandoffRequired, got {other:?}"),
+            };
+            let id = d9f1_pending_id(&pending);
+            b.delete_error = delete_error;
+            let before = d9f1_snapshot(&v);
+            let outcome = cancel_registration(&mut b, pending);
+            assert_eq!(
+                outcome,
+                if delete_error {
+                    CancelOutcome::ManualRemovalRequired
+                } else {
+                    CancelOutcome::Removed
+                }
+            );
+            assert_eq!(b.deleted, vec![id]);
+            assert!(d9f1_snapshot(&v) == before);
+        }
+        // Not provably local any more → never blind-delete.
+        let p = fresh_path("d9f1-cancel-platform-missing");
+        let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+        let mut b = d9f1_platform_backend(MockHandoffRefusal::OwnerNotForeground, 1);
+        let pending = match v.begin_register_windows_hello(&mut b, "TEST-PC", Edition::Single) {
+            Ok(RegistrationOutcome::HandoffRequired(pending)) => pending,
+            other => panic!("expected HandoffRequired, got {other:?}"),
+        };
+        assert!(b
+            .inner
+            .delete_platform_credential(&d9f1_pending_id(&pending))
+            .is_ok());
+        assert_eq!(
+            cancel_registration(&mut b, pending),
+            CancelOutcome::ManualRemovalRequired
+        );
+        assert!(b.deleted.is_empty());
+    }
+
+    #[test]
+    fn d9f1_cancel_roaming_discards_without_backend_calls() {
+        let p = fresh_path("d9f1-cancel-roaming");
+        let mut v = Vault::create(&p, "Synthetic-Pw-12345").unwrap();
+        let mut b = d9f1_roaming_backend(1);
+        let pending = match v.begin_register_key_for(&mut b, None, "my-key", None) {
+            Ok(RegistrationOutcome::HandoffRequired(pending)) => pending,
+            other => panic!("expected HandoffRequired, got {other:?}"),
+        };
+        let calls = b.calls().len();
+        assert_eq!(
+            cancel_registration(&mut b, pending),
+            CancelOutcome::Discarded
+        );
+        assert_eq!(b.calls().len(), calls);
+        assert!(v.header.key_slots.is_empty());
+    }
+
+    // ── D9-F1 R2 L3：roaming 註冊落盤失敗必須回滾 header 與 audit ──
+
+    /// tmp 寫入失敗：在 tmp 路徑放目錄。rename 失敗（Windows）：以不允許刪除/改名的共享模式開著原檔。
+    fn d9f1_save_obstacle(p: &Path, rename_failure: bool) -> Option<fs::File> {
+        let tmp = p.with_extension("db.tmp");
+        if !rename_failure {
+            fs::create_dir(&tmp).unwrap();
+            return None;
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            Some(
+                fs::OpenOptions::new()
+                    .read(true)
+                    .share_mode(1)
+                    .open(p)
+                    .unwrap(),
+            )
+        }
+        #[cfg(not(windows))]
+        {
+            unreachable!("rename failure injection is Windows-only")
+        }
+    }
+
+    fn d9f1_roaming_save_failure(dual: bool, rename_failure: bool, via_continue: bool) {
+        let tag = format!(
+            "d9f1-r2-roaming-save-{}-{}-{}",
+            if dual { "dual" } else { "single" },
+            if rename_failure { "rename" } else { "tmp" },
+            if via_continue { "continue" } else { "direct" }
+        );
+        let p = fresh_path(&tag);
+        let _ = fs::remove_dir_all(p.with_extension("db.tmp"));
+        let mut v = if dual {
+            Vault::create_dual(&p, "Synthetic-Pw-12345").unwrap()
+        } else {
+            Vault::create(&p, "Synthetic-Pw-12345").unwrap()
+        };
+        // 滿額 audit：新增一筆會裁掉最舊一筆，回滾必須連裁切一起還原。
+        v.data.audit = (0..MAX_AUDIT)
+            .map(|index| AuditEvent {
+                ts: index.to_string(),
+                event: "synthetic".into(),
+                method: "test".into(),
+                detail: index.to_string(),
+            })
+            .collect();
+        v.write_file().unwrap();
+        let group = dual.then_some(KeyGroup::A);
+        let mut b = d9f1_roaming_backend(usize::from(via_continue));
+        let pending = if via_continue {
+            let outcome = v.begin_register_key_for(&mut b, None, "my-key", group);
+            assert!(
+                matches!(&outcome, Ok(RegistrationOutcome::HandoffRequired(_))),
+                "{outcome:?}"
+            );
+            let Ok(RegistrationOutcome::HandoffRequired(pending)) = outcome else {
+                unreachable!()
+            };
+            Some(pending)
+        } else {
+            None
+        };
+        let before = d9f1_snapshot(&v);
+        let guard = d9f1_save_obstacle(&p, rename_failure);
+        let edition = if dual { Edition::Dual } else { Edition::Single };
+        let result = match pending {
+            Some(pending) => v
+                .continue_registration(&mut b, pending, edition)
+                .map(|_| ()),
+            None => v
+                .register_key_for(&mut b, None, "my-key", group)
+                .map(|_| ()),
+        };
+        drop(guard);
+        let _ = fs::remove_dir_all(p.with_extension("db.tmp"));
+        assert!(matches!(result, Err(VaultError::Io(_))), "{result:?}");
+        assert!(
+            serde_json::to_vec(&v.header).unwrap() == before.0,
+            "failed persist must restore the header (no new slot)"
+        );
+        assert!(
+            serde_json::to_vec(&v.data.audit).unwrap() == before.1,
+            "failed persist must restore audit including the trimmed entry"
+        );
+        assert!(fs::read(&p).unwrap() == before.2, "disk bytes unchanged");
+        // 之後另一個成功寫入不得把失敗的槽位帶入磁碟。
+        assert!(v.record("synthetic_after", "test", "").is_ok());
+        let on_disk = Vault::read_header(&p, edition).unwrap();
+        assert_eq!(
+            on_disk.key_slots.len(),
+            0,
+            "failed slot must never reach disk"
+        );
+        assert!(!v.data.audit.iter().any(|e| e.event == "key_registered"));
+    }
+
+    #[test]
+    fn d9f1_r2_roaming_continue_single_tmp_write_failure_rolls_back() {
+        d9f1_roaming_save_failure(false, false, true);
+    }
+
+    #[test]
+    fn d9f1_r2_roaming_continue_dual_tmp_write_failure_rolls_back() {
+        d9f1_roaming_save_failure(true, false, true);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn d9f1_r2_roaming_continue_single_rename_failure_rolls_back() {
+        d9f1_roaming_save_failure(false, true, true);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn d9f1_r2_roaming_continue_dual_rename_failure_rolls_back() {
+        d9f1_roaming_save_failure(true, true, true);
+    }
+
+    /// 原 register_key_internal 共用 complete_roaming_registration：回滾同樣適用。
+    #[test]
+    fn d9f1_r2_roaming_direct_register_tmp_write_failure_rolls_back() {
+        d9f1_roaming_save_failure(false, false, false);
+        d9f1_roaming_save_failure(true, false, false);
     }
 }

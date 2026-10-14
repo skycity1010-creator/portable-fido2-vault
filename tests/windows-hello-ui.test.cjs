@@ -42,7 +42,7 @@ function load({ edition = "single", keys = [], status = { api_ok: true, uvpa: tr
     boot_info: () => ({ has_vault: true, keys, brokered_key_login: brokered }),
     platform_status: () => status,
     login_windows_hello: () => [],
-    register_windows_hello: () => ({ label: "Windows Hello（本機 TEST）", key_type: "windows_managed" }),
+    register_windows_hello: () => ({ status: "registered", credential: { label: "Windows Hello（本機 TEST）", key_type: "windows_managed" } }),
     get_vault_settings: () => ({ idle_lock_minutes: 5, password_history_limit: 3 }),
     list_audit: () => [], list_entries: () => [],
     remove_key: () => ({ outcome: "removed" }),
@@ -113,7 +113,7 @@ test("Hello registration skips YubiKey detect/name dialog and reports outcome", 
   assert.match(ui.$("hello-register-status").textContent, /Windows Hello/);
   assert.equal(ui.calls.filter((c) => c.command === "register_windows_hello").length, 1);
   assert.equal(ui.calls.some((c) => c.command === "detect_key" || c.command === "suggest_key_label"), false);
-  pending.resolve({ label: "Windows Hello（本機 TEST）", key_type: "windows_managed" });
+  pending.resolve({ status: "registered", credential: { label: "Windows Hello（本機 TEST）", key_type: "windows_managed" } });
   await Promise.all([first, second]);
   assert.match(ui.$("hello-register-status").textContent, /已註冊/);
   assert.equal(ui.$("btn-register-hello").disabled, false);

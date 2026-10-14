@@ -173,6 +173,64 @@ impl ContinuationDiagnostics {
     }
 }
 
+/// Where a foreground-owner refusal was decided.
+#[derive(Clone, Copy)]
+pub(crate) enum ForegroundSite {
+    Continuation,
+    PreApi,
+}
+
+/// Bounded foreground-window evidence, gathered only after a refusal was decided.
+/// Fields are private: values can only enter through the sanitizing constructor,
+/// so a window title or full image path can never reach the serializer.
+#[derive(Default)]
+pub(crate) struct ForegroundOwnerDiagnostics {
+    foreground_class: Option<String>,
+    foreground_process: Option<String>,
+    foreground_same_session: Option<bool>,
+    foreground_is_owner_process: Option<bool>,
+}
+
+impl ForegroundOwnerDiagnostics {
+    pub(crate) fn new(
+        class_name: Option<&str>,
+        image_path: Option<&str>,
+        same_session: Option<bool>,
+        is_owner_process: Option<bool>,
+    ) -> Self {
+        Self {
+            foreground_class: class_name.and_then(bounded_text),
+            foreground_process: image_path
+                .and_then(|path| path.rsplit(['\\', '/']).next())
+                .map(str::to_lowercase)
+                .as_deref()
+                .and_then(bounded_text),
+            foreground_same_session: same_session,
+            foreground_is_owner_process: is_owner_process,
+        }
+    }
+
+    pub(crate) fn record(&self, operation: Operation, site: ForegroundSite) -> Value {
+        json!({
+            "operation": operation.label(),
+            "site": match site {
+                ForegroundSite::Continuation => "continuation",
+                ForegroundSite::PreApi => "pre-api",
+            },
+            "foreground_class": self.foreground_class,
+            "foreground_process": self.foreground_process,
+            "foreground_same_session": self.foreground_same_session,
+            "foreground_is_owner_process": self.foreground_is_owner_process,
+        })
+    }
+}
+
+const FOREGROUND_TEXT_MAX_CHARS: usize = 64;
+
+fn bounded_text(text: &str) -> Option<String> {
+    (!text.is_empty()).then(|| text.chars().take(FOREGROUND_TEXT_MAX_CHARS).collect())
+}
+
 pub(crate) fn capability_record(
     api_version: Option<u32>,
     process_id: Option<u32>,
@@ -202,6 +260,8 @@ fn error_category(error: &FidoError) -> &'static str {
         FidoError::NotSupported(_) => "capability-unsupported",
         FidoError::Internal(_) => "internal",
         FidoError::DeviceOpenDenied { .. } => "device-open-denied",
+        FidoError::ForegroundHandoffRequired => "foreground-handoff-required",
+        FidoError::OwnerNotForeground => "owner-not-foreground",
     }
 }
 
@@ -306,6 +366,85 @@ pub(crate) fn diagnose<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn d9f1_foreground_owner_serializer_exact_null_allowlist() {
+        let record = ForegroundOwnerDiagnostics::new(None, None, None, None)
+            .record(Operation::GetAssertion, ForegroundSite::Continuation);
+        assert_eq!(
+            record,
+            json!({
+                "operation": "GetAssertion", "site": "continuation",
+                "foreground_class": null, "foreground_process": null,
+                "foreground_same_session": null, "foreground_is_owner_process": null,
+            })
+        );
+        let record = ForegroundOwnerDiagnostics::new(
+            Some("Shell_TrayWnd"),
+            Some(r"C:\Windows\explorer.exe"),
+            Some(true),
+            Some(false),
+        )
+        .record(Operation::MakeCredential, ForegroundSite::PreApi);
+        assert_eq!(
+            record,
+            json!({
+                "operation": "MakeCredential", "site": "pre-api",
+                "foreground_class": "Shell_TrayWnd", "foreground_process": "explorer.exe",
+                "foreground_same_session": true, "foreground_is_owner_process": false,
+            })
+        );
+        assert_eq!(record.as_object().unwrap().len(), 6);
+    }
+
+    #[test]
+    fn d9f1_foreground_owner_basename_lowercase_and_truncation() {
+        let cases: [(Option<&str>, Option<&str>); 7] = [
+            (
+                Some(r"C:\Program Files\Vendor\Some App.EXE"),
+                Some("some app.exe"),
+            ),
+            (Some("C:/Users/alice/AppData/Tool.exe"), Some("tool.exe")),
+            (Some("PLAIN.EXE"), Some("plain.exe")),
+            (Some(r"C:\dir\"), None),
+            (Some(""), None),
+            (None, None),
+            (
+                Some(r"\\?\C:\Windows\System32\CredentialUIBroker.exe"),
+                Some("credentialuibroker.exe"),
+            ),
+        ];
+        for (path, expected) in cases {
+            let record = ForegroundOwnerDiagnostics::new(None, path, None, None)
+                .record(Operation::GetAssertion, ForegroundSite::PreApi);
+            assert_eq!(record["foreground_process"].as_str(), expected, "{path:?}");
+            // Directory components (including a user name) never leak.
+            let text = record.to_string();
+            assert!(
+                !text.contains("alice") && !text.contains("Program Files"),
+                "{text}"
+            );
+        }
+        let long_name = format!(r"C:\x\{}.exe", "N".repeat(100));
+        let record =
+            ForegroundOwnerDiagnostics::new(Some(&"類".repeat(100)), Some(&long_name), None, None)
+                .record(Operation::GetAssertion, ForegroundSite::PreApi);
+        assert_eq!(
+            record["foreground_class"].as_str().unwrap().chars().count(),
+            64
+        );
+        assert_eq!(
+            record["foreground_class"].as_str().unwrap(),
+            "類".repeat(64)
+        );
+        assert_eq!(
+            record["foreground_process"].as_str().unwrap(),
+            "n".repeat(64)
+        );
+        let empty = ForegroundOwnerDiagnostics::new(Some(""), None, None, None)
+            .record(Operation::GetAssertion, ForegroundSite::PreApi);
+        assert!(empty["foreground_class"].is_null());
+    }
 
     #[test]
     fn continuation_serializer_exact_null_allowlist() {

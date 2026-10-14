@@ -25,6 +25,7 @@ pub mod csv_import;
 pub mod diag_log;
 pub mod edition;
 pub mod fido2;
+mod registration_cleanup_journal;
 pub mod vault;
 #[cfg(all(windows, feature = "real-ctap"))]
 mod webauthn_diagnostics;
@@ -305,6 +306,158 @@ struct AppInner {
     dual_pending: Option<vault::DualPending>,
     /// 每次第一步遞增；逾時計時器只清除自己那一代的暫存。
     dual_generation: u64,
+    /// D9-F1：第二階段因前景未交回而暫停的註冊（只在 Rust 端，drop 時秘密清零）。
+    pending_registration: Option<PendingRegistrationSlot>,
+    /// 每次建立新的 pending 註冊遞增；逾時計時器只清除自己那一代。
+    registration_generation: u64,
+    /// 只保留非機密清理失敗收據；即使 timer 或上鎖取消 pending，警告也不會遺失。
+    registration_cleanup_receipts: Vec<RegistrationCleanupReceipt>,
+    registration_cleanup_journal: Option<registration_cleanup_journal::Journal>,
+    registration_cleanup_storage_unavailable: bool,
+}
+
+/// pending 註冊的有效期限；逾時視同取消（Windows Hello 會刪除本次 credential）。
+const PENDING_REGISTRATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+struct PendingRegistrationSlot {
+    pending: vault::PendingRegistration,
+    deadline: std::time::Instant,
+    /// 建立 pending 時的金庫；繼續時金庫不同 → 取消，不寫入其他金庫。
+    vault_path: std::path::PathBuf,
+    generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct RegistrationCleanupReceipt {
+    id: String,
+    generation: u64,
+    reason: &'static str,
+    cleanup: RegistrationCleanup,
+}
+
+/// register_key / register_windows_hello / continue_registration 的回應（不含任何秘密）。
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum RegisterResult {
+    Registered {
+        credential: fido2::RegisteredCredential,
+    },
+    HandoffRequired {
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RegistrationCleanup {
+    Removed,
+    ManualRemovalRequired,
+    Discarded,
+    None,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct CancelRegistrationInfo {
+    status: &'static str,
+    cleanup: RegistrationCleanup,
+}
+
+fn record_registration_cleanup(g: &mut AppInner, generation: u64, reason: &'static str) {
+    let (id, effective_reason) = match g.registration_cleanup_journal.as_ref() {
+        Some(journal) => match journal.record(reason) {
+            Ok(id) => (id, reason),
+            Err(_) => (format!("memory-{generation}"), "storage_unavailable"),
+        },
+        None => (format!("memory-{generation}"), reason),
+    };
+    g.registration_cleanup_receipts
+        .push(RegistrationCleanupReceipt {
+            id,
+            generation,
+            reason: effective_reason,
+            cleanup: RegistrationCleanup::ManualRemovalRequired,
+        });
+}
+
+/// 取消並清理 pending 註冊（Windows Hello：RP 清單證明後刪除）。
+/// 失敗僅留非機密收據，直到使用者確認；秘密隨 pending drop 清零。
+fn cancel_pending_registration_with_reason(
+    g: &mut AppInner,
+    reason: &'static str,
+) -> RegistrationCleanup {
+    let Some(slot) = g.pending_registration.take() else {
+        // No pending: report the unacknowledged durable warnings (journal is authoritative,
+        // unreadable storage is conservatively a warning), never a stale in-memory copy.
+        return if has_unacknowledged_cleanup(g) {
+            RegistrationCleanup::ManualRemovalRequired
+        } else {
+            RegistrationCleanup::None
+        };
+    };
+    let generation = slot.generation;
+    let cleanup = match vault::cancel_registration(g.backend.as_mut(), slot.pending) {
+        vault::CancelOutcome::Removed => RegistrationCleanup::Removed,
+        vault::CancelOutcome::ManualRemovalRequired => RegistrationCleanup::ManualRemovalRequired,
+        vault::CancelOutcome::Discarded => RegistrationCleanup::Discarded,
+    };
+    if cleanup == RegistrationCleanup::ManualRemovalRequired {
+        record_registration_cleanup(g, generation, reason);
+    }
+    cleanup
+}
+
+fn cancel_pending_registration(g: &mut AppInner) -> RegistrationCleanup {
+    cancel_pending_registration_with_reason(g, "implicit")
+}
+
+/// 已逾時的 pending 註冊視同取消；`generation` 給定時只清除該代。回傳是否清除。
+fn sweep_expired_registration(
+    g: &mut AppInner,
+    generation: Option<u64>,
+    now: std::time::Instant,
+) -> bool {
+    let expired = g.pending_registration.as_ref().is_some_and(|slot| {
+        now >= slot.deadline && generation.is_none_or(|generation| generation == slot.generation)
+    });
+    if expired {
+        cancel_pending_registration_with_reason(g, "expired");
+    }
+    expired
+}
+
+fn require_no_pending_registration(g: &AppInner) -> Result<()> {
+    if g.pending_registration.is_some() {
+        return Err(
+            "已有尚未完成的金鑰註冊；請先按「繼續驗證」完成，或按「取消」放棄後再註冊。".into(),
+        );
+    }
+    Ok(())
+}
+
+/// 依註冊結果建立 pending（若需要）並轉成 IPC 回應。
+fn store_registration_outcome(
+    g: &mut AppInner,
+    outcome: vault::RegistrationOutcome,
+    vault_path: std::path::PathBuf,
+    now: std::time::Instant,
+) -> RegisterResult {
+    match outcome {
+        vault::RegistrationOutcome::Registered(credential) => {
+            RegisterResult::Registered { credential }
+        }
+        vault::RegistrationOutcome::HandoffRequired(pending) => {
+            g.registration_generation = g.registration_generation.wrapping_add(1);
+            g.pending_registration = Some(PendingRegistrationSlot {
+                pending,
+                deadline: now + PENDING_REGISTRATION_TIMEOUT,
+                vault_path,
+                generation: g.registration_generation,
+            });
+            RegisterResult::HandoffRequired {
+                message: fido2::FidoError::ForegroundHandoffRequired.to_string(),
+            }
+        }
+    }
 }
 
 /// 逾時計時器：同一代且已逾時 → 取走暫存、記 `fido2-dual-timeout`（share 清零）。
@@ -335,20 +488,58 @@ fn new_csv_import_token() -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// Per-user receipt directory. A missing, empty or relative `LOCALAPPDATA` is not trusted
+/// (it could resolve against the working directory); the UI then shows "storage unavailable".
+fn cleanup_journal_from_local_appdata(
+    local_appdata: Option<std::ffi::OsString>,
+) -> (Option<registration_cleanup_journal::Journal>, bool) {
+    match local_appdata.map(std::path::PathBuf::from) {
+        Some(base) if base.is_absolute() => (
+            Some(registration_cleanup_journal::Journal::new(
+                base.join("FidoVault").join("registration-cleanup-v1"),
+            )),
+            false,
+        ),
+        _ => (None, true),
+    }
+}
+
 impl AppInner {
     fn new(window_handle: isize) -> Result<Self> {
+        let (journal, storage_unavailable) =
+            cleanup_journal_from_local_appdata(std::env::var_os("LOCALAPPDATA"));
         Ok(Self {
             vault: None,
             backend: make_backend(window_handle)?,
             pending_csv_import: None,
             dual_pending: None,
             dual_generation: 0,
+            pending_registration: None,
+            registration_generation: 0,
+            registration_cleanup_receipts: Vec::new(),
+            registration_cleanup_journal: journal,
+            registration_cleanup_storage_unavailable: storage_unavailable,
         })
     }
 }
 
 impl VaultState {
     fn with_lock<R>(&self, f: impl FnOnce(&mut AppInner) -> Result<R>) -> Result<R> {
+        #[cfg(test)]
+        let mut g = match self.0.try_lock() {
+            Ok(g) => g,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                // Test-only observation point: this thread is about to block on the state lock.
+                lock_wait_hook::notify();
+                self.0
+                    .lock()
+                    .map_err(|_| "state lock poisoned".to_string())?
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err("state lock poisoned".to_string())
+            }
+        };
+        #[cfg(not(test))]
         let mut g = self
             .0
             .lock()
@@ -576,16 +767,50 @@ fn register_windows_hello_inner(
     ed: edition::Edition,
     raise: impl FnOnce(bool) -> Result<isize>,
     computer_name: impl FnOnce() -> Result<String>,
-) -> Result<fido2::RegisteredCredential> {
+) -> Result<RegisterResult> {
+    register_windows_hello_inner_with_clock(
+        state,
+        ed,
+        raise,
+        computer_name,
+        std::time::Instant::now,
+    )
+}
+
+fn register_windows_hello_inner_with_clock(
+    state: &VaultState,
+    ed: edition::Edition,
+    raise: impl FnOnce(bool) -> Result<isize>,
+    computer_name: impl FnOnce() -> Result<String>,
+    mut clock: impl FnMut() -> std::time::Instant,
+) -> Result<RegisterResult> {
     require_windows_hello_single(ed)?;
     state.with_lock(|g| {
-        let v = g.vault.as_mut().ok_or_else(|| "金庫未解鎖".to_string())?;
+        if g.vault.is_none() {
+            return Err("金庫未解鎖".to_string());
+        }
+        let now = clock();
+        sweep_expired_registration(g, None, now);
+        require_no_pending_registration(g)?;
         require_windows_hello_available(g.backend.as_ref())?;
         let name = computer_name()?;
         let owner = raise(true)?;
         g.backend.set_webauthn_parent_hwnd(owner);
-        v.register_windows_hello(g.backend.as_mut(), &name, ed)
-            .map_err(|e| e.to_string())
+        let v = g.vault.as_mut().ok_or_else(|| "金庫未解鎖".to_string())?;
+        let vault_path = v.path.clone();
+        let outcome = v.begin_register_windows_hello(g.backend.as_mut(), &name, ed);
+        let cleanup_report = v.take_registration_cleanup_report();
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                g.registration_generation = g.registration_generation.wrapping_add(1);
+                let generation = g.registration_generation;
+                record_registration_failure_cleanup(g, generation, cleanup_report);
+                return Err(error.to_string());
+            }
+        };
+        // 註冊第一階段可能等待使用者操作；pending 的完整期限從返回後起算。
+        Ok(store_registration_outcome(g, outcome, vault_path, clock()))
     })
 }
 
@@ -593,8 +818,8 @@ fn register_windows_hello_inner(
 fn register_windows_hello(
     window: tauri::WebviewWindow,
     state: tauri::State<VaultState>,
-) -> Result<fido2::RegisteredCredential> {
-    register_windows_hello_inner(
+) -> Result<RegisterResult> {
+    let result = register_windows_hello_inner(
         &state,
         edition::current(),
         |required| raise_key_operation_window(&window, required),
@@ -602,7 +827,270 @@ fn register_windows_hello(
             std::env::var("COMPUTERNAME")
                 .map_err(|_| "無法取得本機電腦名稱；請使用 YubiKey 或主密碼".to_string())
         },
+    )?;
+    schedule_registration_sweep(&window, &state, &result);
+    Ok(result)
+}
+
+/// 新建立的 pending 註冊：Rust 端在期限後主動取消（不依賴前端），秘密清零。
+fn schedule_registration_sweep(
+    window: &tauri::WebviewWindow,
+    state: &VaultState,
+    result: &RegisterResult,
+) {
+    if !matches!(result, RegisterResult::HandoffRequired { .. }) {
+        return;
+    }
+    let Ok(Some((generation, deadline))) = state.with_lock(|g| {
+        Ok(g.pending_registration
+            .as_ref()
+            .map(|slot| (slot.generation, slot.deadline)))
+    }) else {
+        return;
+    };
+    let app = window.app_handle().clone();
+    std::thread::spawn(move || {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        std::thread::sleep(remaining + std::time::Duration::from_millis(250));
+        let state = app.state::<VaultState>();
+        let _ = state.with_lock(|g| {
+            sweep_expired_registration(g, Some(generation), std::time::Instant::now());
+            Ok(())
+        });
+    });
+}
+
+/// The vault layer separately reports deletion failure for a proven newly-created
+/// platform credential without replacing the primary error or inferring from generic FIDO errors.
+fn record_registration_failure_cleanup(
+    g: &mut AppInner,
+    generation: u64,
+    report: Option<vault::RegistrationCleanupReport>,
+) {
+    match report {
+        Some(vault::RegistrationCleanupReport::DeleteFailed) => {
+            record_registration_cleanup(g, generation, "continue_error")
+        }
+        Some(vault::RegistrationCleanupReport::NotAttempted) => {
+            record_registration_cleanup(g, generation, "unverified")
+        }
+        Some(vault::RegistrationCleanupReport::Removed) | None => {}
+    }
+}
+
+/// D9-F1：使用者按「繼續驗證」。點擊本身讓 FidoVault 成為前景；與註冊相同先確認 live HWND
+/// 為前景，再以全新一般斷言完成 pending 註冊（不放寬任何守門）。
+fn continue_registration_inner(
+    state: &VaultState,
+    ed: edition::Edition,
+    raise: impl FnOnce(bool) -> Result<isize>,
+    mut clock: impl FnMut() -> std::time::Instant,
+) -> Result<RegisterResult> {
+    state.with_lock(|g| {
+        let Some(vault_path) = g.vault.as_ref().map(|v| v.path.clone()) else {
+            return Err("金庫未解鎖".to_string());
+        };
+        let Some(slot) = g.pending_registration.as_ref() else {
+            return Err(if !has_unacknowledged_cleanup(g) {
+                "沒有待完成的金鑰註冊；請重新註冊".to_string()
+            } else {
+                "沒有待完成的金鑰註冊；本次建立的 Windows Hello 憑證未能自動刪除，請到「設定 → 帳戶 → 通行金鑰」只刪除本次測試項目。".to_string()
+            });
+        };
+        if clock() >= slot.deadline || slot.vault_path != vault_path {
+            let cleanup = cancel_pending_registration(g);
+            return Err(format!(
+                "註冊確認已逾時或金庫已變更，已取消本次註冊（金庫未新增金鑰槽）。{}",
+                if cleanup == RegistrationCleanup::ManualRemovalRequired {
+                    "本次建立的 Windows Hello 憑證未能自動刪除，請到「設定 → 帳戶 → 通行金鑰」只刪除本次測試項目。"
+                } else {
+                    ""
+                }
+            ));
+        }
+        if slot.pending.is_platform() {
+            require_windows_hello_single(ed)?;
+        }
+        // 視窗無法成為前景時保留 pending，使用者可再按一次或取消。
+        let owner = raise(true)?;
+        // 前景確認本身可能跨過期限；在消耗 pending 前再核對鎖內的即時時鐘。
+        if clock() >= g.pending_registration.as_ref().expect("pending under lock").deadline {
+            let cleanup = cancel_pending_registration(g);
+            return Err(format!(
+                "註冊確認已逾時，已取消本次註冊（金庫未新增金鑰槽）。{}",
+                if cleanup == RegistrationCleanup::ManualRemovalRequired {
+                    "本次建立的 Windows Hello 憑證未能自動刪除，請到「設定 → 帳戶 → 通行金鑰」只刪除本次測試項目。"
+                } else {
+                    ""
+                }
+            ));
+        }
+        let PendingRegistrationSlot {
+            pending,
+            deadline,
+            vault_path,
+            generation,
+        } = g
+            .pending_registration
+            .take()
+            .ok_or_else(|| "沒有待完成的金鑰註冊；請重新註冊".to_string())?;
+        g.backend.set_webauthn_parent_hwnd(owner);
+        let v = g.vault.as_mut().ok_or_else(|| "金庫未解鎖".to_string())?;
+        let outcome = v.continue_registration(g.backend.as_mut(), pending, ed);
+        let cleanup_report = v.take_registration_cleanup_report();
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                record_registration_failure_cleanup(g, generation, cleanup_report);
+                return Err(error.to_string());
+            }
+        };
+        match outcome {
+            vault::RegistrationOutcome::Registered(credential) => {
+                Ok(RegisterResult::Registered { credential })
+            }
+            vault::RegistrationOutcome::HandoffRequired(pending) => {
+                // 再按一次即可；期限不延長。
+                g.pending_registration = Some(PendingRegistrationSlot {
+                    pending,
+                    deadline,
+                    vault_path,
+                    generation,
+                });
+                Ok(RegisterResult::HandoffRequired {
+                    message: fido2::FidoError::ForegroundHandoffRequired.to_string(),
+                })
+            }
+        }
+    })
+}
+
+#[tauri::command]
+fn continue_registration(
+    window: tauri::WebviewWindow,
+    state: tauri::State<VaultState>,
+) -> Result<RegisterResult> {
+    continue_registration_inner(
+        &state,
+        edition::current(),
+        |required| raise_key_operation_window(&window, required),
+        std::time::Instant::now,
     )
+}
+
+fn cancel_registration_inner(state: &VaultState) -> Result<CancelRegistrationInfo> {
+    state.with_lock(|g| {
+        Ok(CancelRegistrationInfo {
+            status: "cancelled",
+            cleanup: cancel_pending_registration(g),
+        })
+    })
+}
+
+#[tauri::command]
+fn cancel_registration(state: tauri::State<VaultState>) -> Result<CancelRegistrationInfo> {
+    cancel_registration_inner(&state)
+}
+
+fn registration_cleanup_status_inner(
+    state: &VaultState,
+) -> Result<Vec<RegistrationCleanupReceipt>> {
+    state.with_lock(registration_cleanup_status_inner_unlocked)
+}
+
+fn cleanup_reason_tag(reason: &str) -> &'static str {
+    match reason {
+        "expired" => "expired",
+        "locked" => "locked",
+        "implicit" => "implicit",
+        "continue_error" => "continue_error",
+        "unverified" => "unverified",
+        _ => "unknown",
+    }
+}
+
+/// Journal-backed receipts are authoritative: a successful listing replaces every durable
+/// entry of the in-memory cache (so acknowledgements by another process are honoured and
+/// receipts from a previous process appear). Memory-only fallbacks (`memory-*`) are kept.
+/// An unreadable journal or missing storage adds a conservative, unacknowledgeable notice.
+fn registration_cleanup_status_inner_unlocked(
+    g: &mut AppInner,
+) -> Result<Vec<RegistrationCleanupReceipt>> {
+    let mut unavailable = g.registration_cleanup_storage_unavailable;
+    if let Some(journal) = &g.registration_cleanup_journal {
+        match journal.list() {
+            Ok(records) => {
+                let previous = std::mem::take(&mut g.registration_cleanup_receipts);
+                let generations: std::collections::HashMap<&str, u64> = previous
+                    .iter()
+                    .map(|receipt| (receipt.id.as_str(), receipt.generation))
+                    .collect();
+                let mut synced: Vec<RegistrationCleanupReceipt> = previous
+                    .iter()
+                    .filter(|receipt| receipt.id.starts_with("memory-"))
+                    .cloned()
+                    .collect();
+                for record in records {
+                    let generation = generations.get(record.id.as_str()).copied().unwrap_or(0);
+                    synced.push(RegistrationCleanupReceipt {
+                        id: record.id,
+                        generation,
+                        reason: cleanup_reason_tag(&record.reason),
+                        cleanup: RegistrationCleanup::ManualRemovalRequired,
+                    });
+                }
+                g.registration_cleanup_receipts = synced;
+            }
+            Err(_) => unavailable = true,
+        }
+    }
+    let mut receipts = g.registration_cleanup_receipts.clone();
+    if unavailable {
+        receipts.push(RegistrationCleanupReceipt {
+            id: "journal-unavailable".into(),
+            generation: 0,
+            reason: "storage_unavailable",
+            cleanup: RegistrationCleanup::ManualRemovalRequired,
+        });
+    }
+    Ok(receipts)
+}
+
+fn has_unacknowledged_cleanup(g: &mut AppInner) -> bool {
+    registration_cleanup_status_inner_unlocked(g).map_or(true, |receipts| !receipts.is_empty())
+}
+
+#[tauri::command]
+fn registration_cleanup_status(
+    state: tauri::State<VaultState>,
+) -> Result<Vec<RegistrationCleanupReceipt>> {
+    registration_cleanup_status_inner(&state)
+}
+
+fn acknowledge_registration_cleanup_inner(state: &VaultState, id: &str) -> Result<()> {
+    state.with_lock(|g| {
+        if id == "journal-unavailable" {
+            return Err("清理收據儲存位置無法讀取，請先修復儲存問題".into());
+        }
+        let receipts = registration_cleanup_status_inner_unlocked(g)?;
+        if !receipts.iter().any(|r| r.id == id) {
+            return Err("找不到待確認的清理通知".into());
+        }
+        if !id.starts_with("memory-") {
+            g.registration_cleanup_journal
+                .as_ref()
+                .ok_or_else(|| "清理收據儲存位置無法讀取".to_string())?
+                .ack(id)
+                .map_err(|_| "無法儲存清理通知確認，請重試".to_string())?;
+        }
+        g.registration_cleanup_receipts.retain(|r| r.id != id);
+        Ok(())
+    })
+}
+
+#[tauri::command]
+fn acknowledge_registration_cleanup(state: tauri::State<VaultState>, id: String) -> Result<()> {
+    acknowledge_registration_cleanup_inner(&state, &id)
 }
 
 fn login_windows_hello_inner(
@@ -623,6 +1111,7 @@ fn login_windows_hello_inner(
         // A concurrent lock command cannot interleave and be undone by login.
         g.pending_csv_import = None;
         g.dual_pending = None;
+        cancel_pending_registration(g);
         g.vault = Some(v);
         Ok(entries)
     })
@@ -655,6 +1144,7 @@ fn create_vault(state: tauri::State<VaultState>, password: String) -> Result<()>
         .map_err(|e| e.to_string())?;
     state.with_lock(|g| {
         g.dual_pending = None;
+        cancel_pending_registration(g);
         g.vault = Some(v);
         Ok(())
     })?;
@@ -688,6 +1178,7 @@ fn login_password_inner(
         let entries = v.entries().to_vec();
         // 改用主密碼登入：放棄進行中的兩步驟登入（share 清零）。
         g.dual_pending = None;
+        cancel_pending_registration(g);
         g.vault = Some(v);
         Ok(entries)
     })
@@ -711,6 +1202,7 @@ fn login_key(
     })?;
     let entries = v.entries().to_vec();
     state.with_lock(|g| {
+        cancel_pending_registration(g);
         g.vault = Some(v);
         Ok(())
     })?;
@@ -732,6 +1224,7 @@ fn login_any_key(
     })?;
     let entries = v.entries().to_vec();
     state.with_lock(|g| {
+        cancel_pending_registration(g);
         g.vault = Some(v);
         Ok(())
     })?;
@@ -829,6 +1322,7 @@ fn login_dual_complete(
     })?;
     let entries = v.entries().to_vec();
     state.with_lock(|g| {
+        cancel_pending_registration(g);
         g.vault = Some(v);
         Ok(())
     })?;
@@ -849,9 +1343,15 @@ fn login_dual_cancel(state: tauri::State<VaultState>) -> Result<()> {
 /// 上鎖（手動或閒置）。回傳登入畫面資訊。
 #[tauri::command]
 fn lock(state: tauri::State<VaultState>, reason: Option<String>) -> Result<LoginScreenInfo> {
+    lock_inner(&state, reason)
+}
+
+fn lock_inner(state: &VaultState, reason: Option<String>) -> Result<LoginScreenInfo> {
     let (header, brokered_key_login) = state.with_lock(|g| {
         let brokered_key_login = g.backend.uses_brokered_key_selection();
         g.dual_pending = None;
+        // 上鎖/登出：放棄未完成的註冊（Windows Hello 刪除本次 credential，秘密清零）。
+        cancel_pending_registration_with_reason(g, "locked");
         match g.vault.take() {
             Some(v) => {
                 g.pending_csv_import = None;
@@ -1050,18 +1550,47 @@ fn register_key(
     pin: Option<String>,
     label: String,
     group: Option<crypto::KeyGroup>,
-) -> Result<fido2::RegisteredCredential> {
-    let require_foreground = state.with_lock(|g| Ok(g.backend.uses_brokered_key_selection()))?;
-    let owner_hwnd = raise_key_operation_window(&window, require_foreground)?;
+) -> Result<RegisterResult> {
+    let result = register_key_inner(
+        &state,
+        |required| raise_key_operation_window(&window, required),
+        pin.as_deref(),
+        &label,
+        group,
+    )?;
+    schedule_registration_sweep(&window, &state, &result);
+    Ok(result)
+}
+
+fn register_key_inner(
+    state: &VaultState,
+    raise: impl FnOnce(bool) -> Result<isize>,
+    pin: Option<&str>,
+    label: &str,
+    group: Option<crypto::KeyGroup>,
+) -> Result<RegisterResult> {
+    let require_foreground = state.with_lock(|g| {
+        sweep_expired_registration(g, None, std::time::Instant::now());
+        require_no_pending_registration(g)?;
+        Ok(g.backend.uses_brokered_key_selection())
+    })?;
+    let owner_hwnd = raise(require_foreground)?;
     // 同一後端實例內 detect+register → 類型一致。
-    state.with_lock(|g| match g.vault.as_mut() {
-        Some(v) => {
-            g.backend.set_webauthn_parent_hwnd(owner_hwnd);
-            // 單人版不可帶群組、雙人版必須帶群組（vault 層 fail closed，不碰 authenticator）。
-            v.register_key_for(g.backend.as_mut(), pin.as_deref(), &label, group)
-                .map_err(|e| e.to_string())
-        }
-        None => Err("金庫未解鎖".to_string()),
+    state.with_lock(|g| {
+        require_no_pending_registration(g)?;
+        let v = g.vault.as_mut().ok_or_else(|| "金庫未解鎖".to_string())?;
+        g.backend.set_webauthn_parent_hwnd(owner_hwnd);
+        // 單人版不可帶群組、雙人版必須帶群組（vault 層 fail closed，不碰 authenticator）。
+        let outcome = v
+            .begin_register_key_for(g.backend.as_mut(), pin, label, group)
+            .map_err(|e| e.to_string())?;
+        let vault_path = v.path.clone();
+        Ok(store_registration_outcome(
+            g,
+            outcome,
+            vault_path,
+            std::time::Instant::now(),
+        ))
     })
 }
 
@@ -1108,6 +1637,11 @@ fn remove_key_inner(
     ed: edition::Edition,
 ) -> Result<Option<KeyRemovalInfo>> {
     state.with_lock(|g| {
+        if g.vault.is_none() {
+            return Err("金庫未解鎖".to_string());
+        }
+        // 金鑰清單即將改變：先放棄未完成的註冊（UI 在 pending 期間也停用移除）。
+        cancel_pending_registration(g);
         let v = g.vault.as_mut().ok_or_else(|| "金庫未解鎖".to_string())?;
         if ed == edition::Edition::Dual {
             v.remove_key(credential_id).map_err(|e| e.to_string())?;
@@ -1257,6 +1791,10 @@ pub fn run() {
             delete_entry,
             list_audit,
             register_key,
+            continue_registration,
+            cancel_registration,
+            registration_cleanup_status,
+            acknowledge_registration_cleanup,
             validate_key_label,
             suggest_key_label,
             remove_key,
@@ -1269,6 +1807,26 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+/// Test-only, per-thread hook fired when `with_lock` must wait for another holder.
+/// Lets a test prove a worker is genuinely queued on the state mutex (no sleeps).
+#[cfg(test)]
+mod lock_wait_hook {
+    use std::cell::RefCell;
+    thread_local! {
+        static HOOK: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
+    }
+    pub fn set(hook: impl Fn() + 'static) {
+        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    }
+    pub fn notify() {
+        HOOK.with(|h| {
+            if let Some(hook) = h.borrow().as_ref() {
+                hook();
+            }
+        });
+    }
 }
 
 #[cfg(test)]
@@ -1286,6 +1844,13 @@ mod wh_d5_tests {
         delete: usize,
         hwnd: Vec<isize>,
         allow: Vec<Vec<u8>>,
+        // D9-F1 R4 runtime fault injection (test-only; mutable after the backend is boxed).
+        force_unavailable: bool,
+        list_fail_from: Option<usize>,
+        list_empty: bool,
+        clock_ms: Option<Arc<std::sync::atomic::AtomicU64>>,
+        assert_error_from: Option<usize>,
+        wrong_prf_from: Option<usize>,
     }
 
     struct Recording {
@@ -1294,6 +1859,7 @@ mod wh_d5_tests {
         status: PlatformStatus,
         list_error: bool,
         rogue: bool,
+        rogue_after_first: bool,
         delete_error: bool,
     }
 
@@ -1309,6 +1875,7 @@ mod wh_d5_tests {
                 },
                 list_error: false,
                 rogue: false,
+                rogue_after_first: false,
                 delete_error: false,
             }
         }
@@ -1332,15 +1899,31 @@ mod wh_d5_tests {
         ) -> std::result::Result<[u8; 32], FidoError> {
             self.mock.get_prf_secret(id, pin)
         }
+        fn prf_supported(&self) -> bool {
+            self.mock.prf_supported()
+        }
         fn platform_status(&self) -> PlatformStatus {
-            self.calls.lock().unwrap().status += 1;
+            let mut c = self.calls.lock().unwrap();
+            c.status += 1;
+            if c.force_unavailable {
+                return PlatformStatus {
+                    api_ok: false,
+                    uvpa: false,
+                    console: false,
+                };
+            }
             self.status
         }
         fn list_platform_credentials(&mut self) -> std::result::Result<Vec<Vec<u8>>, FidoError> {
-            self.calls.lock().unwrap().list += 1;
-            if self.list_error {
+            let mut c = self.calls.lock().unwrap();
+            c.list += 1;
+            if self.list_error || c.list_fail_from.is_some_and(|from| c.list >= from) {
                 return Err(FidoError::Internal("synthetic discovery failure".into()));
             }
+            if c.list_empty {
+                return Ok(Vec::new());
+            }
+            drop(c);
             self.mock.list_platform_credentials()
         }
         fn register_platform_credential(
@@ -1348,7 +1931,13 @@ mod wh_d5_tests {
             label: &str,
             exclude: &[Vec<u8>],
         ) -> std::result::Result<fido2::PlatformRegistration, FidoError> {
-            self.calls.lock().unwrap().create += 1;
+            let mut c = self.calls.lock().unwrap();
+            c.create += 1;
+            // Controlled ceremony seam: the first phase "takes" 200 synthetic seconds.
+            if let Some(clock) = &c.clock_ms {
+                clock.fetch_add(200_000, std::sync::atomic::Ordering::SeqCst);
+            }
+            drop(c);
             self.mock.register_platform_credential(label, exclude)
         }
         fn get_platform_prf_secret(
@@ -1357,9 +1946,21 @@ mod wh_d5_tests {
         ) -> std::result::Result<(Vec<u8>, [u8; 32]), FidoError> {
             let mut c = self.calls.lock().unwrap();
             c.assert += 1;
+            let assertion_count = c.assert;
             c.allow = ids.to_vec();
+            let assert_error = c
+                .assert_error_from
+                .is_some_and(|from| assertion_count >= from);
+            let wrong_prf = c.wrong_prf_from.is_some_and(|from| assertion_count >= from);
             drop(c);
-            if self.rogue {
+            if assert_error {
+                return Err(FidoError::NoDevice);
+            }
+            if wrong_prf {
+                // Correct credential, different PRF output.
+                return Ok((ids[0].clone(), [0x5a; 32]));
+            }
+            if self.rogue || (self.rogue_after_first && assertion_count > 1) {
                 return Ok((vec![255; 32], [0; 32]));
             }
             self.mock.get_platform_prf_secret(ids)
@@ -1452,6 +2053,11 @@ mod wh_d5_tests {
                 pending_csv_import: None,
                 dual_pending: None,
                 dual_generation: 0,
+                pending_registration: None,
+                registration_generation: 0,
+                registration_cleanup_receipts: Vec::new(),
+                registration_cleanup_journal: None,
+                registration_cleanup_storage_unavailable: false,
             })),
             calls,
         )
@@ -2148,7 +2754,9 @@ mod wh_d5_tests {
             || Ok("TRUSTED-SYNTHETIC".into()),
         );
         assert!(result.is_ok(), "registration should succeed");
-        let reg = result.unwrap();
+        let RegisterResult::Registered { credential: reg } = result.unwrap() else {
+            panic!("registration should not require a foreground handoff");
+        };
         assert_eq!(focus, 1);
         let h = vault::Vault::read_header(&p, edition::Edition::Single).unwrap();
         assert_eq!(h.key_slots.len(), 1);
@@ -2188,6 +2796,1565 @@ mod wh_d5_tests {
         let c = c.lock().unwrap();
         assert!(c.list > 0);
         assert_eq!((c.create, c.assert, c.delete, c.hwnd.len()), (0, 0, 0, 0));
+    }
+
+    // ── D9-F1：註冊第二階段前景交接（IPC 層） ──
+
+    fn d9f1_hello_state(times: usize) -> (Fixture, VaultState, Arc<Mutex<Calls>>) {
+        let p = fixture();
+        let v = vault::Vault::create_for(&p, "synthetic-D9F1-password", edition::Edition::Single)
+            .unwrap();
+        let mut b = Recording::new();
+        b.mock = MockBackend::new()
+            .with_platform_handoff(fido2::MockHandoffRefusal::OwnerNotForeground, times);
+        let (s, c) = state(Some(v), b);
+        (p, s, c)
+    }
+
+    fn d9f1_hello_handoff(s: &VaultState) -> Result<RegisterResult> {
+        register_windows_hello_inner(
+            s,
+            edition::Edition::Single,
+            |_| Ok(789),
+            || Ok("SYNTHETIC".into()),
+        )
+    }
+
+    fn d9f1_has_pending(s: &VaultState) -> bool {
+        s.with_lock(|g| Ok(g.pending_registration.is_some()))
+            .unwrap()
+    }
+
+    #[test]
+    fn d9f1_hello_handoff_stores_pending_and_blocks_new_registration() {
+        let (p, s, c) = d9f1_hello_state(1);
+        let before = std::fs::read(&p).unwrap();
+        let result = d9f1_hello_handoff(&s);
+        assert!(
+            matches!(&result, Ok(RegisterResult::HandoffRequired { .. })),
+            "{result:?}"
+        );
+        assert_eq!(
+            serde_json::to_value(result.unwrap()).unwrap(),
+            serde_json::json!({
+                "status": "handoff_required",
+                "message": FidoError::ForegroundHandoffRequired.to_string(),
+            })
+        );
+        assert!(d9f1_has_pending(&s));
+        assert_eq!(std::fs::read(&p).unwrap(), before);
+        assert_eq!(
+            c.lock().unwrap().delete,
+            0,
+            "handoff keeps the new credential"
+        );
+
+        let mut focus = 0;
+        let again = register_windows_hello_inner(
+            &s,
+            edition::Edition::Single,
+            |_| {
+                focus += 1;
+                Ok(789)
+            },
+            || Ok("SYNTHETIC".into()),
+        );
+        assert!(matches!(&again, Err(m) if m.contains("取消")), "{again:?}");
+        let roaming = register_key_inner(
+            &s,
+            |_| {
+                focus += 1;
+                Ok(789)
+            },
+            None,
+            "synthetic-roaming",
+            None,
+        );
+        assert!(
+            matches!(&roaming, Err(m) if m.contains("取消")),
+            "{roaming:?}"
+        );
+        assert_eq!(
+            focus, 0,
+            "a pending registration refuses before any focus change"
+        );
+        let c = c.lock().unwrap();
+        assert_eq!((c.create, c.delete), (1, 0));
+    }
+
+    #[test]
+    fn d9f1_r2_hello_deadline_starts_when_first_ceremony_returns() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let (_p, state, calls) = d9f1_hello_state(1);
+        // The synthetic clock only advances inside MakeCredential (Recording seam), so a
+        // deadline computed from a clock read before the ceremony is exactly 200 s early.
+        let synthetic_ms = Arc::new(AtomicU64::new(0));
+        calls.lock().unwrap().clock_ms = Some(Arc::clone(&synthetic_ms));
+        let base = std::time::Instant::now();
+        let clock = || base + std::time::Duration::from_millis(synthetic_ms.load(Ordering::SeqCst));
+        let result = register_windows_hello_inner_with_clock(
+            &state,
+            edition::Edition::Single,
+            |_| Ok(789),
+            || Ok("SYNTHETIC".into()),
+            clock,
+        );
+        assert!(
+            matches!(&result, Ok(RegisterResult::HandoffRequired { .. })),
+            "{result:?}"
+        );
+        let deadline = state
+            .with_lock(|g| Ok(g.pending_registration.as_ref().unwrap().deadline))
+            .unwrap();
+        assert_eq!(
+            deadline,
+            base + std::time::Duration::from_secs(200) + PENDING_REGISTRATION_TIMEOUT,
+            "pending deadline must start after the first ceremony returns"
+        );
+        assert_eq!(calls.lock().unwrap().delete, 0);
+    }
+
+    #[test]
+    fn d9f1_continue_success_registers_with_fresh_foreground_and_clears_pending() {
+        let (p, s, c) = d9f1_hello_state(1);
+        assert!(d9f1_hello_handoff(&s).is_ok());
+        let mut required = Vec::new();
+        let result = continue_registration_inner(
+            &s,
+            edition::Edition::Single,
+            |r| {
+                required.push(r);
+                Ok(790)
+            },
+            std::time::Instant::now,
+        );
+        assert!(
+            matches!(&result, Ok(RegisterResult::Registered { .. })),
+            "{result:?}"
+        );
+        let json = serde_json::to_value(result.unwrap()).unwrap();
+        assert_eq!(json["status"], "registered");
+        assert_eq!(
+            json["credential"]["label"],
+            "Windows Hello（本機 SYNTHETIC）"
+        );
+        assert!(json.get("message").is_none() && json["credential"].get("creation_prf").is_none());
+        assert_eq!(required, vec![true]);
+        assert!(!d9f1_has_pending(&s));
+        let h = vault::Vault::read_header(&p, edition::Edition::Single).unwrap();
+        assert_eq!(h.key_slots.len(), 1);
+        let c = c.lock().unwrap();
+        assert_eq!(
+            c.hwnd,
+            vec![789, 790],
+            "continue uses the freshly raised live HWND"
+        );
+        assert_eq!((c.create, c.delete), (1, 0));
+    }
+
+    #[test]
+    fn d9f1_continue_handoff_again_keeps_pending_without_extending_deadline() {
+        let (_p, s, c) = d9f1_hello_state(2);
+        assert!(d9f1_hello_handoff(&s).is_ok());
+        let deadline = s
+            .with_lock(|g| Ok(g.pending_registration.as_ref().map(|slot| slot.deadline)))
+            .unwrap();
+        let result = continue_registration_inner(
+            &s,
+            edition::Edition::Single,
+            |_| Ok(790),
+            std::time::Instant::now,
+        );
+        assert!(
+            matches!(&result, Ok(RegisterResult::HandoffRequired { .. })),
+            "{result:?}"
+        );
+        let after = s
+            .with_lock(|g| Ok(g.pending_registration.as_ref().map(|slot| slot.deadline)))
+            .unwrap();
+        assert!(deadline.is_some() && after == deadline);
+        assert_eq!(c.lock().unwrap().delete, 0);
+    }
+
+    #[test]
+    fn d9f1_continue_after_timeout_cancels_and_deletes_without_focus() {
+        let (p, s, c) = d9f1_hello_state(1);
+        assert!(d9f1_hello_handoff(&s).is_ok());
+        let before = std::fs::read(&p).unwrap();
+        let mut focus = 0;
+        let late = std::time::Instant::now()
+            + PENDING_REGISTRATION_TIMEOUT
+            + std::time::Duration::from_secs(1);
+        let result = continue_registration_inner(
+            &s,
+            edition::Edition::Single,
+            |_| {
+                focus += 1;
+                Ok(790)
+            },
+            || late,
+        );
+        assert!(
+            matches!(&result, Err(m) if m.contains("逾時")),
+            "{result:?}"
+        );
+        assert_eq!(focus, 0);
+        assert!(!d9f1_has_pending(&s));
+        assert_eq!(std::fs::read(&p).unwrap(), before);
+        assert_eq!(
+            c.lock().unwrap().delete,
+            1,
+            "expired platform pending is deleted"
+        );
+    }
+
+    #[test]
+    fn d9f1_r2_queued_continue_rejects_deadline_passed_while_waiting_for_lock() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let (_p, state, calls) = d9f1_hello_state(1);
+        assert!(d9f1_hello_handoff(&state).is_ok());
+        let initial_assertions = calls.lock().unwrap().assert;
+        let state = Arc::new(state);
+        let held = state.0.lock().unwrap();
+        let base = std::time::Instant::now();
+        let ticks = Arc::new(AtomicU64::new(0));
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let (clock_tx, clock_rx) = std::sync::mpsc::channel::<u64>();
+        let worker = Arc::clone(&state);
+        let worker_ticks = Arc::clone(&ticks);
+        let task = std::thread::spawn(move || {
+            // Fires only when with_lock's try_lock reports WouldBlock in this thread.
+            lock_wait_hook::set(move || {
+                let _ = waiting_tx.send(());
+            });
+            let mut focus_calls = 0;
+            let result = continue_registration_inner(
+                &worker,
+                edition::Edition::Single,
+                |_| {
+                    focus_calls += 1;
+                    Ok(790)
+                },
+                || {
+                    let now = worker_ticks.load(Ordering::SeqCst);
+                    let _ = clock_tx.send(now);
+                    base + std::time::Duration::from_millis(now)
+                },
+            );
+            (result, focus_calls)
+        });
+        // Deterministic synchronisation: proceed only once the worker is genuinely blocked on
+        // the state mutex. Not reaching that point is a test failure, never a silent pass.
+        let reached = waiting_rx.recv_timeout(std::time::Duration::from_secs(30));
+        assert!(reached.is_ok(), "worker never queued on the state lock");
+        // Everything the IPC did before blocking is complete; any clock read so far was
+        // necessarily outside the lock (a stale time-of-check).
+        let early = clock_rx.try_recv();
+        assert!(
+            early.is_err(),
+            "clock was read before the state lock: {early:?}"
+        );
+        let mut held = held;
+        held.pending_registration.as_mut().unwrap().deadline =
+            base + std::time::Duration::from_millis(10);
+        ticks.store(20, Ordering::SeqCst);
+        drop(held);
+        let (result, focus_calls) = task.join().unwrap();
+        assert!(
+            matches!(&result, Err(message) if message.contains("逾時")),
+            "{result:?}"
+        );
+        assert_eq!(focus_calls, 0, "an expired pending must not raise focus");
+        assert_eq!(
+            clock_rx.try_iter().next(),
+            Some(20),
+            "first clock read happens under the lock"
+        );
+        let c = calls.lock().unwrap();
+        assert_eq!((c.assert, c.delete), (initial_assertions, 1));
+    }
+
+    #[test]
+    fn d9f1_r2_continue_rejects_deadline_crossed_during_raise() {
+        let (_p, state, calls) = d9f1_hello_state(1);
+        assert!(d9f1_hello_handoff(&state).is_ok());
+        let initial_assertions = calls.lock().unwrap().assert;
+        let base = std::time::Instant::now();
+        let ticks = std::cell::Cell::new(0_u64);
+        state
+            .with_lock(|g| {
+                g.pending_registration.as_mut().unwrap().deadline =
+                    base + std::time::Duration::from_millis(10);
+                Ok(())
+            })
+            .unwrap();
+        let mut focus_calls = 0;
+        let result = continue_registration_inner(
+            &state,
+            edition::Edition::Single,
+            |_| {
+                focus_calls += 1;
+                ticks.set(20);
+                Ok(790)
+            },
+            || base + std::time::Duration::from_millis(ticks.get()),
+        );
+        assert!(
+            matches!(&result, Err(message) if message.contains("逾時")),
+            "{result:?}"
+        );
+        assert_eq!(focus_calls, 1);
+        let c = calls.lock().unwrap();
+        assert_eq!((c.assert, c.delete), (initial_assertions, 1));
+    }
+
+    #[test]
+    fn d9f1_r2_timer_failed_cleanup_remains_visible_to_cancel_and_continue() {
+        let p = fixture();
+        let v = vault::Vault::create_for(&p, "synthetic-D9F1-password", edition::Edition::Single)
+            .unwrap();
+        let mut b = Recording::new();
+        b.mock = MockBackend::new()
+            .with_platform_handoff(fido2::MockHandoffRefusal::OwnerNotForeground, 1);
+        b.delete_error = true;
+        let (state, calls) = state(Some(v), b);
+        assert!(d9f1_hello_handoff(&state).is_ok());
+        let expired = state
+            .with_lock(|g| {
+                let slot = g.pending_registration.as_ref().unwrap();
+                let generation = slot.generation;
+                let deadline = slot.deadline;
+                Ok(sweep_expired_registration(g, Some(generation), deadline))
+            })
+            .unwrap();
+        assert!(expired);
+        let status = cancel_registration_inner(&state).unwrap();
+        assert_eq!(status.cleanup, RegistrationCleanup::ManualRemovalRequired);
+        let result = continue_registration_inner(
+            &state,
+            edition::Edition::Single,
+            |_| unreachable!("expired pending must not raise focus"),
+            std::time::Instant::now,
+        );
+        assert!(
+            matches!(&result, Err(message) if message.contains("通行金鑰")),
+            "{result:?}"
+        );
+        assert_eq!(calls.lock().unwrap().delete, 1, "no double delete");
+    }
+
+    #[test]
+    fn d9f1_r2_lock_failed_cleanup_receipt_survives_login() {
+        let p = fixture();
+        let v = vault::Vault::create_for(&p, "synthetic-D9F1-password", edition::Edition::Single)
+            .unwrap();
+        let mut b = Recording::new();
+        b.mock = MockBackend::new()
+            .with_platform_handoff(fido2::MockHandoffRefusal::OwnerNotForeground, 1);
+        b.delete_error = true;
+        let (state, calls) = state(Some(v), b);
+        assert!(d9f1_hello_handoff(&state).is_ok());
+        assert!(lock_inner(&state, None).is_ok());
+        assert!(login_password_inner(
+            &state,
+            &p,
+            "synthetic-D9F1-password",
+            edition::Edition::Single
+        )
+        .is_ok());
+        let receipts = state
+            .with_lock(|g| Ok(g.registration_cleanup_receipts.clone()))
+            .unwrap();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(
+            receipts[0].cleanup,
+            RegistrationCleanup::ManualRemovalRequired
+        );
+        assert_eq!(receipts[0].reason, "locked");
+        assert_eq!(calls.lock().unwrap().delete, 1);
+    }
+
+    #[test]
+    fn d9f1_r2_lazy_sweep_then_new_pending_keeps_old_failure_receipt() {
+        let p = fixture();
+        let v = vault::Vault::create_for(&p, "synthetic-D9F1-password", edition::Edition::Single)
+            .unwrap();
+        let mut b = Recording::new();
+        b.mock = MockBackend::new()
+            .with_platform_handoff(fido2::MockHandoffRefusal::OwnerNotForeground, 2);
+        b.delete_error = true;
+        let (state, calls) = state(Some(v), b);
+        assert!(d9f1_hello_handoff(&state).is_ok());
+        state
+            .with_lock(|g| {
+                g.pending_registration.as_mut().unwrap().deadline = std::time::Instant::now();
+                Ok(())
+            })
+            .unwrap();
+        assert!(d9f1_hello_handoff(&state).is_ok());
+        let (first, second) = state
+            .with_lock(|g| {
+                Ok((
+                    g.registration_cleanup_receipts.first().cloned(),
+                    g.pending_registration.as_ref().map(|p| p.generation),
+                ))
+            })
+            .unwrap();
+        assert!(matches!(
+            first.as_ref(),
+            Some(RegistrationCleanupReceipt {
+                cleanup: RegistrationCleanup::ManualRemovalRequired,
+                reason: "expired",
+                ..
+            })
+        ));
+        assert!(second.is_some_and(|generation| generation != first.unwrap().generation));
+        assert_eq!(calls.lock().unwrap().delete, 1);
+    }
+
+    #[test]
+    fn d9f1_r2_cleanup_receipt_query_and_exact_generation_acknowledgement() {
+        let p = fixture();
+        let v = vault::Vault::create_for(&p, "synthetic-D9F1-password", edition::Edition::Single)
+            .unwrap();
+        let mut b = Recording::new();
+        b.mock = MockBackend::new()
+            .with_platform_handoff(fido2::MockHandoffRefusal::OwnerNotForeground, 1);
+        b.delete_error = true;
+        let (state, calls) = state(Some(v), b);
+        assert!(d9f1_hello_handoff(&state).is_ok());
+        assert!(lock_inner(&state, None).is_ok());
+        let receipts = registration_cleanup_status_inner(&state).unwrap();
+        let json = serde_json::to_value(&receipts).unwrap();
+        assert_eq!(json.as_array().unwrap().len(), 1);
+        assert_eq!(json[0]["reason"], "locked");
+        assert_eq!(json[0]["cleanup"], "manual_removal_required");
+        assert_eq!(
+            json[0].as_object().unwrap().len(),
+            4,
+            "no credential or secret may leave IPC"
+        );
+        let id = receipts[0].id.clone();
+        assert!(acknowledge_registration_cleanup_inner(&state, "invalid-id").is_err());
+        assert_eq!(registration_cleanup_status_inner(&state).unwrap().len(), 1);
+        assert!(acknowledge_registration_cleanup_inner(&state, &id).is_ok());
+        assert!(registration_cleanup_status_inner(&state)
+            .unwrap()
+            .is_empty());
+        assert_eq!(calls.lock().unwrap().delete, 1);
+    }
+
+    #[test]
+    fn d9f1_r3_continue_failure_cleanup_warning_is_recorded() {
+        let p = fixture();
+        let v = vault::Vault::create_for(&p, "synthetic-D9F1-password", edition::Edition::Single)
+            .unwrap();
+        let (state, _) = state(Some(v), Recording::new());
+        state
+            .with_lock(|g| {
+                record_registration_failure_cleanup(g, 96, None);
+                record_registration_failure_cleanup(
+                    g,
+                    96,
+                    Some(vault::RegistrationCleanupReport::Removed),
+                );
+                assert!(
+                    g.registration_cleanup_receipts.is_empty(),
+                    "ordinary error has no orphan warning"
+                );
+                record_registration_failure_cleanup(
+                    g,
+                    96,
+                    Some(vault::RegistrationCleanupReport::DeleteFailed),
+                );
+                record_registration_failure_cleanup(
+                    g,
+                    97,
+                    Some(vault::RegistrationCleanupReport::NotAttempted),
+                );
+                assert!(g
+                    .registration_cleanup_receipts
+                    .iter()
+                    .any(|r| r.generation == 97 && r.reason == "unverified"));
+                assert!(g
+                    .registration_cleanup_receipts
+                    .iter()
+                    .any(|r| r.generation == 96
+                        && r.reason == "continue_error"
+                        && r.cleanup == RegistrationCleanup::ManualRemovalRequired));
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn d9f1_r3_cleanup_journal_survives_restart_and_acks_exact_record() {
+        let root = fixture_root().join(format!(
+            "cleanup-journal-test-{:016x}",
+            rand::random::<u64>()
+        ));
+        let journal = registration_cleanup_journal::Journal::new(root.clone());
+        let first = journal.record("expired").unwrap();
+        let second = journal.record("locked").unwrap();
+        assert_ne!(first, second);
+        let restarted = registration_cleanup_journal::Journal::new(root);
+        let records = restarted.list().unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(records
+            .iter()
+            .any(|r| r.id == first && r.reason == "expired"));
+        assert!(records
+            .iter()
+            .any(|r| r.id == second && r.reason == "locked"));
+        assert!(restarted.ack("../escape").is_err());
+        restarted.ack(&first).unwrap();
+        let remaining = registration_cleanup_journal::Journal::new(restarted.root().to_path_buf())
+            .list()
+            .unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, second);
+    }
+
+    #[test]
+    fn d9f1_r3_failed_cleanup_is_visible_to_fresh_app_state() {
+        let root = fixture_root().join(format!("receipt-restart-{:016x}", rand::random::<u64>()));
+        let p = fixture_in(&root);
+        let v = vault::Vault::create_for(&p, "synthetic-D9F1-password", edition::Edition::Single)
+            .unwrap();
+        let mut b = Recording::new();
+        b.mock = MockBackend::new()
+            .with_platform_handoff(fido2::MockHandoffRefusal::OwnerNotForeground, 1);
+        b.delete_error = true;
+        let (first_state, _) = state(Some(v), b);
+        first_state
+            .with_lock(|g| {
+                g.registration_cleanup_journal = Some(registration_cleanup_journal::Journal::new(
+                    root.join("receipts"),
+                ));
+                Ok(())
+            })
+            .unwrap();
+        assert!(d9f1_hello_handoff(&first_state).is_ok());
+        assert!(lock_inner(&first_state, None).is_ok());
+        let first = registration_cleanup_status_inner(&first_state).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].cleanup, RegistrationCleanup::ManualRemovalRequired);
+        let (restarted, _) = state(None, Recording::new());
+        restarted
+            .with_lock(|g| {
+                g.registration_cleanup_journal = Some(registration_cleanup_journal::Journal::new(
+                    root.join("receipts"),
+                ));
+                Ok(())
+            })
+            .unwrap();
+        let reopened = registration_cleanup_status_inner(&restarted).unwrap();
+        assert_eq!(
+            reopened.len(),
+            1,
+            "warning must survive a fresh process state"
+        );
+        assert_eq!(reopened[0].id, first[0].id);
+        assert!(acknowledge_registration_cleanup_inner(&restarted, "wrong-id").is_err());
+        assert!(acknowledge_registration_cleanup_inner(&restarted, &reopened[0].id).is_ok());
+        assert!(registration_cleanup_status_inner(&restarted)
+            .unwrap()
+            .is_empty());
+        assert!(
+            registration_cleanup_status_inner(&first_state)
+                .unwrap()
+                .is_empty(),
+            "another process must not keep displaying an acknowledged receipt"
+        );
+    }
+
+    #[test]
+    fn d9f1_r3_continue_delete_failure_reports_durable_receipt() {
+        let root = fixture_root().join(format!("continue-failure-{:016x}", rand::random::<u64>()));
+        let p = fixture_in(&root);
+        let v = vault::Vault::create_for(&p, "synthetic-D9F1-password", edition::Edition::Single)
+            .unwrap();
+        let mut b = Recording::new();
+        b.mock = MockBackend::new()
+            .with_platform_handoff(fido2::MockHandoffRefusal::OwnerNotForeground, 1);
+        b.delete_error = true;
+        b.rogue_after_first = true;
+        let (first_state, calls) = state(Some(v), b);
+        first_state
+            .with_lock(|g| {
+                g.registration_cleanup_journal = Some(registration_cleanup_journal::Journal::new(
+                    root.join("receipts"),
+                ));
+                Ok(())
+            })
+            .unwrap();
+        assert!(d9f1_hello_handoff(&first_state).is_ok());
+        let result = continue_registration_inner(
+            &first_state,
+            edition::Edition::Single,
+            |_| Ok(1),
+            std::time::Instant::now,
+        );
+        assert!(result.is_err());
+        assert!(!d9f1_has_pending(&first_state));
+        let receipts = registration_cleanup_status_inner(&first_state).unwrap();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].reason, "continue_error");
+        assert_eq!(
+            receipts[0].cleanup,
+            RegistrationCleanup::ManualRemovalRequired
+        );
+        assert_eq!(calls.lock().unwrap().delete, 1);
+        let (restarted, _) = state(None, Recording::new());
+        restarted
+            .with_lock(|g| {
+                g.registration_cleanup_journal = Some(registration_cleanup_journal::Journal::new(
+                    root.join("receipts"),
+                ));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            registration_cleanup_status_inner(&restarted).unwrap()[0].id,
+            receipts[0].id
+        );
+    }
+
+    #[test]
+    fn d9f1_r3_journal_write_failure_does_not_prevent_lock_and_warns() {
+        let root = fixture_root().join(format!("receipt-denied-{:016x}", rand::random::<u64>()));
+        std::fs::create_dir_all(&root).unwrap();
+        let blocked = root.join("not-a-directory");
+        std::fs::write(&blocked, b"test").unwrap();
+        let p = fixture_in(&root);
+        let v = vault::Vault::create_for(&p, "synthetic-D9F1-password", edition::Edition::Single)
+            .unwrap();
+        let mut b = Recording::new();
+        b.mock = MockBackend::new()
+            .with_platform_handoff(fido2::MockHandoffRefusal::OwnerNotForeground, 1);
+        b.delete_error = true;
+        let (state, calls) = state(Some(v), b);
+        state
+            .with_lock(|g| {
+                g.registration_cleanup_journal =
+                    Some(registration_cleanup_journal::Journal::new(blocked.clone()));
+                Ok(())
+            })
+            .unwrap();
+        assert!(d9f1_hello_handoff(&state).is_ok());
+        assert!(
+            lock_inner(&state, None).is_ok(),
+            "storage failure must not block lock"
+        );
+        let notices = registration_cleanup_status_inner(&state).unwrap();
+        assert!(notices.iter().any(|r| r.reason == "storage_unavailable"
+            && r.cleanup == RegistrationCleanup::ManualRemovalRequired));
+        assert_eq!(calls.lock().unwrap().delete, 1);
+        std::fs::remove_file(blocked).unwrap();
+    }
+
+    // ── D9-F1 R4：journal 為權威狀態、前置失敗保守通知 ──
+
+    fn d9f1_r4_root(tag: &str) -> std::path::PathBuf {
+        fixture_root().join(format!("d9f1-r4-{tag}-{:016x}", rand::random::<u64>()))
+    }
+
+    fn d9f1_r4_attach_journal(s: &VaultState, root: &std::path::Path) {
+        s.with_lock(|g| {
+            g.registration_cleanup_journal = Some(registration_cleanup_journal::Journal::new(
+                root.join("receipts"),
+            ));
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    fn d9f1_r4_journal_state(
+        root: &std::path::Path,
+        handoffs: usize,
+        delete_error: bool,
+    ) -> (Fixture, VaultState, Arc<Mutex<Calls>>) {
+        let p = fixture_in(root);
+        let v = vault::Vault::create_for(&p, "synthetic-D9F1-password", edition::Edition::Single)
+            .unwrap();
+        let mut b = Recording::new();
+        b.mock = MockBackend::new()
+            .with_platform_handoff(fido2::MockHandoffRefusal::OwnerNotForeground, handoffs);
+        b.delete_error = delete_error;
+        let (s, c) = state(Some(v), b);
+        d9f1_r4_attach_journal(&s, root);
+        (p, s, c)
+    }
+
+    #[test]
+    fn d9f1_r4_restart_journal_is_authoritative_for_cancel_and_continue() {
+        let root = d9f1_r4_root("restart");
+        let (p, first, _) = d9f1_r4_journal_state(&root, 1, true);
+        assert!(d9f1_hello_handoff(&first).is_ok());
+        assert!(lock_inner(&first, None).is_ok());
+        drop(first);
+        // Fresh process: same vault and journal, no pending, empty in-memory receipts.
+        let v = vault::Vault::open_password(&p, "synthetic-D9F1-password").unwrap();
+        let (restarted, calls) = state(Some(v), Recording::new());
+        d9f1_r4_attach_journal(&restarted, &root);
+        let cancelled = cancel_registration_inner(&restarted).unwrap();
+        assert_eq!(
+            cancelled.cleanup,
+            RegistrationCleanup::ManualRemovalRequired,
+            "an unacknowledged durable warning must not be downgraded to none after restart"
+        );
+        let resumed = continue_registration_inner(
+            &restarted,
+            edition::Edition::Single,
+            |_| unreachable!("no pending: must not raise focus"),
+            std::time::Instant::now,
+        );
+        assert!(
+            matches!(&resumed, Err(m) if m.contains("通行金鑰")),
+            "{resumed:?}"
+        );
+        let c = calls.lock().unwrap();
+        assert_eq!((c.create, c.assert, c.delete), (0, 0, 0));
+        drop(c);
+        drop(p);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn d9f1_r4_cross_process_ack_is_honored_by_original_cancel_and_continue() {
+        let root = d9f1_r4_root("cross-ack");
+        let (p, original, _) = d9f1_r4_journal_state(&root, 1, true);
+        assert!(d9f1_hello_handoff(&original).is_ok());
+        assert!(lock_inner(&original, None).is_ok());
+        assert!(login_password_inner(
+            &original,
+            &p,
+            "synthetic-D9F1-password",
+            edition::Edition::Single
+        )
+        .is_ok());
+        let (other, _) = state(None, Recording::new());
+        d9f1_r4_attach_journal(&other, &root);
+        let receipts = registration_cleanup_status_inner(&other).unwrap();
+        assert_eq!(receipts.len(), 1);
+        assert!(acknowledge_registration_cleanup_inner(&other, &receipts[0].id).is_ok());
+        let cancelled = cancel_registration_inner(&original).unwrap();
+        assert_eq!(
+            cancelled.cleanup,
+            RegistrationCleanup::None,
+            "an acknowledged receipt must not be reported again by another process"
+        );
+        let resumed = continue_registration_inner(
+            &original,
+            edition::Edition::Single,
+            |_| unreachable!("no pending: must not raise focus"),
+            std::time::Instant::now,
+        );
+        assert!(
+            matches!(&resumed, Err(m) if !m.contains("通行金鑰")),
+            "{resumed:?}"
+        );
+        drop(p);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn d9f1_r4_assert_unverified_receipt(s: &VaultState, root: &std::path::Path, case: &str) {
+        let receipts = registration_cleanup_status_inner(s).unwrap();
+        assert!(
+            receipts.iter().any(|r| r.reason == "unverified"
+                && r.cleanup == RegistrationCleanup::ManualRemovalRequired),
+            "{case}: {receipts:?}"
+        );
+        let (fresh, _) = state(None, Recording::new());
+        d9f1_r4_attach_journal(&fresh, root);
+        let reopened = registration_cleanup_status_inner(&fresh).unwrap();
+        assert!(
+            reopened.iter().any(|r| r.reason == "unverified"),
+            "{case}: warning must survive restart: {reopened:?}"
+        );
+    }
+
+    fn d9f1_r4_continue_precondition_case(case: &str, inject: impl FnOnce(&mut Calls)) {
+        let root = d9f1_r4_root(case);
+        let (p, s, calls) = d9f1_r4_journal_state(&root, 1, false);
+        assert!(d9f1_hello_handoff(&s).is_ok());
+        let asserts_before = calls.lock().unwrap().assert;
+        inject(&mut calls.lock().unwrap());
+        let result = continue_registration_inner(
+            &s,
+            edition::Edition::Single,
+            |_| Ok(790),
+            std::time::Instant::now,
+        );
+        assert!(result.is_err(), "{case}: {result:?}");
+        assert!(!d9f1_has_pending(&s), "{case}");
+        {
+            let c = calls.lock().unwrap();
+            assert_eq!(
+                c.assert, asserts_before,
+                "{case}: no assertion without preconditions"
+            );
+            assert_eq!(
+                c.delete, 0,
+                "{case}: unproven credential must never be deleted"
+            );
+        }
+        d9f1_r4_assert_unverified_receipt(&s, &root, case);
+        drop(p);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn d9f1_r4_continue_platform_unavailable_leaves_durable_warning() {
+        d9f1_r4_continue_precondition_case("unavailable", |c| c.force_unavailable = true);
+    }
+
+    #[test]
+    fn d9f1_r4_continue_discovery_error_leaves_durable_warning() {
+        d9f1_r4_continue_precondition_case("discovery", |c| c.list_fail_from = Some(c.list + 1));
+    }
+
+    #[test]
+    fn d9f1_r4_continue_membership_unproven_leaves_durable_warning() {
+        d9f1_r4_continue_precondition_case("membership", |c| c.list_empty = true);
+    }
+
+    #[test]
+    fn d9f1_r4_begin_post_create_discovery_failure_leaves_durable_warning() {
+        let root = d9f1_r4_root("begin-discovery");
+        let (p, s, calls) = d9f1_r4_journal_state(&root, 1, false);
+        // List #1 (before MakeCredential) succeeds; list #2 (ownership proof) fails.
+        calls.lock().unwrap().list_fail_from = Some(2);
+        let result = d9f1_hello_handoff(&s);
+        assert!(result.is_err(), "{result:?}");
+        assert!(!d9f1_has_pending(&s));
+        {
+            let c = calls.lock().unwrap();
+            assert_eq!((c.create, c.assert, c.delete), (1, 0, 0));
+        }
+        d9f1_r4_assert_unverified_receipt(&s, &root, "begin-discovery");
+        drop(p);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn d9f1_r4_existing_slot_id_is_never_reported_as_new_orphan() {
+        // A pending that names an already-registered credential is not evidence of a new
+        // credential: neither delete nor an orphan receipt may be produced.
+        let root = d9f1_r4_root("existing-id");
+        let (p, s, calls) = d9f1_r4_journal_state(&root, 0, false);
+        let registered = d9f1_hello_handoff(&s);
+        assert!(
+            matches!(&registered, Ok(RegisterResult::Registered { .. })),
+            "{registered:?}"
+        );
+        let RegisterResult::Registered { credential } = registered.unwrap() else {
+            unreachable!()
+        };
+        let forged = vault::PendingRegistration::Platform {
+            credential,
+            creation_prf: Zeroizing::new([7; 32]),
+            label: "forged".into(),
+        };
+        s.with_lock(|g| {
+            g.pending_registration = Some(PendingRegistrationSlot {
+                pending: forged,
+                deadline: std::time::Instant::now() + PENDING_REGISTRATION_TIMEOUT,
+                vault_path: p.to_path_buf(),
+                generation: 900,
+            });
+            Ok(())
+        })
+        .unwrap();
+        let deletes_before = calls.lock().unwrap().delete;
+        let result = continue_registration_inner(
+            &s,
+            edition::Edition::Single,
+            |_| Ok(790),
+            std::time::Instant::now,
+        );
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(calls.lock().unwrap().delete, deletes_before);
+        assert!(registration_cleanup_status_inner(&s).unwrap().is_empty());
+        drop(p);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn d9f1_r2_old_generation_sweep_cannot_cancel_new_pending() {
+        let (_p, state, calls) = d9f1_hello_state(2);
+        assert!(d9f1_hello_handoff(&state).is_ok());
+        let first_generation = state
+            .with_lock(|g| {
+                let slot = g.pending_registration.as_mut().unwrap();
+                slot.deadline = std::time::Instant::now();
+                Ok(slot.generation)
+            })
+            .unwrap();
+        assert!(state
+            .with_lock(|g| Ok(sweep_expired_registration(
+                g,
+                Some(first_generation),
+                std::time::Instant::now()
+            )))
+            .unwrap());
+        assert!(d9f1_hello_handoff(&state).is_ok());
+        let new_deadline = state
+            .with_lock(|g| Ok(g.pending_registration.as_ref().unwrap().deadline))
+            .unwrap();
+        let swept = state
+            .with_lock(|g| {
+                Ok(sweep_expired_registration(
+                    g,
+                    Some(first_generation),
+                    new_deadline,
+                ))
+            })
+            .unwrap();
+        assert!(!swept);
+        assert!(d9f1_has_pending(&state));
+        assert_eq!(calls.lock().unwrap().delete, 1);
+    }
+
+    #[test]
+    fn d9f1_r2_sweep_and_cancel_race_delete_at_most_once() {
+        use std::sync::{Arc, Barrier};
+        let (_p, state, calls) = d9f1_hello_state(1);
+        assert!(d9f1_hello_handoff(&state).is_ok());
+        let (generation, deadline) = state
+            .with_lock(|g| {
+                let slot = g.pending_registration.as_ref().unwrap();
+                Ok((slot.generation, slot.deadline))
+            })
+            .unwrap();
+        let state = Arc::new(state);
+        let barrier = Arc::new(Barrier::new(3));
+        let swept = {
+            let state = Arc::clone(&state);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                state
+                    .with_lock(|g| Ok(sweep_expired_registration(g, Some(generation), deadline)))
+                    .unwrap()
+            })
+        };
+        let cancelled = {
+            let state = Arc::clone(&state);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                cancel_registration_inner(&state).unwrap().cleanup
+            })
+        };
+        barrier.wait();
+        let swept = swept.join().unwrap();
+        let cancelled = cancelled.join().unwrap();
+        assert!(
+            matches!(
+                (swept, cancelled),
+                (true, RegistrationCleanup::None) | (false, RegistrationCleanup::Removed)
+            ),
+            "exactly one cleanup winner: swept={swept} cancelled={cancelled:?}"
+        );
+        assert!(!d9f1_has_pending(&state));
+        let c = calls.lock().unwrap();
+        assert_eq!(
+            (c.delete, c.hwnd.len()),
+            (1, 1),
+            "one delete, no extra focus"
+        );
+        drop(c);
+        assert!(registration_cleanup_status_inner(&state)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn d9f1_r4_sweep_and_cancel_exact_results_in_both_orders() {
+        for sweep_first in [true, false] {
+            let (_p, state, calls) = d9f1_hello_state(1);
+            assert!(d9f1_hello_handoff(&state).is_ok());
+            let asserts = calls.lock().unwrap().assert;
+            let (generation, deadline) = state
+                .with_lock(|g| {
+                    let slot = g.pending_registration.as_ref().unwrap();
+                    Ok((slot.generation, slot.deadline))
+                })
+                .unwrap();
+            let sweep = |s: &VaultState| {
+                s.with_lock(|g| Ok(sweep_expired_registration(g, Some(generation), deadline)))
+                    .unwrap()
+            };
+            let (swept, cancelled) = if sweep_first {
+                let swept = sweep(&state);
+                (swept, cancel_registration_inner(&state).unwrap().cleanup)
+            } else {
+                let cancelled = cancel_registration_inner(&state).unwrap().cleanup;
+                (sweep(&state), cancelled)
+            };
+            let expected = if sweep_first {
+                (true, RegistrationCleanup::None)
+            } else {
+                (false, RegistrationCleanup::Removed)
+            };
+            assert_eq!((swept, cancelled), expected, "sweep_first={sweep_first}");
+            let c = calls.lock().unwrap();
+            assert_eq!(
+                (c.assert, c.delete),
+                (asserts, 1),
+                "sweep_first={sweep_first}"
+            );
+        }
+    }
+
+    #[test]
+    fn d9f1_r4_local_appdata_must_be_absolute_for_the_journal() {
+        let (journal, unavailable) = cleanup_journal_from_local_appdata(None);
+        assert!(journal.is_none() && unavailable);
+        for untrusted in ["", "relative\\AppData", "relative/AppData"] {
+            let (journal, unavailable) = cleanup_journal_from_local_appdata(Some(untrusted.into()));
+            assert!(
+                journal.is_none() && unavailable,
+                "{untrusted:?} must not be trusted"
+            );
+        }
+        let absolute = fixture_root();
+        let (journal, unavailable) =
+            cleanup_journal_from_local_appdata(Some(absolute.clone().into()));
+        assert!(!unavailable);
+        assert_eq!(
+            journal.unwrap().root(),
+            absolute.join("FidoVault").join("registration-cleanup-v1")
+        );
+    }
+
+    fn d9f1_r5_write_failure_case(
+        tag: &str,
+        inject: impl FnOnce(&mut registration_cleanup_journal::TestFaults),
+        restart_reason: &str,
+    ) {
+        let root = d9f1_r4_root(tag);
+        let (p, s, calls) = d9f1_r4_journal_state(&root, 1, true);
+        s.with_lock(|g| {
+            inject(&mut g.registration_cleanup_journal.as_ref().unwrap().faults());
+            Ok(())
+        })
+        .unwrap();
+        assert!(d9f1_hello_handoff(&s).is_ok());
+        assert!(
+            lock_inner(&s, None).is_ok(),
+            "{tag}: storage failure must not block lock"
+        );
+        let now = registration_cleanup_status_inner(&s).unwrap();
+        assert!(
+            now.iter()
+                .any(|r| r.reason == "storage_unavailable" && r.id.starts_with("memory-")),
+            "{tag}: in-process fallback warning: {now:?}"
+        );
+        assert_eq!(
+            cancel_registration_inner(&s).unwrap().cleanup,
+            RegistrationCleanup::ManualRemovalRequired,
+            "{tag}"
+        );
+        assert_eq!(calls.lock().unwrap().delete, 1, "{tag}");
+        let (fresh, _) = state(None, Recording::new());
+        d9f1_r4_attach_journal(&fresh, &root);
+        let reopened = registration_cleanup_status_inner(&fresh).unwrap();
+        assert!(
+            reopened.iter().any(|r| r.reason == restart_reason),
+            "{tag}: the failed receipt must stay a conservative warning after restart: {reopened:?}"
+        );
+        drop(p);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn d9f1_r4_journal_write_failure_warns_now_and_after_restart() {
+        d9f1_r5_write_failure_case("after-create", |f| f.fail_after_create = true, "unknown");
+    }
+
+    #[test]
+    fn d9f1_r5_journal_partial_write_warns_now_and_after_restart() {
+        d9f1_r5_write_failure_case("partial", |f| f.partial_write = Some(3), "unknown");
+    }
+
+    #[test]
+    fn d9f1_r5_journal_sync_failure_warns_now_and_after_restart() {
+        d9f1_r5_write_failure_case("sync", |f| f.fail_sync = true, "locked");
+    }
+
+    /// End-to-end matrix: {begin, continue} x {assertion error, PRF mismatch, persist failure}
+    /// x {delete ok, delete fails}. Checks the primary error, exact calls, slot rollback, the
+    /// durable receipt, no-pending cancel and a fresh process.
+    #[test]
+    fn d9f1_r5_terminal_cleanup_matrix_is_durable_end_to_end() {
+        let primary_assert = vault::VaultError::Fido(FidoError::NoDevice).to_string();
+        let primary_prf = vault::VaultError::Fido(FidoError::PlatformPrfUnsupported).to_string();
+        for phase in ["begin", "continue"] {
+            for failure in ["assertion", "prf", "persist"] {
+                for delete_fails in [false, true] {
+                    let case = format!("{phase}/{failure}/delete_fails={delete_fails}");
+                    let root = d9f1_r4_root(&format!("matrix-{phase}-{failure}-{delete_fails}"));
+                    let handoffs = usize::from(phase == "continue");
+                    let (p, s, calls) = d9f1_r4_journal_state(&root, handoffs, delete_fails);
+                    // The failing assertion is the first (begin) or the second (continue).
+                    let ordinal = 1 + handoffs;
+                    let arm = |calls: &Arc<Mutex<Calls>>| {
+                        let mut c = calls.lock().unwrap();
+                        match failure {
+                            "assertion" => c.assert_error_from = Some(ordinal),
+                            "prf" => c.wrong_prf_from = Some(ordinal),
+                            _ => {}
+                        }
+                    };
+                    let tmp = p.with_extension("db.tmp");
+                    let result = if phase == "begin" {
+                        arm(&calls);
+                        if failure == "persist" {
+                            std::fs::create_dir(&tmp).unwrap();
+                        }
+                        d9f1_hello_handoff(&s).map(|_| ())
+                    } else {
+                        assert!(
+                            matches!(
+                                d9f1_hello_handoff(&s),
+                                Ok(RegisterResult::HandoffRequired { .. })
+                            ),
+                            "{case}"
+                        );
+                        arm(&calls);
+                        if failure == "persist" {
+                            std::fs::create_dir(&tmp).unwrap();
+                        }
+                        continue_registration_inner(
+                            &s,
+                            edition::Edition::Single,
+                            |_| Ok(790),
+                            std::time::Instant::now,
+                        )
+                        .map(|_| ())
+                    };
+                    let error = result.expect_err(&case);
+                    match failure {
+                        "assertion" => assert_eq!(error, primary_assert, "{case}"),
+                        "prf" => assert_eq!(error, primary_prf, "{case}"),
+                        _ => assert!(error.starts_with("檔案錯誤"), "{case}: {error}"),
+                    }
+                    if failure == "persist" {
+                        std::fs::remove_dir(&tmp).unwrap();
+                    }
+                    {
+                        let c = calls.lock().unwrap();
+                        assert_eq!(
+                            (c.create, c.delete),
+                            (1, 1),
+                            "{case}: one credential, one delete"
+                        );
+                        assert_eq!(c.assert, ordinal, "{case}: no extra assertion");
+                    }
+                    assert!(!d9f1_has_pending(&s), "{case}");
+                    let header = vault::Vault::read_header(&p, edition::Edition::Single).unwrap();
+                    assert!(header.key_slots.is_empty(), "{case}: slot rolled back");
+                    let receipts = registration_cleanup_status_inner(&s).unwrap();
+                    let cancelled = cancel_registration_inner(&s).unwrap().cleanup;
+                    let (fresh, _) = state(None, Recording::new());
+                    d9f1_r4_attach_journal(&fresh, &root);
+                    let reopened = registration_cleanup_status_inner(&fresh).unwrap();
+                    if delete_fails {
+                        assert!(
+                            receipts.iter().any(|r| r.reason == "continue_error"),
+                            "{case}: {receipts:?}"
+                        );
+                        assert_eq!(
+                            cancelled,
+                            RegistrationCleanup::ManualRemovalRequired,
+                            "{case}"
+                        );
+                        assert!(
+                            reopened.iter().any(|r| r.reason == "continue_error"),
+                            "{case}: {reopened:?}"
+                        );
+                    } else {
+                        assert!(
+                            receipts.is_empty(),
+                            "{case}: Removed must not leave a receipt: {receipts:?}"
+                        );
+                        assert_eq!(cancelled, RegistrationCleanup::None, "{case}");
+                        assert!(reopened.is_empty(), "{case}: {reopened:?}");
+                    }
+                    drop(p);
+                    let _ = std::fs::remove_dir_all(&root);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn d9f1_r5_sync_keeps_memory_fallbacks_and_generations() {
+        let root = d9f1_r4_root("memory-generation");
+        let (p, s, _) = d9f1_r4_journal_state(&root, 1, false);
+        s.with_lock(|g| {
+            g.registration_cleanup_receipts
+                .push(RegistrationCleanupReceipt {
+                    id: "memory-5".into(),
+                    generation: 5,
+                    reason: "storage_unavailable",
+                    cleanup: RegistrationCleanup::ManualRemovalRequired,
+                });
+            record_registration_cleanup(g, 77, "expired");
+            Ok(())
+        })
+        .unwrap();
+        for round in 0..2 {
+            let receipts = registration_cleanup_status_inner(&s).unwrap();
+            assert_eq!(
+                receipts.len(),
+                2,
+                "round {round}: no loss, no duplicates: {receipts:?}"
+            );
+            assert!(
+                receipts
+                    .iter()
+                    .any(|r| r.id == "memory-5" && r.generation == 5),
+                "round {round}: memory fallback must survive journal sync"
+            );
+            assert!(
+                receipts.iter().any(|r| !r.id.starts_with("memory-")
+                    && r.generation == 77
+                    && r.reason == "expired"),
+                "round {round}: durable receipt keeps its generation: {receipts:?}"
+            );
+        }
+        drop(p);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn d9f1_r2_wrong_vault_or_repeated_continue_never_reasserts() {
+        let (_p, state, calls) = d9f1_hello_state(1);
+        assert!(d9f1_hello_handoff(&state).is_ok());
+        let initial_asserts = calls.lock().unwrap().assert;
+        state
+            .with_lock(|g| {
+                g.pending_registration.as_mut().unwrap().vault_path =
+                    std::path::PathBuf::from("other-vault.db");
+                Ok(())
+            })
+            .unwrap();
+        let mut focus_calls = 0;
+        let result = continue_registration_inner(
+            &state,
+            edition::Edition::Single,
+            |_| {
+                focus_calls += 1;
+                Ok(123)
+            },
+            std::time::Instant::now,
+        );
+        assert!(
+            matches!(&result, Err(message) if message.contains("金庫已變更")),
+            "{result:?}"
+        );
+        let second = continue_registration_inner(
+            &state,
+            edition::Edition::Single,
+            |_| {
+                focus_calls += 1;
+                Ok(123)
+            },
+            std::time::Instant::now,
+        );
+        assert!(second.is_err());
+        assert_eq!(focus_calls, 0);
+        let c = calls.lock().unwrap();
+        assert_eq!((c.assert, c.delete), (initial_asserts, 1));
+    }
+
+    #[test]
+    fn d9f1_r2_successful_continue_consumes_pending_once() {
+        let (_p, state, calls) = d9f1_hello_state(1);
+        assert!(d9f1_hello_handoff(&state).is_ok());
+        assert!(matches!(
+            continue_registration_inner(
+                &state,
+                edition::Edition::Single,
+                |_| Ok(790),
+                std::time::Instant::now
+            ),
+            Ok(RegisterResult::Registered { .. })
+        ));
+        let assertions = calls.lock().unwrap().assert;
+        let mut focus_calls = 0;
+        let again = continue_registration_inner(
+            &state,
+            edition::Edition::Single,
+            |_| {
+                focus_calls += 1;
+                Ok(790)
+            },
+            std::time::Instant::now,
+        );
+        assert!(again.is_err());
+        assert_eq!(focus_calls, 0);
+        assert_eq!(calls.lock().unwrap().assert, assertions);
+    }
+
+    #[test]
+    fn d9f1_cancel_reports_each_cleanup_value() {
+        for delete_error in [false, true] {
+            let p = fixture();
+            let v =
+                vault::Vault::create_for(&p, "synthetic-D9F1-password", edition::Edition::Single)
+                    .unwrap();
+            let mut b = Recording::new();
+            b.mock = MockBackend::new()
+                .with_platform_handoff(fido2::MockHandoffRefusal::OwnerNotForeground, 1);
+            b.delete_error = delete_error;
+            let (s, c) = state(Some(v), b);
+            assert!(d9f1_hello_handoff(&s).is_ok());
+            let info = cancel_registration_inner(&s);
+            assert!(info.is_ok());
+            let json = serde_json::to_value(info.unwrap()).unwrap();
+            let expected = if delete_error {
+                "manual_removal_required"
+            } else {
+                "removed"
+            };
+            assert_eq!(
+                json,
+                serde_json::json!({"status": "cancelled", "cleanup": expected})
+            );
+            assert!(!d9f1_has_pending(&s));
+            assert_eq!(
+                c.lock().unwrap().delete,
+                1,
+                "cancel attempts the delete once"
+            );
+            let none = serde_json::to_value(cancel_registration_inner(&s).unwrap()).unwrap();
+            // R2 contract: until explicit acknowledgement, failed cleanup is retained;
+            // successful cleanup still reports none when repeated.
+            let repeated = if delete_error {
+                "manual_removal_required"
+            } else {
+                "none"
+            };
+            assert_eq!(
+                none,
+                serde_json::json!({"status": "cancelled", "cleanup": repeated})
+            );
+        }
+
+        let p = fixture();
+        let v = vault::Vault::create_for(&p, "synthetic-D9F1-password", edition::Edition::Single)
+            .unwrap();
+        let mut b = Recording::new();
+        b.mock = MockBackend::new()
+            .with_next_kind(fido2::KeyKind::TouchOnly)
+            .with_roaming_handoff(fido2::MockHandoffRefusal::ForegroundHandoffRequired, 1);
+        let (s, c) = state(Some(v), b);
+        let result = register_key_inner(&s, |_| Ok(5), None, "synthetic-roaming", None);
+        assert!(
+            matches!(&result, Ok(RegisterResult::HandoffRequired { .. })),
+            "{result:?}"
+        );
+        let json = serde_json::to_value(cancel_registration_inner(&s).unwrap()).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"status": "cancelled", "cleanup": "discarded"})
+        );
+        assert_eq!(c.lock().unwrap().delete, 0);
+    }
+
+    #[test]
+    fn d9f1_roaming_register_then_continue_completes_slot() {
+        let p = fixture();
+        let v = vault::Vault::create_for(&p, "synthetic-D9F1-password", edition::Edition::Single)
+            .unwrap();
+        let mut b = Recording::new();
+        b.mock = MockBackend::new()
+            .with_next_kind(fido2::KeyKind::TouchOnly)
+            .with_roaming_handoff(fido2::MockHandoffRefusal::ForegroundHandoffRequired, 1);
+        let (s, c) = state(Some(v), b);
+        let result = register_key_inner(&s, |_| Ok(5), None, "synthetic-roaming", None);
+        assert!(
+            matches!(&result, Ok(RegisterResult::HandoffRequired { .. })),
+            "{result:?}"
+        );
+        assert!(d9f1_has_pending(&s));
+        let result = continue_registration_inner(
+            &s,
+            edition::Edition::Single,
+            |_| Ok(6),
+            std::time::Instant::now,
+        );
+        assert!(
+            matches!(&result, Ok(RegisterResult::Registered { credential }) if credential.label == "synthetic-roaming"),
+            "{result:?}"
+        );
+        assert_eq!(
+            vault::Vault::read_header(&p, edition::Edition::Single)
+                .unwrap()
+                .key_slots
+                .len(),
+            1
+        );
+        assert_eq!(c.lock().unwrap().hwnd, vec![5, 6]);
+    }
+
+    #[test]
+    fn d9f1_lock_login_and_remove_cancel_pending_with_platform_delete() {
+        // lock
+        let (_p, s, c) = d9f1_hello_state(1);
+        assert!(d9f1_hello_handoff(&s).is_ok());
+        assert!(lock_inner(&s, None).is_ok());
+        assert!(!d9f1_has_pending(&s));
+        assert_eq!(c.lock().unwrap().delete, 1);
+
+        // successful login replacing the session
+        let (p, s, c) = d9f1_hello_state(1);
+        assert!(d9f1_hello_handoff(&s).is_ok());
+        let login =
+            login_password_inner(&s, &p, "synthetic-D9F1-password", edition::Edition::Single);
+        assert!(login.is_ok(), "{:?}", login.err());
+        assert!(!d9f1_has_pending(&s));
+        assert_eq!(c.lock().unwrap().delete, 1);
+
+        // key removal changes the key list
+        let (_p, s, c) = d9f1_hello_state(1);
+        assert!(d9f1_hello_handoff(&s).is_ok());
+        let removal = remove_key_inner(&s, "unknown-id", edition::Edition::Single);
+        assert!(removal.is_err());
+        assert!(!d9f1_has_pending(&s));
+        assert_eq!(c.lock().unwrap().delete, 1);
+    }
+
+    #[test]
+    fn d9f1_dual_edition_refuses_hello_pending_continue_before_focus() {
+        let (_p, s, c) = d9f1_hello_state(1);
+        assert!(d9f1_hello_handoff(&s).is_ok());
+        let asserts = c.lock().unwrap().assert;
+        let mut focus = 0;
+        let result = continue_registration_inner(
+            &s,
+            edition::Edition::Dual,
+            |_| {
+                focus += 1;
+                Ok(790)
+            },
+            std::time::Instant::now,
+        );
+        assert!(
+            matches!(&result, Err(m) if m.contains("單人版")),
+            "{result:?}"
+        );
+        assert_eq!(focus, 0);
+        assert_eq!(
+            c.lock().unwrap().assert,
+            asserts,
+            "no assertion in dual edition"
+        );
+    }
+
+    #[test]
+    fn d9f1_registration_ipcs_are_registered_and_wired() {
+        let source = include_str!("lib.rs").replace(char::from(13), "");
+        let commands = source
+            .split(".invoke_handler(tauri::generate_handler![")
+            .nth(1)
+            .unwrap()
+            .split("])")
+            .next()
+            .unwrap();
+        for (command, helper) in [
+            ("continue_registration", "continue_registration_inner("),
+            ("cancel_registration", "cancel_registration_inner(&state)"),
+            (
+                "registration_cleanup_status",
+                "registration_cleanup_status_inner(&state)",
+            ),
+            (
+                "acknowledge_registration_cleanup",
+                "acknowledge_registration_cleanup_inner(&state",
+            ),
+        ] {
+            assert!(
+                commands.lines().any(|l| l.trim() == format!("{command},")),
+                "{command} must be registered"
+            );
+            // Concatenated marker so this test does not find itself.
+            let marker = ["fn ", command, "(\n"].concat();
+            let alt = ["fn ", command, "(state:"].concat();
+            let body = source
+                .split(&marker)
+                .nth(1)
+                .or_else(|| source.split(&alt).nth(1))
+                .expect("command exists")
+                .split("#[tauri::command]")
+                .next()
+                .unwrap();
+            assert!(body.contains(helper), "{command} must call {helper}");
+        }
+        let continue_body = source
+            .split(&["fn continue_registration", "(\n"].concat())
+            .nth(1)
+            .unwrap()
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        assert!(continue_body.contains("raise_key_operation_window(&window, required)"));
+    }
+
+    #[test]
+    fn d9f1_no_new_active_foreground_api_calls() {
+        fn production(source: &str, marker: &str) -> String {
+            let source = source.replace(char::from(13), "");
+            source.split(marker).next().unwrap().to_owned()
+        }
+        let lib = production(include_str!("lib.rs"), "\n#[cfg(test)]\n");
+        let webauthn = production(
+            include_str!("windows_webauthn.rs"),
+            "\n#[cfg(test)]\nmod tests {",
+        );
+        // Existing, reviewed calls only: the raise helper and the broker monitor.
+        assert_eq!(lib.matches("SetForegroundWindow(").count(), 1);
+        assert_eq!(lib.matches("ShowWindow(").count(), 1);
+        assert_eq!(webauthn.matches("SetForegroundWindow(").count(), 1);
+        assert_eq!(webauthn.matches(".activate(").count(), 1);
+        for source in [&lib, &webauthn] {
+            for forbidden in [
+                "AllowSetForegroundWindow",
+                "AttachThreadInput",
+                "BringWindowToTop",
+                "SwitchToThisWindow",
+                "SetActiveWindow",
+                "keybd_event",
+                "SendInput",
+                "ASFW_ANY",
+                "LockSetForegroundWindow",
+            ] {
+                assert!(!source.contains(forbidden), "{forbidden}");
+            }
+        }
+        // The D9-F1 additions are passive: no activation inside them.
+        for (start, end) in [
+            ("fn continuation_refusal_error(", "\n}\n"),
+            ("fn foreground_owner_details(", "\n}\n"),
+            ("fn log_foreground_owner(", "\n}\n"),
+            ("fn log_pre_api_refusal<T>(", "\n}\n"),
+        ] {
+            let body = webauthn
+                .split(start)
+                .nth(1)
+                .unwrap()
+                .split(end)
+                .next()
+                .unwrap();
+            assert!(
+                !body.contains("activate") && !body.contains("SetForeground"),
+                "{start}"
+            );
+        }
     }
 }
 
@@ -2395,6 +4562,11 @@ mod dual_pending_sweep_tests {
             pending_csv_import: None,
             dual_pending: pending,
             dual_generation: generation,
+            pending_registration: None,
+            registration_generation: 0,
+            registration_cleanup_receipts: Vec::new(),
+            registration_cleanup_journal: None,
+            registration_cleanup_storage_unavailable: false,
         }
     }
 
@@ -2657,6 +4829,11 @@ mod d9_settings_ipc_tests {
             pending_csv_import: None,
             dual_pending: None,
             dual_generation: 0,
+            pending_registration: None,
+            registration_generation: 0,
+            registration_cleanup_receipts: Vec::new(),
+            registration_cleanup_journal: None,
+            registration_cleanup_storage_unavailable: false,
         }))
     }
 

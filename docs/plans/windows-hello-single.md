@@ -347,3 +347,73 @@ v1 不變，`KeySlot` 新增：
 - **R2 completed-code review + parent verification：** frozen R2 manifest SHA256 `27fe82f66844e5eee7f3252a7daf2846d3e6220780cb154f737f1bf9ae7d46d2`；Reviewer `passed=true`、`coverage_complete=true`、security／logic arrays 空，原 R1 否決保留。Parent 讀回四檔 hashes 一致；MSVC Rust `real-ctap` **428/428**、dual **428/428**、Node **123/123**、既有 single Gate **20/20**、dual Gate **25/25**；Hello example 兩 features 各 **9 cases／29 checks**，Python `-O` **9／29**，CI-root 模擬 **9／29**；GNU offline Release example build + CI-root Gate **9／29**。Rustfmt、Python AST、diff check PASS。證據 `D:\scratch\wh-d7-20261013\evidence\60`–`72`。本機因 Windows user 缺 symlink privilege（WinError 1314）未能實際做 symlink 負測；不把靜態防護說成抗 TOCTOU／同帳號惡意程序。既有 Gate local debug binaries 是 D6 warm target，hosted CI 將自 source 重新建置。**D7 仍待 exact-head hosted CI；尚不勾選。**
 - **發布前狀態（歷史紀錄）：** 當時仍需 hosted exact-head CI 與發布驗證；PR #30 保持 Draft、卡 `t_01329074` 保持 blocked。沒有實體金鑰／GUI／部署；Mock Gate 不證明物理 Hello。
 - **D7 發布 gate：** source+doc head `054f525e694d05d460f09119aa6611311d3f0e07` 的 exact-head CI run `38402500039` / job `115313422084` completed/success，所有步驟成功。Hosted merge checkout `31964d7` 顯示 `Merge 054f525... into 368f103...`；完整 log SHA256 `709fc2c50a2a654b5241fa12c8376265d6bdbad134fba4c8ced2cd409eddfda7`（`D:\scratch\wh-d7-20261013\evidence\79-ci-job-full.log`）；逐項核實 Node 123／Rust 428+428／既有 Gate 20+dual25／新增 Hello Gate **9 cases／29 checks**。初次 `gh run watch` 因暫時網路錯誤退出 1，後續唯讀 API 重試直到實際 success，未重跑 CI。本段為 D7 收尾文件，若另有 docs-only commit，該 commit 的新 head CI 應另查，不冒充前述 run。PR #30 保持 OPEN Draft、整張功能卡仍 blocked；D8–D9、實體 Windows Hello、正式金庫、部署及合併未開始。
+
+## 12 D9-F1 註冊第二階段前景交接（A+C）
+
+**狀態：候選，待審查，未實測。** 本節不改動 D1–D9 狀態；沒有 GUI、native WebAuthn、實體金鑰、正式金庫或部署操作。
+
+### 12.1 背景
+
+- SKYCITY-PC（Windows 11 26H2 build 26300）實測：註冊的第一個 ceremony（MakeCredential）成功後，Windows 未把前景交回 FidoVault（前景為另一個不明視窗，pid 未知、每次 hwnd 不同）。第二個 ceremony（驗證用 GetAssertion）依既有設計 fail-closed：
+  - YubiKey：`prepare_assertion_continuation` 拒絕（`broker-not-observed` 或 `foreground-not-associated-broker`）→ `Windows WebAuthn continuation refused: ...`。main（368f103）同樣失敗，屬既有行為，非回歸。
+  - Windows Hello：pre-API `validate_owner_foreground` 拒絕（owner 非前景），vault 依現行邏輯刪除剛建立的 platform credential。
+- Win11-NB 前景會自然交回，現行流程正常，行為不得改變。
+
+### 12.2 決策（使用者：A＋C）
+
+- **A 兩段式「按一下繼續」：** 第二個 ceremony 因「前景未交回」被拒時不視為註冊失敗，保留 pending 註冊並顯示「金鑰已建立，但 Windows 未將焦點交回 FidoVault……」；使用者按「繼續驗證」的點擊本身讓 FidoVault 成為前景，第二個 ceremony 以全新一般斷言執行（continuation 已消耗 → `Ordinary` → 新 owner baseline → 既有 pre-API 守門）。**不放寬任何守門**：未新增 SetForegroundWindow／AllowSetForegroundWindow／AttachThreadInput／最小化還原等主動搶焦點；`prepare_continuation_inner`、`passive_owner_return`、`validate_owner_foreground` 的判斷條件未變寬。
+- **C 前景診斷：** continuation 拒絕與 pre-API owner 前景拒絕後，各記一行 `[WebAuthN-foreground-owner] {json}`；欄位白名單 `operation`、`site`（`continuation`｜`pre-api`）、`foreground_class`（≤64 字元）、`foreground_process`（basename 小寫 ≤64 字元）、`foreground_same_session`、`foreground_is_owner_process`；取不到為 null。不記錄視窗標題、完整路徑、credential、PRF、PIN。
+
+### 12.3 設計摘要
+
+- `fido2.rs`：新增 `FidoError::ForegroundHandoffRequired`（Display 為上述提示）與 `FidoError::OwnerNotForeground`（Display 與舊 `Internal(...)` 顯示逐字相同：`FIDO2 內部錯誤：Windows WebAuthn was not started because its owner window is not foreground. ...`，登入路徑文字不變）；`is_foreground_handoff()` 只對這兩者為真。MockBackend 可注入 N 次 roaming／platform handoff 拒絕並記錄呼叫順序（`MockCall`）。
+- `windows_webauthn.rs`：`validate_owner_foreground` 在 owner 非 null 且非前景時回 `OwnerNotForeground`（null owner 仍為原 Internal）；`continuation_refusal_error`：`UnobservedBroker`／`Foreground`／`PassiveDeadline` → `ForegroundHandoffRequired`，其餘 variant 維持原 Internal。診斷純邏輯在 `webauthn_diagnostics.rs`（私有欄位 + 消毒建構子），native 查詢只讀 class／image path／session。continuation 診斷用拒絕當下取樣的 foreground hwnd；pre-API 診斷在操作 wrapper 回傳 `OwnerNotForeground` 之後才重新取樣前景，最終守門與 FFI 之間沒有新增任何程式碼（既有 source-wiring 契約維持）。
+- `vault.rs`：`PendingRegistration`（Roaming：credential、`Zeroizing` PIN、label、group；Platform：credential、`Zeroizing` 建立時 PRF、label；手寫 Debug 只顯示種類與 label；不可 Clone／Serialize）、`RegistrationOutcome`、`CancelOutcome`。`begin_register_key_for`／`begin_register_windows_hello` 在第二個 ceremony 回 handoff 錯誤時回 `HandoffRequired`（platform 不刪除）；其他錯誤維持現行。舊 `register_key*`／`register_windows_hello` 為相容 wrapper：handoff → `Fido(ForegroundHandoffRequired)`，platform 先 best-effort 刪除。`continue_registration` 重新檢查 edition、群組 share、credential 不在既有 slot、label；platform 再做 RP 清單證明（不在 → `PlatformCredentialMissing`，不刪），再執行相同的斷言、constant-time PRF 比對、wrap、slot、audit 與回滾；再次 handoff → 回同一 pending；其他失敗 platform 刪除、roaming 直接失敗。`cancel_registration`：platform 先以 RP 清單證明再刪除（`removed`／`manual_removal_required`），roaming → `discarded`。
+- `lib.rs`：`AppInner.pending_registration`（pending、120 秒 deadline、金庫路徑、世代）。`register_key`／`register_windows_hello` 回 `{status:"registered",credential}` 或 `{status:"handoff_required",message}`；已有 pending 時拒絕新註冊（在任何前景操作之前）。新 IPC `continue_registration`（先 `raise_key_operation_window(&window, true)` 與 `set_webauthn_parent_hwnd`；逾時或金庫不同 → 取消並清理；再次 handoff 放回 pending、期限不延長；視窗無法成為前景時保留 pending）與 `cancel_registration`（`{status:"cancelled",cleanup:"removed"|"manual_removal_required"|"discarded"|"none"}`），兩者已註冊於 `invoke_handler`。上鎖、各登入成功、建立金庫、移除金鑰前先取消 pending；另以世代計時器在期限後主動取消。
+- `src/app.js`／`src/index.html`：YubiKey（單人／雙人群組）與 Windows Hello 註冊共用 `applyRegisterResult`；`handoff_required` 顯示 inline 區塊（`textContent`）含「繼續驗證」「取消」；pending 期間停用註冊與移除按鈕；in-flight 兩鈕停用、例外時恢復並保留區塊；取消依 cleanup 顯示結果（`manual_removal_required` 指向「設定 → 帳戶 → 通行金鑰」只刪除本次測試項目）。
+
+### 12.4 測試清單（候選；證據 `D:\scratch\wh-d9f1-20261014\evidence\`）
+
+- 錯誤對應全 variant、`validate_owner_foreground` typed、兩個 Display（`01`→`02`）。
+- 診斷 serializer exact allowlist、截斷、basename／小寫、null、native 取樣只讀 class／image（`03`→`04`）。
+- Mock handoff 注入與呼叫紀錄（`05`→`06`）。
+- vault roaming／platform：handoff 無 slot／audit／寫檔且 platform 未刪；continue 單人 KEK、雙人 group share + AAD、再次 handoff、重複 credential 拒絕、RP 清單不含不刪、PRF 不符刪除；cancel removed／manual／discarded；相容 wrapper（`07`→`08`，vault 子集 `09`）。
+- lib：pending 拒絕新註冊、continue 成功／再次 handoff、逾時取消並刪除、cancel 各 cleanup、lock／登入／移除清 pending、dual edition 拒絕 Hello pending、兩 IPC 已註冊、未新增主動前景 API（`10`→`12`）。
+- UI：handoff 顯示、繼續成功／再次 handoff、取消各 cleanup、XSS、in-flight 鎖、YubiKey 單／雙人共用路徑（`13`→`14`）。
+- 全套：R1 frozen candidate（非 R2）MSVC `real-ctap` 461/461、`real-ctap,dual-control` 461/461、Node 132/132（R1 最終 `24`、`25`、`22`）。首次全套 `17` 有 10 個既有 source-wiring 契約失敗（候選曾改動最終守門呼叫處文字）；已還原呼叫處、改為操作 wrapper 回傳後才記 pre-API 診斷，未修改任何既有契約測試。既有 UI 測試只把 `register_key`／`register_windows_hello` 的 mock 回應改成新 IPC 形狀。實機（SKYCITY-PC／Win11-NB）尚未驗證。
+
+### 12.5 R1 Reviewer 否決與 R2 修正候選（2026-10-14）
+
+- R1 completed-code Reviewer `passed=false`，blocking S1／L1／L2／L3／T1；verdict 保留 `D:/project/_archives/portable-fido2-vault/wh-d9f1-review-20261014-R1/reviewer-verdict.json`。不得將 R1 的長套件 461/461、132/132 當作 R2 驗證，也不得宣稱實機成功。
+- S1：`continue_registration` 在 state mutex **內**使用即時 clock，raise 前與 raise 返回、take pending 前各檢查一次，逾時取消並以 RP membership 證明後 best-effort 清除，斷言不啟動；排隊跨期限及 raise 跨期限為行為測試。L1：Hello 120 秒期限自 MakeCredential 第一階段返回後起算，原先較早的時間只用於 lazy sweep；再次 handoff 不延長期限。
+- L2：清理失敗時 pending 機密立即清零，`AppInner.registration_cleanup_receipts` 僅存非機密 generation／reason／cleanup；逾時、上鎖、lazy sweep、其他登入與新 pending 不抹去舊失敗收據。`registration_cleanup_status` 唯讀 IPC 與 `acknowledge_registration_cleanup(generation)` 明確確認後才移除該代收據；登入／UI reload／進入主畫面可查詢並以 `textContent` 顯示警告。**收據僅在 GUI process 記憶體；若整個程式退出則不保證跨 process 保留，須在 R2 review 評估是否為阻擋。**
+- L3：roaming 登記寫檔失敗回滾完整 header 與 audit（含裁切），single／dual 的 tmp-write／rename failure 及原 direct 路徑均有負向測試；不嘗試刪除 roaming passkey。T1：舊世代 sweep、新 pending、逾時與 cancel 競爭、金庫路徑不符、第二次 continue、查詢／確認收據均新增行為測試。
+- parent 自行執行 R2 targeted RED→GREEN 原始記錄：L3 `27`→`28`（5/5）、S1 `31`→`32`（後續 S1+L3 7/7）、L1 `33`→`34`（8/8）、L2 core `35`→`36`、IPC `39`→`40`、UI `38`→`41`；Rust handoff targeted `48` 49/49、相關 UI `49` 67/67。R2 完整 suite／獨立 R2 reviewer／hosted CI／Release／實機均尚未完成。
+
+### 12.6 R2 Reviewer 否決與 R3 本機候選（2026-10-14）
+
+- R2 唯讀 completed-code verdict `passed=false`、`coverage_complete=true`，原檔 `D:/project/_archives/portable-fido2-vault/wh-d9f1-review-20261014-R2/reviewer-verdict.json`。S1／L1／L3 維持修正；L2 仍缺 process-exit 持久收據、timer/lazy 通知與 async query 排序、continue 刪除失敗結果；T1 尚需受控 clock／跨重啟精確確認。R2 不得推至 Release／實機。
+- R3 改以使用者 `%LOCALAPPDATA%/FidoVault/registration-cleanup-v1/` 的非機密、每筆 128-bit 隨機 ID 收據（僅 reason tag）持久化；`create_new` 防碰撞、`sync_all`、損毀紀錄保守顯示 unknown，ack 精確驗證 ID 並刪除個別檔案；沒有儲存 credential ID、PIN、PRF、主密碼、視窗標題或完整執行檔路徑。GUI restart 再查狀態，記憶體寫入失敗以 `storage_unavailable` 立即示警且不得阻擋 lock；若 `%LOCALAPPDATA%` 缺失／收據不可讀，啟動亦保守顯示儲存不可用。**磁碟本身不可寫且程式退出時無法保證保留新收據；此為物理限制，介面會明示。** 不代表已發現實體 orphan passkey。
+- 第二階段 cleanup 刪除失敗以 `Vault::take_registration_cleanup_failure()` 的一次性非機密 side-channel 回報並留下持久警告；原始 `VaultError` 型別與訊息（包含既有 D4 failure contract）及 fail-closed slot rollback 均保留。UI 在 lazy 註冊返回後刷新、handoff 期間每 3 秒輪詢，並以 query sequence 防舊回應覆蓋新警告；不自動清理未知 passkey、不搶焦點。計時測試改用受控 clock（first ceremony、mutex 排隊、raise 中跨期限），無 120 秒 wall-clock 等待。
+- R3 RED→GREEN 證據：UI `50/51`→`52`、delete-failure report 初版 `54`→`55`（其後完整套件 `73` 揭露 D4 primary error 合約回歸，已改一次性 side-channel 並以 `74`／`75` 恢復）、journal 契約 `62`→`63`、fresh state `64`→`65`。最終 R3 MSVC Rust `real-ctap` **483/483**（`76`）、dual **483/483**（`77`）、Node **136/136**（`70`）；completed-code review／exact-head CI／Release 或實機尚未完成，待獨立審查後再決定。
+
+### 12.7 R3 Reviewer 否決與 R4 本機候選（2026-10-14）
+
+- R3 completed-code verdict `passed=false`、`coverage_complete=true`、security 0（`D:/project/_archives/portable-fido2-vault/wh-d9f1-review-20261014-R3/reviewer-verdict.json`；首次審查因 provider 429 未執行，log 保留於 `reviewer-R3/attempt1-429/`）。S1／L1／L3／L2B 關閉；阻擋 L2-R3-A、L2-R3-C、T1-R3、T2-R3。
+- **L2-R3-A：** journal 成為權威狀態。`registration_cleanup_status_inner_unlocked` 成功列舉時以磁碟收據取代記憶體快取中的所有持久項目（保留同 ID 的 generation 與 `memory-*` fallback），因此其他程序 ack 後原程序不再誤報、重啟後未 ack 的收據會出現；`cancel` 無 pending 與 `continue` 無 pending 皆改經同一 `has_unacknowledged_cleanup()`（journal 無法讀取時保守視為仍有警告）。
+- **L2-R3-C：** `Vault` 一次性 side-channel 改為 `RegistrationCleanupReport { Removed, DeleteFailed, NotAttempted }`。`continue_registration` 包裝層：新的 platform pending 在任何前置失敗（能力不可用、RP discovery 失敗、membership 無法證明、label／edition）被消耗而無清理結論時回報 `NotAttempted`；既有 slot 的 credential ID 永不視為新 credential。`begin_register_windows_hello` 在 MakeCredential 之後的 discovery 失敗／membership 不成立／header 解碼失敗亦回報 `NotAttempted`。lib 將 `DeleteFailed`→`continue_error`、`NotAttempted`→`unverified` 寫入持久收據；未證明者仍**不刪除**，原 primary `VaultError` 不變。UI 以專屬文字提示「無法確認是否已清除，只檢查本次測試項目」。
+- **其他硬化：** journal ID 改 `try_fill_bytes`（熵失敗回 I/O 錯誤而非 panic）、經 handle 的有界讀取（≤64 bytes，否則 `unknown`）；`LOCALAPPDATA` 空字串或相對路徑視為儲存不可用；UI ack 的 `finally` 不再重新啟用 journal-unavailable 的按鈕。
+- **T1-R3：** L1 改以 MakeCredential seam 內推進的合成時鐘驗證期限；排隊測試在持鎖期間觀測「不得讀 clock」並確認 worker 仍在等鎖；race 檢查雙方回傳值、focus／assertion／delete 次數與收據；新增固定兩順序 sweep/cancel、journal ID 碰撞、write/sync 失敗、損毀／超長／非檔案收據、root 不可讀、惡意 ID ack、LOCALAPPDATA、lib 寫入失敗跨重啟、多收據 UI、ack 後按鈕、poll 停止等 oracle。
+- **T2-R3：** 自然 assertion RED：`80`（6 個後端，均在預期斷言行失敗；既有 slot 控制測試保持通過）、`81`（UI ack 按鈕）→ GREEN `84`／`83`。已有正確行為的 oracle 以 13 個**可編譯的受控反向 mutation** 取得 assertion RED（`evidence/r4-mutations/`，最終格式化 source 上 13/13 `red_ok`，每次以 SHA-256 驗證還原；格式化前一輪保留於 `r4-mutations-prefmt/`，M12 首輪 unwrap panic 已改明確斷言並標 SUPERSEDED）。`82`、`85` 為編譯失敗，已標 `NOT_EXECUTED`，不計為 RED。
+- **格式：** 只套用觸及 R1–R4 變更行的 rustfmt hunk（`--config skip_children=true`）；`88` 稽核顯示觸及 hunk 全為 0，`windows_webauthn.rs` 37 個 BASE 既有差異未動。
+- **驗證：** R4 MSVC Rust `real-ctap` **500/500**（`90`）、`real-ctap,dual-control` **500/500**（`91`）、Node **139/139**（`92`）、`node --check`、`git diff --check` 通過。completed-code review、exact-head CI、Release 與 SKYCITY-PC／Win11-NB 實機 V1/V2 尚未完成。
+
+### 12.8 R4 Reviewer 否決與 R5 本機候選（2026-10-14）
+
+- R4 completed-code verdict `passed=false`、`coverage_complete=true`、security 0、logic 0（`D:/project/_archives/portable-fido2-vault/wh-d9f1-review-20261014-R4/reviewer-verdict.json`）。L2-R3-A、L2-R3-C、T2-R3 關閉，S1／L1／L2B／L3 無回歸；剩餘阻擋僅測試 T1-R4-A、T1-R4-B。
+- **T1-R4-A：** `VaultState::with_lock` 在 `cfg(test)` 下先 `try_lock`，`WouldBlock` 時觸發每執行緒的 `lock_wait_hook`（模組位於測試區，production 編譯不含）。排隊測試只在 worker **確實卡在 state mutex** 後才推進時鐘；未到達即測試失敗（30 秒上限），不再以 300 ms 未觀察推定。到達後以 `try_recv` 檢查此前不得有任何 clock 讀取。
+- **T1-R4-B：** journal 寫入改為單一 `write_receipt` 處理點，分別注入「建立後失敗（空檔）」「寫一半失敗」「寫完後 sync 失敗」三種模式；三者在 journal 與 lib 層（目前程序 fallback 警告、無 pending cancel、重啟後保守可見）均有 oracle。新增端到端矩陣 {begin, continue} × {assertion 錯誤, PRF 不符, 存檔失敗} × {刪除成功, 刪除失敗}（12 例）檢查原 primary error、精確 create/assert/delete、slot rollback、durable 收據、cancel 與 fresh state，其中「刪除成功不得留下收據／不得升級為 NotAttempted」為負向 oracle。另補 continue 的 Removed 保留、begin 方向 reset、`memory-*` fallback 與同 ID generation 保留（連續兩次同步無遺失、無重複）。
+- **非阻斷建議採納：** UI 以獨立 `registrationCleanupAckInFlight` 統一計算確認按鈕（輪詢不得在 ack 進行中重新啟用；自然 RED `93`→GREEN `94`）；`unverified` 專屬文字與關閉 handoff 確實 `clearTimeout` 有測試；同步快取改用 HashMap 索引。持鎖 journal I/O 的延遲上界仍未證明，維持為已知限制。
+- **Mutation runner 強化：** `r5-mutations.py` 預檢全部錨點、拒絕空選集、要求指定測試實際執行且所有 FAILED 測試符合 filter、拒收 unwrap 類 panic，並逐筆記錄原始／還原 SHA-256。最終格式化 source 上 **19/19** 為 assertion RED（`evidence/r5-mutations/`、`98`），其中 M14–M19 為 R5 新增。`95` 為既有 source-wiring 守門測試抓到測試模組誤放在 production 區（已移入測試區），不是產品缺陷。
+- **格式用語更正：** 先前「只修觸及行」應精確為「只套用與 R1–R5 變更行相交的 rustfmt hunk（可能含相鄰舊行）」；腳本現固定比對 BASE `5d34ccf`。`97`：五檔相交 hunk 為 0，`windows_webauthn.rs` 37 個未相交的 BASE 既有差異未動；完整 `cargo fmt --check` 不宣稱 PASS（非 CI 必要 gate）。
+- **驗證：** R5 MSVC Rust `real-ctap` **507/507**（`99`）、`real-ctap,dual-control` **507/507**（`100`）、Node **142/142**（`101`）、`node --check`、`git diff --check` 通過。completed-code review（Reviewer＋Officer）、exact-head CI、Release 與實機 V1/V2 尚未完成。

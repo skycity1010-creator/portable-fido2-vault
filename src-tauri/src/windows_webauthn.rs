@@ -7,8 +7,8 @@ use crate::fido2::{
 };
 use crate::webauthn_diagnostics::{
     capability_record, diagnose, monitor_record, ContinuationDiagnostics, ContinuationStatus,
-    FailureStage, MonitorStop, NativeSessionEvidence, Operation, OperationDiagnostics, QueryStatus,
-    SessionProtocol, SessionState, WindowScalars,
+    FailureStage, ForegroundOwnerDiagnostics, ForegroundSite, MonitorStop, NativeSessionEvidence,
+    Operation, OperationDiagnostics, QueryStatus, SessionProtocol, SessionState, WindowScalars,
 };
 use std::{
     collections::HashSet,
@@ -81,9 +81,7 @@ fn validate_owner_foreground(owner: HWND, foreground: HWND) -> Result<HWND, Fido
     } else if owner == foreground {
         Ok(owner)
     } else {
-        Err(FidoError::Internal(
-            "Windows WebAuthn was not started because its owner window is not foreground. Bring FidoVault to the foreground and retry.".into(),
-        ))
+        Err(FidoError::OwnerNotForeground)
     }
 }
 
@@ -238,6 +236,24 @@ impl HandoffRefusal {
     }
 }
 
+/// Maps a refused continuation to the caller-visible error. The refusal itself
+/// is unchanged; only "focus was not handed back" outcomes become a retryable
+/// handoff error so registration can ask for an explicit user click.
+fn continuation_refusal_error(refusal: &HandoffRefusal) -> FidoError {
+    match refusal {
+        HandoffRefusal::UnobservedBroker
+        | HandoffRefusal::Foreground
+        | HandoffRefusal::PassiveDeadline => FidoError::ForegroundHandoffRequired,
+        HandoffRefusal::Credential
+        | HandoffRefusal::Owner
+        | HandoffRefusal::Broker
+        | HandoffRefusal::PassiveSession => FidoError::Internal(format!(
+            "Windows WebAuthn continuation refused: {}",
+            refusal.reason()
+        )),
+    }
+}
+
 #[cfg(test)]
 fn prepare_continuation(
     pending: &mut Option<RegistrationContinuation>,
@@ -299,6 +315,54 @@ fn prepare_assertion_continuation(
     let creation_owner = pending.as_ref().map(|context| context.owner);
     prepare_continuation_recorded(pending, owner, credential_ids, system, diagnostic)
         .map(|outcome| (outcome, creation_owner))
+}
+
+// Diagnostic only: called after a refusal was already decided, so its queries
+// can neither change the outcome nor delay an allowed operation. Reads class
+// name and image path (basename only); never the window title.
+fn foreground_owner_details(
+    system: &mut impl ForegroundSystem,
+    hwnd: isize,
+) -> ForegroundOwnerDiagnostics {
+    if hwnd == 0 {
+        return ForegroundOwnerDiagnostics::default();
+    }
+    let identity = system.identity(hwnd);
+    let class_name = identity.and_then(|_| system.class(hwnd));
+    let image_path = identity.and_then(|identity| system.path(identity.process_id));
+    let pid = system.current_pid();
+    let own_session = identity.and_then(|_| system.session(pid));
+    ForegroundOwnerDiagnostics::new(
+        class_name.as_deref(),
+        image_path.as_deref(),
+        identity
+            .zip(own_session)
+            .map(|(identity, session)| identity.session == session),
+        identity.map(|identity| identity.process_id == pid),
+    )
+}
+
+fn log_foreground_owner(
+    system: &mut impl ForegroundSystem,
+    hwnd: isize,
+    operation: Operation,
+    site: ForegroundSite,
+) {
+    log::warn!(
+        "[WebAuthN-foreground-owner] {}",
+        foreground_owner_details(system, hwnd).record(operation, site)
+    );
+}
+
+// Pre-API owner-foreground refusal: emitted only after the operation wrapper has
+// already returned the refusal, so nothing is added between the final guard and
+// the native call. The foreground is re-sampled at this point.
+fn log_pre_api_refusal<T>(result: &Result<T, FidoError>, operation: Operation) {
+    if matches!(result, Err(FidoError::OwnerNotForeground)) {
+        let mut system = NativeForegroundSystem;
+        let foreground = system.foreground();
+        log_foreground_owner(&mut system, foreground, operation, ForegroundSite::PreApi);
+    }
 }
 
 fn assertion_owner_baseline(
@@ -2278,6 +2342,7 @@ impl WindowsWebAuthnBackend {
             |diagnostic| self.make_credential_with_diagnostics(detected, exclude, diagnostic),
             |record| log::info!("[WebAuthN-operation] {}", record),
         );
+        log_pre_api_refusal(&result, Operation::MakeCredential);
         complete_registration(&mut self.continuation, result)
     }
 
@@ -2433,11 +2498,13 @@ impl WindowsWebAuthnBackend {
     ) -> Result<PlatformRegistration, FidoError> {
         self.continuation = None;
         self.require_platform_available()?;
-        diagnose(
+        let result = diagnose(
             Operation::MakeCredential,
             |diagnostic| self.make_platform_credential_with_diagnostics(label, exclude, diagnostic),
             |record| log::info!("[WebAuthN-platform-operation] {}", record),
-        )
+        );
+        log_pre_api_refusal(&result, Operation::MakeCredential);
+        result
     }
 
     fn make_platform_credential_with_diagnostics(
@@ -2589,13 +2656,15 @@ impl WindowsWebAuthnBackend {
         &mut self,
         credential_ids: &[Vec<u8>],
     ) -> Result<(Vec<u8>, [u8; 32]), FidoError> {
-        diagnose(
+        let result = diagnose(
             Operation::GetAssertion,
             |diagnostic| {
                 self.get_hmac_secret_for_any_with_diagnostics(credential_ids, diagnostic, false)
             },
             |record| log::info!("[WebAuthN-operation] {}", record),
-        )
+        );
+        log_pre_api_refusal(&result, Operation::GetAssertion);
+        result
     }
 
     fn get_platform_secret(
@@ -2603,13 +2672,15 @@ impl WindowsWebAuthnBackend {
         credential_ids: &[Vec<u8>],
     ) -> Result<(Vec<u8>, [u8; 32]), FidoError> {
         self.require_platform_available()?;
-        diagnose(
+        let result = diagnose(
             Operation::GetAssertion,
             |diagnostic| {
                 self.get_hmac_secret_for_any_with_diagnostics(credential_ids, diagnostic, true)
             },
             |record| log::info!("[WebAuthN-platform-operation] {}", record),
-        )
+        );
+        log_pre_api_refusal(&result, Operation::GetAssertion);
+        result
     }
 
     fn get_hmac_secret_for_any_with_diagnostics(
@@ -2652,10 +2723,14 @@ impl WindowsWebAuthnBackend {
                 }
                 Err(refusal) => {
                     log::warn!("[WebAuthN-handoff] reason={}", refusal.reason());
-                    return Err(FidoError::Internal(format!(
-                        "Windows WebAuthn continuation refused: {}",
-                        refusal.reason()
-                    )));
+                    // The refusal is final; describe the sampled foreground it was refused for.
+                    log_foreground_owner(
+                        &mut system,
+                        continuation_diagnostic.foreground.hwnd.unwrap_or(0),
+                        Operation::GetAssertion,
+                        ForegroundSite::Continuation,
+                    );
+                    return Err(continuation_refusal_error(&refusal));
                 }
             }
         };
@@ -7888,5 +7963,125 @@ mod tests {
             pExtensions: &mut disabled_extension,
         };
         assert!(!hmac_secret_enabled(&disabled_extensions));
+    }
+
+    // ── D9-F1: registration second-ceremony foreground handoff ──
+
+    #[test]
+    fn d9f1_continuation_refusal_error_maps_every_variant() {
+        for refusal in [
+            HandoffRefusal::UnobservedBroker,
+            HandoffRefusal::Foreground,
+            HandoffRefusal::PassiveDeadline,
+        ] {
+            assert!(
+                matches!(
+                    continuation_refusal_error(&refusal),
+                    FidoError::ForegroundHandoffRequired
+                ),
+                "{refusal:?} must become a retryable handoff"
+            );
+        }
+        for refusal in [
+            HandoffRefusal::Credential,
+            HandoffRefusal::Owner,
+            HandoffRefusal::Broker,
+            HandoffRefusal::PassiveSession,
+        ] {
+            let expected = format!(
+                "Windows WebAuthn continuation refused: {}",
+                refusal.reason()
+            );
+            assert!(
+                matches!(continuation_refusal_error(&refusal), FidoError::Internal(ref m) if *m == expected),
+                "{refusal:?} must keep the existing Internal refusal"
+            );
+        }
+    }
+
+    #[test]
+    fn d9f1_validate_owner_foreground_is_typed() {
+        let owner = 1 as HWND;
+        let other = 2 as HWND;
+        assert!(matches!(validate_owner_foreground(owner, owner), Ok(h) if h == owner));
+        assert!(matches!(
+            validate_owner_foreground(owner, other),
+            Err(FidoError::OwnerNotForeground)
+        ));
+        assert!(matches!(
+            validate_owner_foreground(owner, ptr::null_mut()),
+            Err(FidoError::OwnerNotForeground)
+        ));
+        // A missing owner is not a focus problem; keep the existing Internal error.
+        assert!(matches!(
+            validate_owner_foreground(ptr::null_mut(), ptr::null_mut()),
+            Err(FidoError::Internal(ref m)) if m.contains("parent HWND is unavailable")
+        ));
+    }
+
+    #[test]
+    fn d9f1_foreground_owner_details_reads_only_bounded_metadata() {
+        let (mut system, _, owner, broker) = handoff_fixture();
+        let record = foreground_owner_details(&mut system, broker.hwnd)
+            .record(Operation::GetAssertion, ForegroundSite::Continuation);
+        assert_eq!(
+            record,
+            serde_json::json!({
+                "operation": "GetAssertion", "site": "continuation",
+                "foreground_class": "Credential Dialog Xaml Host",
+                "foreground_process": "credentialuibroker.exe",
+                "foreground_same_session": true, "foreground_is_owner_process": false,
+            })
+        );
+        let text = record.to_string();
+        assert!(
+            !text.contains("Windows Security") && !text.contains("System32"),
+            "{text}"
+        );
+
+        let own = foreground_owner_details(&mut system, owner.hwnd)
+            .record(Operation::MakeCredential, ForegroundSite::PreApi);
+        assert_eq!(own["foreground_is_owner_process"], true);
+        assert_eq!(own["foreground_process"], "vault.exe");
+        assert!(
+            !own.to_string().contains("FidoVault"),
+            "owner title must not be logged"
+        );
+
+        for hwnd in [0, 99] {
+            let unknown = foreground_owner_details(&mut system, hwnd)
+                .record(Operation::GetAssertion, ForegroundSite::PreApi);
+            for field in [
+                "foreground_class",
+                "foreground_process",
+                "foreground_same_session",
+                "foreground_is_owner_process",
+            ] {
+                assert!(unknown[field].is_null(), "hwnd={hwnd} {field}");
+            }
+        }
+
+        system.inaccessible_pid = Some(broker.process_id);
+        system.inaccessible_session = Some(system.test_pid);
+        let partial = foreground_owner_details(&mut system, broker.hwnd)
+            .record(Operation::GetAssertion, ForegroundSite::Continuation);
+        assert!(partial["foreground_process"].is_null());
+        assert!(partial["foreground_same_session"].is_null());
+        assert_eq!(partial["foreground_class"], "Credential Dialog Xaml Host");
+        assert_eq!(partial["foreground_is_owner_process"], false);
+    }
+
+    #[test]
+    fn d9f1_owner_not_foreground_display_is_verbatim_legacy_text() {
+        let legacy = FidoError::Internal(
+            "Windows WebAuthn was not started because its owner window is not foreground. Bring FidoVault to the foreground and retry.".into(),
+        );
+        assert_eq!(
+            FidoError::OwnerNotForeground.to_string(),
+            legacy.to_string()
+        );
+        assert!(FidoError::OwnerNotForeground.is_foreground_handoff());
+        assert!(FidoError::ForegroundHandoffRequired.is_foreground_handoff());
+        assert!(!legacy.is_foreground_handoff());
     }
 }
