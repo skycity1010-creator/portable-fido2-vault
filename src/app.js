@@ -215,26 +215,45 @@ function selectLoginKey(key, item) {
 }
 
 // ─────────────── 建立 / 登入 ───────────────
-async function doCreate() {
-  errBox("");
-  const pw = $("setup-pw").value, pw2 = $("setup-pw2").value;
-  if (pw.length < 8) return errBox("主密碼至少 8 個字元");
-  if (pw !== pw2) return errBox("兩次輸入的主密碼不一致");
+// 建立金庫與各種登入方式共用一個 in-flight 旗標：IPC 在工作執行緒執行，UI 不再被凍結，
+// 所以雙擊、密碼／PIN 欄 Enter、跨登入方式都可能在上一個請求完成前再次進入。
+// 後端另有單一進行中操作的保留（最後防線）；這裡先在 JS 端同步擋下，且一定在 finally 釋放。
+let authFlowInFlight = false;
+async function withAuthFlow(work) {
+  if (authFlowInFlight) return;
+  authFlowInFlight = true;
   try {
-    await invoke("create_vault", { password: pw });
-    await enterMain();
-  } catch (e) { errBox(String(e)); }
+    return await work();
+  } finally {
+    authFlowInFlight = false;
+  }
+}
+
+async function doCreate() {
+  await withAuthFlow(async () => {
+    errBox("");
+    const pw = $("setup-pw").value, pw2 = $("setup-pw2").value;
+    if (pw.length < 8) return errBox("主密碼至少 8 個字元");
+    if (pw !== pw2) return errBox("兩次輸入的主密碼不一致");
+    try {
+      await invoke("create_vault", { password: pw });
+      await enterMain();
+    } catch (e) { errBox(String(e)); }
+  });
 }
 
 async function doLoginPw() {
-  errBox("");
   if (!isDual()) {
-    try {
-      const entries = await invoke("login_password", { password: $("login-pw").value });
-      await enterMain(entries);
-    } catch (e) { errBox(String(e)); }
+    await withAuthFlow(async () => {
+      errBox("");
+      try {
+        const entries = await invoke("login_password", { password: $("login-pw").value });
+        await enterMain(entries);
+      } catch (e) { errBox(String(e)); }
+    });
     return;
   }
+  errBox("");
   // 雙人版：begin／complete／cancel／主密碼登入共用同一個 in-flight 鎖，彼此序列化。
   // 金鑰步驟進行中不接受主密碼：避免丟棄一個可能已在 Rust 端成功解鎖的回應（UI 與 Rust 狀態不一致）。
   if (dualBusy) return errBox("金鑰驗證進行中，請先完成或取消後再改用主密碼登入");
@@ -253,47 +272,52 @@ async function doLoginPw() {
 async function doLoginKey() {
   // 雙人版：第二步等待中（例如在 PIN 欄按 Enter）送出第二步，否則開始第一步。
   if (isDual()) return dualLogin ? doDualComplete() : doDualBegin();
-  errBox("");
-  if (!brokeredKeyLogin && !selectedKey) return errBox("請先選擇一支金鑰");
-  const button = $("btn-login-key");
-  button.disabled = true;
-  $("key-login-status").textContent = brokeredKeyLogin
-    ? "請依 Windows 安全性視窗提示操作金鑰"
-    : selectedKey.prompt_zh;
-  try {
-    const entries = brokeredKeyLogin
-      ? await invoke("login_any_key")
-      : await invoke("login_key", {
-          credentialId: selectedKey.credential_id,
-          pin: selectedKey.key_type === "pin" ? $("login-pin").value : null,
-        });
-    await enterMain(entries);
-  } catch (e) {
-    errBox(String(e));
-  } finally {
-    button.disabled = false;
-    $("key-login-status").textContent = "";
-  }
+  // PIN 欄 Enter 會直接呼叫本函式：入口先擋 in-flight（按鈕 disabled 擋不住）。
+  await withAuthFlow(async () => {
+    errBox("");
+    if (!brokeredKeyLogin && !selectedKey) return errBox("請先選擇一支金鑰");
+    const button = $("btn-login-key");
+    button.disabled = true;
+    $("key-login-status").textContent = brokeredKeyLogin
+      ? "請依 Windows 安全性視窗提示操作金鑰"
+      : selectedKey.prompt_zh;
+    try {
+      const entries = brokeredKeyLogin
+        ? await invoke("login_any_key")
+        : await invoke("login_key", {
+            credentialId: selectedKey.credential_id,
+            pin: selectedKey.key_type === "pin" ? $("login-pin").value : null,
+          });
+      await enterMain(entries);
+    } catch (e) {
+      errBox(String(e));
+    } finally {
+      button.disabled = false;
+      $("key-login-status").textContent = "";
+    }
+  });
 }
 
 async function doLoginHello() {
   if (!helloEditionConfirmed) return;
   const button = $("btn-login-hello");
   if (button.disabled || button.classList.contains("hidden")) return;
-  button.disabled = true;
-  button.setAttribute("aria-busy", "true");
-  errBox("");
-  $("hello-login-status").textContent = "請依 Windows Hello 提示完成驗證";
-  try {
-    const entries = await invoke("login_windows_hello");
-    await enterMain(entries);
-  } catch (e) {
-    errBox(String(e));
-  } finally {
-    $("hello-login-status").textContent = "";
-    button.disabled = false;
-    button.removeAttribute?.("aria-busy");
-  }
+  await withAuthFlow(async () => {
+    button.disabled = true;
+    button.setAttribute("aria-busy", "true");
+    errBox("");
+    $("hello-login-status").textContent = "請依 Windows Hello 提示完成驗證";
+    try {
+      const entries = await invoke("login_windows_hello");
+      await enterMain(entries);
+    } catch (e) {
+      errBox(String(e));
+    } finally {
+      $("hello-login-status").textContent = "";
+      button.disabled = false;
+      button.removeAttribute?.("aria-busy");
+    }
+  });
 }
 
 async function enterMain(entries, options = {}) {

@@ -417,3 +417,111 @@ v1 不變，`KeySlot` 新增：
 - **Mutation runner 強化：** `r5-mutations.py` 預檢全部錨點、拒絕空選集、要求指定測試實際執行且所有 FAILED 測試符合 filter、拒收 unwrap 類 panic，並逐筆記錄原始／還原 SHA-256。最終格式化 source 上 **19/19** 為 assertion RED（`evidence/r5-mutations/`、`98`），其中 M14–M19 為 R5 新增。`95` 為既有 source-wiring 守門測試抓到測試模組誤放在 production 區（已移入測試區），不是產品缺陷。
 - **格式用語更正：** 先前「只修觸及行」應精確為「只套用與 R1–R5 變更行相交的 rustfmt hunk（可能含相鄰舊行）」；腳本現固定比對 BASE `5d34ccf`。`97`：五檔相交 hunk 為 0，`windows_webauthn.rs` 37 個未相交的 BASE 既有差異未動；完整 `cargo fmt --check` 不宣稱 PASS（非 CI 必要 gate）。
 - **驗證：** R5 MSVC Rust `real-ctap` **507/507**（`99`）、`real-ctap,dual-control` **507/507**（`100`）、Node **142/142**（`101`）、`node --check`、`git diff --check` 通過。completed-code review（Reviewer＋Officer）、exact-head CI、Release 與實機 V1/V2 尚未完成。
+
+## 13 D9-F2 WebAuthn 指令移出主執行緒
+
+**狀態：候選，待審查，未實測。** 本節不改動 D1–D9 勾選；沒有 GUI、native WebAuthn、實體金鑰、正式金庫（`C:\FidoVault`）或部署操作。D9-F1 的 A+C（繼續驗證／取消、前景診斷、持久收據）完整保留，守門條件未放寬。
+
+### 13.1 根因與證據
+
+- 所有 WebAuthn IPC 原為同步 `#[tauri::command] fn`。Tauri v2：「Commands without the async keyword are executed on the main thread unless defined with `#[tauri::command(async)]`」。MakeCredential／GetAssertion 在主（UI）執行緒同步阻塞 → owner 視窗不處理訊息 → Windows Hello 提示框停在背景 → 臉部辨識後 Ngc 回 `0x80090029` → Windows 退回「選擇安全性金鑰」→ 使用者取消 → 程式只看到 `0x800704C7`。
+- 證據（SKYCITY-PC，`D:/scratch/wh-d9f2-diag-20261015/DIAG-NOTES.md` 第 6、7 輪）：probe7 以產品相同請求值在 console probe 通過；probe8 自建 Win32 視窗當 owner、相同 RP／salt／名稱／選項，**worker thread 呼叫 PASS（提示框前景）、在 UI thread 內呼叫 FAIL（症狀與產品完全相同）**。
+- 另觀察：Ngc 失敗後 Windows 可能讓使用者以 YubiKey 完成「PLATFORM」請求（事件 2104 MicrosoftCtapHidProvider、attachment cross-platform）；因此新增非 platform 憑證拒絕（§13.4）。
+
+### 13.2 決策（使用者）
+
+修正範圍＝**全部 WebAuthn 指令**（含 YubiKey 註冊／登入、雙人登入）移出主執行緒；接受回歸範圍擴大，**YubiKey／RDP 之後需重新實機驗收**。
+
+### 13.3 盤點（`invoke_handler` 全部 36 個 IPC）
+
+| 指令 | 觸及 WebAuthn／backend | 會顯示 UI | 改法 |
+|---|---|---|---|
+| `register_windows_hello` | MakeCredential＋GetAssertion（platform） | 是 | `(async)`＋KeyOperationGuard |
+| `login_windows_hello` | GetAssertion（platform） | 是 | `(async)`＋Guard |
+| `register_key` | MakeCredential（roaming） | 是 | `(async)`＋Guard |
+| `continue_registration` | GetAssertion（pending 第二階段） | 是 | `(async)`＋Guard |
+| `login_key` / `login_any_key` | GetAssertion（roaming） | 是 | `(async)`＋Guard |
+| `login_dual_begin` / `login_dual_complete` | GetAssertion（雙人） | 是 | `(async)`＋Guard |
+| `lock` | 取消 pending 時 platform 清單／刪除 | 否（可能阻塞） | `(async)`；ceremony 中只記錄待上鎖；idle 時 native 清理在鎖外（R2） |
+| `cancel_registration` | platform 清單／刪除 | 否（可能阻塞） | `(async)`；ceremony 中拒絕 |
+| `create_vault` | 取消 pending 時 platform 刪除 | 否（可能阻塞） | `(async)`；ceremony 中拒絕 |
+| `login_password` | `open_password_with_platform`（platform 清單） | 否（可能阻塞） | `(async)`；ceremony 中拒絕 |
+| `remove_key` | platform 清單／刪除 | 否（可能阻塞） | `(async)`；ceremony 中拒絕 |
+| `boot_info` | platform 清單、`platform_status` | 否（可能阻塞） | `(async)` |
+| `platform_status` | IsUVPAA、platform 清單 | 否（可能阻塞） | `(async)`；ceremony 中回「進行中」 |
+| `detect_key` | `peek_kind`／`key_unavailable_reason`（不呼叫 OS） | 否 | `(async)`（持有狀態鎖並經 trait 呼叫，保守處理） |
+| `login_dual_cancel` | 否 | 否 | R2：進行中的金鑰操作期間回「進行中」（同一短鎖內 `require_key_operation_idle`），不再「取消成功但流程仍發布」 |
+| `get_edition`、`list_entries`、`add_entry`、`update_entry`、`delete_entry`、`list_audit`、`validate_key_label`、`suggest_key_label`、`set_idle_lock`、`set_dual_step_timeout`、`get_vault_settings`、`set_password_history_limit`、`cancel_csv_import`、`apply_csv_import`、`registration_cleanup_status`、`acknowledge_registration_cleanup`、`clear_clipboard_if_matches` | 否（只動記憶體狀態／金庫／journal／剪貼簿） | 否 | 不變（同步，狀態鎖只短暫持有） |
+| `preview_csv_import`、`save_csv_template` | 否（檔案對話框） | 檔案對話框 | 已是 `async fn` |
+
+契約測試（§13.5）要求：此表的每個 IPC 都被分類；WebAuthn 類必須是 `#[tauri::command(async)]` 或 `async fn`；新增 IPC 未分類即失敗；非 WebAuthn 類的函式本體**及其（遞迴追蹤的）自由函式呼叫鏈**不得出現 `backend`／`KeyOperationGuard`／`raise_key_operation_window`／`platform_status`／`list_platform_credentials`／`delete_platform_credential`（R2；方法呼叫與 `path::call` 不追蹤，仍屬人工分類表的範圍，不是完整 call-graph 偵測器）。
+
+### 13.4 設計
+
+- **狀態鎖不跨 ceremony 持有（`KeyOperationGuard`）：** 每個 WebAuthn 指令在任何前景／backend 動作前呼叫 `KeyOperationGuard::begin`：在短暫的狀態鎖內檢查 `key_op.active`（已有進行中操作 → 立即回「已有金鑰操作進行中，請先完成或取消」，不排隊、不碰前景、不呼叫 backend）、執行該指令的前置檢查、標記 active，並把真正的 backend（及註冊／繼續註冊所需的已解鎖金庫）**租出**，原位換成 `BusyBackend`（任何 authenticator 呼叫回錯、`key_unavailable_reason` 為「進行中」）。ceremony 在**不持有狀態鎖**時執行。`complete` 重新取鎖、歸還 backend／金庫、套用結果、執行待上鎖、清除 active；`Drop`（錯誤、提前返回、panic）同樣歸還、執行待上鎖並清除 active。因此 `list_entries`、`get_vault_settings`、`lock` 等指令即使在主執行緒也不會等待 ceremony；金庫被租出時它們回「進行中」而非「金庫未解鎖」，UI 不會誤判為已上鎖。
+- **ceremony 期間的上鎖：** `lock`（含 idle 觸發）在 active 時不阻塞，只記錄待上鎖並用金庫檔頭回登入畫面資訊；ceremony 結束、回傳前完成上鎖。登入類：結果丟棄（`v.lock()`），回「金鑰操作期間已收到上鎖要求…」不含條目；註冊類：沿用既有 lock 語意（pending 以 `queue_pending_cancellation(…, "locked")` 排入佇列，由持有 backend 租約者在鎖外取消；platform credential 以 RP 清單證明後刪除並沿用 D9-F1 收據），pending 被取消時回上述錯誤，已完成的註冊（slot 已持久化）回原結果後上鎖。
+- **改變金庫的指令：** `create_vault`（在建立檔案前檢查）、`remove_key`、`login_password`、`apply_csv_import`、`cancel_registration`、`platform_status` 在 ceremony 中回「進行中」，不改狀態。逾時 sweep 在 active 時略過（backend 被租出）；R2 起 `complete` 與 `Drop`（含 panic）的收尾一律補做（見 §13.7）。
+- **世代／金庫路徑：** 因 ceremony 期間所有會改金庫、pending、世代的指令都被拒絕或延後，租出的金庫與 pending 不可能被其他指令改動；歸還後的寫入沿用原有的世代檢查（continue 的期限／金庫路徑在租出前、raise 後各檢查一次）。
+- **前景守門不放寬：** `raise_key_operation_window`、`set_webauthn_parent_hwnd`、`validate_owner_foreground`、continuation／passive 判斷條件沒有修改；沒有新增 SetForegroundWindow／AllowSetForegroundWindow／AttachThreadInput。從工作執行緒呼叫的正確性：`window.hwnd()` 直接讀取；`unminimize`／`show`／`set_focus` 由 Tauri 派送到主執行緒（現在主執行緒不再被阻塞所以能處理）；`GetForegroundWindow`／`IsIconic`／`IsWindowVisible` 與執行緒無關；`SetForegroundWindow`／`ShowWindow` 的呼叫次數與條件不變。這與 probe8 的 worker thread PASS 呼叫形態一致，**仍待實機確認**。
+- **非 platform 憑證拒絕：** platform MakeCredential 成功後、複製 credential ID 之前，以純函式檢查 `dwUsedTransport` 必須含 `WEBAUTHN_CTAP_TRANSPORT_INTERNAL`（0x10）；先只讀 `dwVersion`：僅接受此平台 PRF 路徑既有的 v7／v8 版面，其餘版本（含 v1–v6、未知）一律以 `PlatformPrfUnsupported` 拒絕（fail closed），**通過版本檢查後才讀取** `dwUsedTransport`（該欄位依官方 `webauthn.h` 為 attestation **v3** 新增，不是 v4；v3 在此被拒是因為此路徑只信任 v7／v8，而非欄位不存在）。不符 → 新 `FidoError::PlatformAuthenticatorSubstituted`：不寫 slot、不嘗試 platform 刪除該 ID（尚未建立 pending-delete guard）；vault 層回報 `RegistrationCleanupReport::NotAttempted`，lib 層留下持久「unverified」收據。
+- **診斷：** platform MakeCredential／GetAssertion 的 `api-error` 在 `[WebAuthN-platform-operation]` 增加 `hresult`（`0x%08X`）與 `error_name`（`WebAuthNGetErrorName`：含非 ASCII 英數字的名稱整個丟棄為 null；全為 ASCII 英數字但超過 64 字元者**截斷**為前 64 字元）；未發生 API 失敗時不輸出這兩欄（既有 record 形狀不變）。不記錄 credential、PRF、PIN、標題、完整路徑。
+
+### 13.5 測試清單（證據 `D:/scratch/wh-d9f2-20261015/evidence/`）
+
+- 契約：每個 IPC 已分類；WebAuthn 類為 async（`07` RED→`08` GREEN；反向 mutation 拿掉 `register_key` 的 `(async)` → `09` RED）；非 WebAuthn 類不碰 backend；偵測器對 sync／async／無屬性函式的判斷。
+- 非 platform 憑證與診斷：transport 位元全組合與版本不足、Display 精確文字、vault 層無 slot／不刪除／`unverified` 收據、診斷欄位 exact allowlist 與消毒（`01`→`03`；vault `02`）。
+- ceremony 並行（`05` RED→`06` GREEN）：停住的登入 ceremony 期間 `list_entries`／`get_vault_settings`／`platform_status`／`lock` 於 2 秒內返回；登入中上鎖→結果丟棄、金庫保持上鎖；註冊成功中上鎖→回傳前上鎖；handoff 中上鎖→pending 取消並刪除；第二個金鑰操作（8 種入口）立即被拒且未呼叫 raise／backend；guard 於錯誤、前景失敗、panic 後釋放且 backend 歸還；panic 後仍執行待上鎖（`11`）；`create_vault`／`login_password`／`remove_key`／`cancel_registration`／`apply_csv_import` 在 ceremony 中被拒且狀態不變。
+- 既有測試調整：`wh_d5_login_publishes_and_clears_pending_under_one_lock` 原斷言「raise 時狀態鎖被持有」（正是本項要移除的行為），改為斷言「鎖未被持有且 operation 標記為進行中」；發佈仍在同一把鎖內。其餘既有 source-wiring 契約測試未改（`#[tauri::command(async)]` 讓以 `#[tauri::command]` 切割的測試取到較長文字，斷言仍成立）。
+- UI：`tests/key-operation-inflight-ui.test.cjs`（8 項，特徵化測試，無 RED：既有 UI 已在 IPC 前停用觸發鈕）。
+- R1 全套（舊）：MSVC `real-ctap` 523/523（`14`）、`real-ctap,dual-control` 523/523（`15`）、Node 150/150（`16`；基線 507／507／142，`00`）。
+
+### 13.6 殘留風險與未完成
+
+- **YubiKey（單人／雙人）與 RDP 路徑需重新實機驗收**；Win11-NB 行為需重驗。工作執行緒呼叫 Windows Hello 的實機結果（SKYCITY-PC）尚未驗證；尚未有 GUI 實測。
+- ceremony 期間 UI 不再凍結：使用者可點「上鎖」（登出畫面出現但提示框仍在，結果會被丟棄）或其他按鈕（以「已有金鑰操作進行中」拒絕）；頁面重新載入不會得知進行中狀態。
+- 同一程序內一次只有一個金鑰操作；ceremony 期間 `boot_info` 的 platform 本機清單不可用（視同未知）。
+- mock Gate（單人／Hello／雙人）需要 Release 範例建置，本次規則禁止 Release build，**未執行**，留待 CI。
+- 尚未完成：獨立 completed-code review、exact-head CI、Release 與實機驗收。
+
+### 13.7 R1 審查否決與 R2 修正
+
+**狀態：候選，待審查，未實測。** R1 Reviewer 與 Officer 均否決（`reviewer-R1`／`officer-R1`）。R2 逐項修正如下（證據 `D:/scratch/wh-d9f2-20261015/evidence/`，R1 舊 log `00`–`16` 未改動；RED＝自然 assertion failure，已正確者以可編譯反向 mutation 取得，含原始／還原 SHA-256 於各 log）。
+
+| 項 | 修正 | RED → GREEN |
+|---|---|---|
+| S1 已解鎖金庫可讀寫 | 所有金鑰**登入**（單人 key、any key、Hello、dual begin／complete）改走 `KeyOperationGuard::begin_login`：同一短鎖內若金庫已解鎖即拒絕（「金庫已解鎖；請先上鎖後再以金鑰登入」），不碰前景／backend；`with_unlocked` 與 `preview_csv_import` 先 `require_vault_readable`（active → 進行中；pending_lock → 已收到上鎖要求）才接受 `Some(v)`。 | `27` → `29` |
+| S2 逾時補掃被 active 擋掉 | 計時器改 `sweep_expired_registration_off_lock`（active 時略過）；`complete` 與 `Drop`（含 panic）收尾一律補做：到期 pending 排入佇列，於**鎖外**用租出的 backend 取消並記收據。 | `27` → `29` |
+| S3 版本檢查前讀 transport | `require_internal_platform_transport(read_version, read_transport)` seam：先只讀 `dwVersion`，非 v7／v8 → `PlatformPrfUnsupported`，之後才讀 `dwUsedTransport`；source 順序測試確認在 `copy_api_bytes`／`PendingPlatformCredential`／PRF 之前。文件／註解更正為 attestation **v3** 新增 `dwUsedTransport`。 | `23` → `24` |
+| L1 create_vault 競態 | `create_vault_inner` 先 `begin_native`（程序內保留，與所有金鑰操作互斥，第二個呼叫立即「進行中」），保留跨越 exists／KDF／建檔／發布；`Vault::create_for` 改以建立專用隨機 tmp 檔 + `hard_link`（目的檔已存在即失敗；無 hard link 的磁碟區退回 `create_new`）；前端 `doCreate` 與各登入入口共用 `authFlowInFlight`。 | Rust vault `25` → `26`；lib `27` → `29`；Node `35` → `36` |
+| L2 持鎖 native 清理 | 新增租約模型：所有會呼叫 platform status／list／delete 的路徑（Guard complete 的 deferred-lock 與到期清理、continue 逾時、idle `lock`、`cancel_registration`、`remove_key`、`login_password`、`create_vault`、`platform_status`、`boot_info`、到期計時器）一律租出 backend，native 在鎖外執行，再以短鎖發布收據。10 個情境讓 platform list／delete 阻塞，`list_entries`／`get_vault_settings`／`registration_cleanup_status` 於 2 秒內返回。 | `27` → `29` |
+| L3 `login_dual_cancel` | 擇「進行中立即回 busy」（同一短鎖內 `require_key_operation_idle`）；理由：不需 cancellation generation，不新增狀態；第一／二步 ceremony 中呼叫 cancel 皆回進行中，第一步暫存不被動到。 | `27` → `29` |
+| T1 RED 分類 | R1 的 `01`（對 `Option::unwrap()` panic）與 `02`（停在 `TODO-D9F2` 訊息，尚未到 NotAttempted 斷言）**更正分類為非合格 RED**，log 保留。測試改為明確 `assert_eq!`；精確反向 mutation：拿掉 sanitation（`20`）、拿掉 NotAttempted 回報（`21`）皆 assertion RED，還原後 GREEN（`22`）。 | `20`／`21` → `22` |
+
+非阻擋建議採納：契約測試加 helper 邊界遞迴偵測（`32`；間接呼叫 mutation `33` RED，舊的本體掃描測試在同一 mutation 下仍綠）；`wh_d5_login_publishes_and_clears_pending_under_one_lock` 加指向觀察測試的註解，新增 sampler 觀察測試與「拆鎖」負向控制（mutation 拿掉 reset → `34` RED）；Node 以未完成 Promise 模擬雙擊／PIN 與密碼欄 Enter／跨登入方式（`35` RED → `36`）；`error_name` 超長實際行為為**截斷**，文件已一致。
+
+驗證：MSVC `real-ctap` **542/542**（`40`）、`real-ctap,dual-control` **542/542**（`41`）、Node **155/155**（`42`）、`node --check src/app.js`、`git diff --check`（僅 CRLF 提示）。mock Gate、Release、實機仍**未執行**。
+
+殘留／限制：`hard_link` 退回 `create_new` 的路徑只有單元測試；租約模型使 `platform_status`／`boot_info` 等短暫呼叫期間 `list_entries` 也可能回「進行中」（已登入金鑰管理頁也會呼叫 `boot_info`）；`login_dual_cancel` 在 ceremony 期間不可取消（等 ceremony 結束或逾時）。
+
+### 13.8 R2 Reviewer 否決與 R3 最小修正候選
+
+**狀態：R3 候選，未獨立審查／mock Gate／Release／CI／實機。** R2 Reviewer `passed=false`（完整唯讀結論 `D:/scratch/wh-d9f2-20261015/reviewer-R2/reviewer-verdict.json`；R1 的 S1–S3、L1–L3、T1 與 Officer 原建庫競態已判定關閉）。Officer R2 因 Claude session limit 僅產生額度錯誤，**沒有 verdict**；不可稱雙審查通過。
+
+- **R2-S4（高）：** `KeyOperationGuard::finish` 在第一短鎖產生登入條目後，鎖外清理期間才收到 lock 時仍回 `Ok(entries)`。R3 在每次短鎖保留本次操作的上鎖訊號，不依賴被 `follow_up_work` 消耗的 pending 狀態；五個登入入口改用 `complete_login`，在最後短鎖以同一原子決策丟棄條目結果並釋放 active。決定性測試：native delete 阻塞時上鎖 `50` assertion RED → `52` GREEN；沒有 cleanup job 的兩鎖間隙控制測試 `53` GREEN。`51` 曾因 closure lifetime 編譯失敗，**非 RED/GREEN 證據**。
+- **R2-L4（中）：** 新建金庫專屬暫存檔成功開啟後，`write_all`／`sync_all` 失敗時 `?` 跳過清理。R3 在寫入失敗時先關閉自己的 handle 再清除自己的 tmp；link/fallback 後同樣檢查**自有 tmp** 的清理結果，不再吞掉 tmp 清理錯誤。若清理本身失敗，回明確錯誤指出目的檔**可能已建立**、須檢查既有金庫且不可重試建立。write/sync fault injection `54` assertion RED → `55` GREEN。**無法保證在 OS 拒絕刪除時無殘留；需人工檢查，不能宣稱此故障路徑已實機驗證。**
+
+此輪完整本機回歸：MSVC `real-ctap` **545/545**（`56`）、`real-ctap,dual-control` **545/545**（`57`）、Node **155/155**（`58`）；均 exit 0。這些結果不能取代獨立審查與實機驗收。
+
+### 13.9 R3 Reviewer 否決與使用者授權的 R4 局部修正
+
+R3 Reviewer 唯讀 verdict `D:/scratch/wh-d9f2-20261015/reviewer-R3/reviewer-verdict.json` 為 **不通過**：R2-S4 已關閉；R2-L4 尚有在 `hard_link` 不支援時，exclusive fallback 建立目的檔後寫入／同步失敗、再遇到目的檔刪除失敗會吞掉 cleanup 錯誤的殘支。使用者於第三輪否決後明確選擇「只修正這個替代寫入的錯誤回報與清理測試，再送審」，不擴大發布架構。
+
+R4 增可注入 write／sync／remove 的 fallback seam，先在 `create_new` 取得自有目的檔後執行寫入／同步，關檔後若失敗則檢查移除結果；移除成功保留原始 I/O 錯誤；移除失敗回傳含**寫入與清理兩個錯誤**、目的檔可能殘留不完整及**勿重試建立**的明確訊息（外層仍會清理自己的 tmp，並透過 `VaultError::Io` 顯示文字）。只刪本次成功 create_new 所取得的檔案，既有目的檔依 `create_new` 拒絕，不可覆寫。決定性 fixture 注入：`60` 一項 assertion RED、另一項 control 通過 → `61` 兩項 GREEN；test cleanup 只清其自有合成 fixture。**若 OS 拒絕刪除，仍可能留下不完整 vault.db，不能宣稱無殘留；只保證不靜默吞掉，使用者必須人工檢查。** 本段仍是候選。本機全套 MSVC `real-ctap` **547/547**（`62`）、`real-ctap,dual-control` **547/547**（`63`）、Node **155/155**（`64`），production check 單人／雙人均 exit 0（`parent/p20`／`p21`）。獨立審查／mock Gate／Release／CI／實機驗收待進行。
+
+### 13.10 R4 Reviewer 否決與 R5 錯誤合併（仍限原授權範圍）
+
+R4 Reviewer `D:/scratch/wh-d9f2-20261015/reviewer-R4/reviewer-verdict.json` 為 **不通過**：當 fallback 目的檔寫入／清理都失敗，且之後 tmp 也清理失敗時，外層只回 tmp 警告而遮蔽目的檔的詳細錯誤。R5 只在本次 create_new 專屬檔案的清理分支合併錯誤，不更改建庫發布架構：外層保留 fallback 的寫入、目的檔刪除失敗與「可能殘留不完整」訊息，再附 tmp 刪除失敗；若 tmp 自身寫入與清理都失敗，也保留原始寫入原因。
+
+決定性合成 fixture：兩檔清理同時失敗 `70` assertion RED → `71` GREEN；tmp 自身寫入＋清理雙失敗 `72` assertion RED → `73` GREEN。測試僅於測試 fixture 清除自己建立的兩個檔案，絕不碰真金庫。**實際 OS 拒絕刪檔時可能殘留；訊息引導使用者檢查而非盲目重試，並非自動恢復。**
+
+本機完整套件：`real-ctap` **549/549**（`81`）、`real-ctap,dual-control` **549/549**（`80`）及 Node **155/155**（`76`），production check 單人／雙人 exit 0（`parent/p22`、`p23`）。先前雙人套件於 Windows C: TEMP 路徑遭遇既有測試 fixture 的 `PermissionDenied`，第一次 547/549（`75`）、重跑仍有一例（`79`）；兩項單獨重跑均 PASS（`77`、`78`），改將該輪 `TMP`、`TEMP` 指向 `D:/scratch/wh-d9f2-20261015/test-fixtures` 後全套 549/549。**僅證實差異與最後結果，未證明 C: TEMP 拒絕的根因，不得隱藏失敗紀錄。** R5 仍是候選，待獨立審查／mock Gate／Release／CI／實機。

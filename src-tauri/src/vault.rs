@@ -814,7 +814,8 @@ impl Vault {
             kek,
             registration_cleanup_report: None,
         };
-        vault.write_file()?;
+        // Creation never replaces an existing vault (another creation may have won the race).
+        Self::publish_new_vault_file(path, &vault.encode_file(&vault.data)?)?;
         Ok(vault)
     }
 
@@ -1362,12 +1363,136 @@ impl Vault {
         serde_json::from_slice(&pt).map_err(VaultError::Json)
     }
 
+    /// D9-F2: temp name used only by one creation (never shared with another creation or save).
+    fn new_vault_tmp_path(path: &Path) -> PathBuf {
+        let mut suffix = [0u8; 8];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut suffix);
+        let suffix: String = suffix.iter().map(|b| format!("{b:02x}")).collect();
+        path.with_extension(format!("db.create-{suffix}.tmp"))
+    }
+
+    /// D9-F2: publish a brand-new vault file; an existing destination is never replaced.
+    ///
+    /// The bytes are written to a creation-private temp file and then linked into place with
+    /// `hard_link`, which fails with `AlreadyExists` instead of replacing the destination (unlike
+    /// `rename`). Volumes without hard links (e.g. exFAT USB sticks) fall back to an exclusive
+    /// `create_new` of the destination; either way an existing vault is never overwritten.
+    fn publish_new_vault_file(path: &Path, bytes: &[u8]) -> Result<(), VaultError> {
+        use std::io::Write;
+        Self::publish_new_vault_file_with_io(path, bytes,
+            |file, bytes| file.write_all(bytes),
+            |file| file.sync_all())
+    }
+
+    fn publish_new_vault_file_with_io(
+        path: &Path,
+        bytes: &[u8],
+        write: impl FnOnce(&mut fs::File, &[u8]) -> std::io::Result<()>,
+        sync: impl FnOnce(&mut fs::File) -> std::io::Result<()>,
+    ) -> Result<(), VaultError> {
+        Self::publish_new_vault_file_with_ops(
+            path, bytes, write, sync,
+            |tmp, target| fs::hard_link(tmp, target),
+            |target, bytes| Self::publish_new_vault_file_exclusive(target, bytes),
+            |tmp| fs::remove_file(tmp),
+        )
+    }
+
+    fn publish_new_vault_file_with_ops(
+        path: &Path,
+        bytes: &[u8],
+        write: impl FnOnce(&mut fs::File, &[u8]) -> std::io::Result<()>,
+        sync: impl FnOnce(&mut fs::File) -> std::io::Result<()>,
+        link: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+        fallback: impl FnOnce(&Path, &[u8]) -> std::io::Result<()>,
+        remove_tmp: impl FnOnce(&Path) -> std::io::Result<()>,
+    ) -> Result<(), VaultError> {
+        let tmp = Self::new_vault_tmp_path(path);
+        // Once create_new succeeds, this invocation owns the temporary path. Never use `?`
+        // before closing the handle and attempting removal on every error path.
+        let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        let written = write(&mut file, bytes).and_then(|()| sync(&mut file));
+        drop(file);
+        if let Err(error) = written {
+            return match remove_tmp(&tmp) {
+                Ok(()) => Err(VaultError::Io(error)),
+                Err(cleanup) => Err(VaultError::Format(format!(
+                    "金庫建立失敗且暫存檔無法清理（{}）；寫入失敗：{error}；清理失敗：{cleanup}；請手動檢查，勿重試建立",
+                    tmp.display()
+                ))),
+            };
+        }
+        let published = match link(&tmp, path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Err(error),
+            Err(_) => fallback(path, bytes),
+        };
+        // A hard link may already have published vault.db. If cleanup fails, never silently
+        // report success or invite another creation attempt on a potentially existing vault.
+        if let Err(cleanup) = remove_tmp(&tmp) {
+            // Do not replace a failed fallback's detailed destination-write/removal error with
+            // the later tmp-removal error. Both files may require manual recovery.
+            let publication = published.as_ref().err()
+                .map(|error| format!("；發布失敗：{error}"))
+                .unwrap_or_default();
+            return Err(VaultError::Format(format!(
+                "金庫檔案可能已建立，但暫存檔無法清理（{}）：{cleanup}{publication}；請確認既有金庫並手動清理，勿重試建立",
+                tmp.display()
+            )));
+        }
+        published.map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                VaultError::Format("vault.db 已存在".into())
+            } else {
+                VaultError::Io(error)
+            }
+        })
+    }
+
+    fn publish_new_vault_file_exclusive(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
+        Self::publish_new_vault_file_exclusive_with_io(path, bytes,
+            |file, bytes| file.write_all(bytes),
+            |file| file.sync_all(),
+            |path| fs::remove_file(path))
+    }
+
+    fn publish_new_vault_file_exclusive_with_io(
+        path: &Path,
+        bytes: &[u8],
+        write: impl FnOnce(&mut fs::File, &[u8]) -> std::io::Result<()>,
+        sync: impl FnOnce(&mut fs::File) -> std::io::Result<()>,
+        remove: impl FnOnce(&Path) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        let mut file = fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+        let written = write(&mut file, bytes).and_then(|()| sync(&mut file));
+        drop(file);
+        match written {
+            Ok(()) => Ok(()),
+            Err(primary) => match remove(path) {
+                Ok(()) => Err(primary),
+                Err(cleanup) => Err(std::io::Error::other(format!(
+                    "本次建立的金庫檔案可能殘留不完整（{}）；寫入失敗：{primary}；清理失敗：{cleanup}；請檢查既有檔案，勿重試建立",
+                    path.display()
+                ))),
+            },
+        }
+    }
+
     /// 以目前 KEK 重新加密 payload + 原子寫入（tmp + rename）。
     fn write_file(&self) -> Result<(), VaultError> {
         self.write_data(&self.data)
     }
 
     fn write_data(&self, data: &VaultData) -> Result<(), VaultError> {
+        let out = self.encode_file(data)?;
+        let tmp = self.path.with_extension("db.tmp");
+        fs::write(&tmp, &out)?;
+        fs::rename(&tmp, &self.path)?;
+        Ok(())
+    }
+
+    fn encode_file(&self, data: &VaultData) -> Result<Vec<u8>, VaultError> {
         let header_json = serde_json::to_vec(&self.header).map_err(VaultError::Json)?;
         let nonce = random_nonce();
         let pt = serde_json::to_vec(data).map_err(VaultError::Json)?;
@@ -1379,11 +1504,7 @@ impl Vault {
         out.extend_from_slice(&header_json);
         out.extend_from_slice(&nonce);
         out.extend_from_slice(&ct);
-
-        let tmp = self.path.with_extension("db.tmp");
-        fs::write(&tmp, &out)?;
-        fs::rename(&tmp, &self.path)?;
-        Ok(())
+        Ok(out)
     }
 
     // ── 軌跡 ──
@@ -1731,7 +1852,18 @@ impl Vault {
                     .ok_or_else(|| VaultError::Format("無法產生唯一的 Windows Hello 名稱".into()))?
             }
         };
-        let registration = backend.register_platform_credential(&label, &exclude)?;
+        let registration = match backend.register_platform_credential(&label, &exclude) {
+            Ok(registration) => registration,
+            Err(error) => {
+                if matches!(error, FidoError::PlatformAuthenticatorSubstituted) {
+                    // A credential exists on a security key that cannot be deleted by this process:
+                    // keep a durable warning instead of pretending nothing was created.
+                    self.registration_cleanup_report =
+                        Some(RegistrationCleanupReport::NotAttempted);
+                }
+                return Err(error.into());
+            }
+        };
         let reg = registration.credential;
         let all = match decode_credential_ids(&self.header.key_slots.iter().collect::<Vec<_>>()) {
             Ok(all) => all,
@@ -4337,6 +4469,202 @@ mod tests {
         let _ = fs::remove_file(failures_path(&p));
         let _ = fs::remove_file(p.with_extension("db.tmp"));
         p
+    }
+
+    #[test]
+    fn d9f2_r3_tmp_write_and_sync_errors_clean_up_the_owned_private_file() {
+        use std::io::{self, Write};
+        for fail_sync in [false, true] {
+            let p = fresh_path(if fail_sync { "d9f2-r3-sync-error" } else { "d9f2-r3-write-error" });
+            let result = Vault::publish_new_vault_file_with_io(
+                &p,
+                b"synthetic encrypted payload",
+                |file, bytes| {
+                    if fail_sync {
+                        file.write_all(bytes)
+                    } else {
+                        file.write_all(b"partial")?;
+                        Err(io::Error::other("injected write failure"))
+                    }
+                },
+                |file| if fail_sync { Err(io::Error::other("injected sync failure")) }
+                    else { file.sync_all() },
+            );
+            assert!(result.is_err(), "injected failure must propagate");
+            assert!(!p.exists(), "failed publication must not create a vault");
+            let leftovers: Vec<_> = fs::read_dir(p.parent().unwrap()).unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            assert!(leftovers.is_empty(), "owned temporary file leaked after injected write/sync error: {leftovers:?}");
+        }
+    }
+
+    #[test]
+    fn d9f2_new_vault_publication_never_overwrites_an_existing_file() {
+        let p = fresh_path("d9f2-publish-no-overwrite");
+        fs::write(&p, b"synthetic existing vault").unwrap();
+        let got = Vault::publish_new_vault_file(&p, b"synthetic replacement");
+        assert!(got.is_err(), "an existing destination must make creation fail: {got:?}");
+        assert_eq!(fs::read(&p).unwrap(), b"synthetic existing vault");
+        let leftovers: Vec<_> = fs::read_dir(p.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "vault.db")
+            .collect();
+        assert!(leftovers.is_empty(), "no temp file is left behind: {leftovers:?}");
+    }
+
+    #[test]
+    fn d9f2_new_vault_publication_succeeds_on_a_fresh_path_and_leaves_no_temp() {
+        let p = fresh_path("d9f2-publish-fresh");
+        Vault::publish_new_vault_file(&p, b"synthetic new vault").unwrap();
+        assert_eq!(fs::read(&p).unwrap(), b"synthetic new vault");
+        assert!(!p.with_extension("db.tmp").exists());
+        let names: Vec<_> = fs::read_dir(p.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["vault.db".to_string()], "{names:?}");
+    }
+
+    #[test]
+    fn d9f2_r5_tmp_write_and_cleanup_failures_preserve_both_errors() {
+        use std::io::{self, Write};
+        let p = fresh_path("d9f2-r5-tmp-write-cleanup-failure");
+        let mut owned_tmp = None;
+        let outcome = Vault::publish_new_vault_file_with_ops(
+            &p, b"synthetic encrypted payload",
+            |file, _bytes| { file.write_all(b"partial")?; Err(io::Error::other("injected tmp write failure")) },
+            |_file| panic!("sync must not run after write failure"),
+            |_, _| panic!("link must not run after write failure"),
+            |_, _| panic!("fallback must not run after write failure"),
+            |tmp| {
+                owned_tmp = Some(tmp.to_path_buf());
+                Err(io::Error::other("injected tmp removal failure"))
+            },
+        );
+        let message = outcome.unwrap_err().to_string();
+        assert!(message.contains("injected tmp write failure") && message.contains("injected tmp removal failure")
+            && message.contains("勿重試建立"), "combined tmp failure lost its primary error: {message}");
+        assert!(!p.exists());
+        fs::remove_file(owned_tmp.unwrap()).unwrap(); // Only our synthetic fixture.
+    }
+
+    #[test]
+    fn d9f2_r5_both_cleanup_failures_retain_destination_and_tmp_errors() {
+        use std::io::{self, Write};
+        let p = fresh_path("d9f2-r5-combined-cleanup-failure");
+        let mut owned_tmp = None;
+        let outcome = Vault::publish_new_vault_file_with_ops(
+            &p, b"synthetic encrypted payload",
+            |file, bytes| file.write_all(bytes),
+            |file| file.sync_all(),
+            |tmp, _target| {
+                owned_tmp = Some(tmp.to_path_buf());
+                Err(io::Error::other("injected hard link unsupported"))
+            },
+            |path, bytes| Vault::publish_new_vault_file_exclusive_with_io(
+                path, bytes,
+                |file, bytes| file.write_all(bytes),
+                |_file| Err(io::Error::other("injected destination sync failure")),
+                |_path| Err(io::Error::other("injected destination removal failure")),
+            ),
+            |_tmp| Err(io::Error::other("injected tmp removal failure")),
+        );
+        let message = outcome.unwrap_err().to_string();
+        for part in ["injected destination sync failure", "injected destination removal failure",
+            "injected tmp removal failure", "可能殘留不完整", "勿重試建立"] {
+            assert!(message.contains(part), "combined failure lost {part}: {message}");
+        }
+        let tmp = owned_tmp.expect("link attempted after owning tmp");
+        assert!(p.exists() && tmp.exists(), "injected cleanup failures must leave both test-owned paths");
+        fs::remove_file(&p).unwrap();
+        fs::remove_file(&tmp).unwrap();
+    }
+
+    #[test]
+    fn d9f2_r4_fallback_failure_reports_unremoved_partial_vault_instead_of_generic_io() {
+        use std::io::{self, Write};
+        let p = fresh_path("d9f2-r4-fallback-removal-failure");
+        let outcome = Vault::publish_new_vault_file_exclusive_with_io(
+            &p, b"synthetic encrypted payload",
+            |file, bytes| file.write_all(bytes),
+            |_file| Err(io::Error::other("injected sync failure")),
+            |_path| Err(io::Error::other("injected destination removal failure")),
+        );
+        let text = outcome.unwrap_err().to_string();
+        assert!(text.contains("injected sync failure") && text.contains("injected destination removal failure")
+            && text.contains("可能殘留") && text.contains("勿重試建立"),
+            "failed cleanup must clearly identify the possibly partial vault and retain both errors: {text}");
+        assert_eq!(fs::read(&p).unwrap(), b"synthetic encrypted payload",
+            "the injected cleanup failure leaves the newly owned destination for manual recovery");
+        fs::remove_file(&p).unwrap(); // Only this test fixture, never a user vault.
+    }
+
+    #[test]
+    fn d9f2_r4_fallback_write_failure_with_successful_cleanup_leaves_no_destination() {
+        use std::io::{self, Write};
+        let p = fresh_path("d9f2-r4-fallback-removal-success");
+        let outcome = Vault::publish_new_vault_file_exclusive_with_io(
+            &p, b"synthetic encrypted payload",
+            |file, _bytes| { file.write_all(b"partial")?; Err(io::Error::other("injected write failure")) },
+            |_file| Ok(()),
+            |path| fs::remove_file(path),
+        );
+        assert!(outcome.unwrap_err().to_string().contains("injected write failure"));
+        assert!(!p.exists(), "successful cleanup must remove this invocation's partial destination");
+    }
+
+    #[test]
+    fn d9f2_exclusive_fallback_publication_also_refuses_to_overwrite() {
+        // Used on volumes without hard links (exFAT USB sticks).
+        let p = fresh_path("d9f2-publish-exclusive");
+        Vault::publish_new_vault_file_exclusive(&p, b"synthetic first").unwrap();
+        let again = Vault::publish_new_vault_file_exclusive(&p, b"synthetic second");
+        assert_eq!(
+            again.unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists,
+            "the fallback must not replace an existing vault"
+        );
+        assert_eq!(fs::read(&p).unwrap(), b"synthetic first");
+    }
+
+    #[test]
+    fn d9f2_each_creation_uses_its_own_temp_name() {
+        let p = fresh_path("d9f2-unique-tmp");
+        let (a, b) = (Vault::new_vault_tmp_path(&p), Vault::new_vault_tmp_path(&p));
+        assert_ne!(a, b, "two creations must never share a temp file");
+        for tmp in [&a, &b] {
+            assert_ne!(tmp, &p.with_extension("db.tmp"), "the regular save temp name is not reused");
+            assert_eq!(tmp.parent(), p.parent());
+        }
+    }
+
+    #[test]
+    fn d9f2_concurrent_create_for_publishes_exactly_one_vault_that_matches_the_disk() {
+        let p = fresh_path("d9f2-concurrent-create");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let workers: Vec<_> = ["synthetic-password-A1", "synthetic-password-B2"]
+            .into_iter()
+            .map(|password| {
+                let (p, barrier) = (p.clone(), std::sync::Arc::clone(&barrier));
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    Vault::create_for(&p, password, Edition::Single).map_err(|e| e.to_string())
+                })
+            })
+            .collect();
+        let results: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
+        let winners: Vec<_> = results.iter().filter(|r| r.is_ok()).collect();
+        assert_eq!(winners.len(), 1, "exactly one creation may succeed: {:?}", results.iter().map(|r| r.as_ref().map(|_| ())).collect::<Vec<_>>());
+        let winner = results.into_iter().find_map(Result::ok).unwrap();
+        let on_disk = Vault::read_header(&p, Edition::Single).unwrap();
+        let in_memory = winner.lock();
+        assert_eq!(
+            serde_json::to_string(&on_disk).unwrap(),
+            serde_json::to_string(&in_memory).unwrap(),
+            "the published in-memory vault must be the one on disk"
+        );
     }
 
     fn decode_share(b64: &str) -> [u8; 32] {

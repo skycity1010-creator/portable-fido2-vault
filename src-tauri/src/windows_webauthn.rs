@@ -2113,6 +2113,38 @@ struct CredentialAttestationV7 {
     b_third_party_payment: windows_sys::core::BOOL,
 }
 
+/// D9-F2: a PLATFORM request must be completed by the local authenticator.
+///
+/// `dwUsedTransport` was added in WEBAUTHN_CREDENTIAL_ATTESTATION version 3 (Microsoft webauthn.h,
+/// `WEBAUTHN_CREDENTIAL_ATTESTATION_CURRENT_VERSION` history). This platform path only trusts the
+/// v7/v8 layouts (the same policy as the PRF extension), so every other version fails closed.
+fn platform_attestation_used_internal_transport(version: u32, used_transport: u32) -> bool {
+    platform_attestation_version_supported(version)
+        && used_transport & WEBAUTHN_CTAP_TRANSPORT_INTERNAL != 0
+}
+
+/// D9-F2 seam: the only gate between a successful PLATFORM MakeCredential and any further read of
+/// the native attestation. Fields are supplied lazily so a test can prove what was (not) read.
+fn require_internal_platform_transport(
+    read_version: impl FnOnce() -> u32,
+    read_transport: impl FnOnce() -> u32,
+) -> Result<(), FidoError> {
+    // Only dwVersion is read first: the extended layout (and therefore every later field) is
+    // trusted only for the versions this platform path already supports (v7/v8).
+    if !platform_attestation_version_supported(read_version()) {
+        return Err(FidoError::PlatformPrfUnsupported);
+    }
+    if platform_attestation_used_internal_transport(8, read_transport()) {
+        Ok(())
+    } else {
+        Err(FidoError::PlatformAuthenticatorSubstituted)
+    }
+}
+
+fn api_error_name_of(hr: windows_sys::core::HRESULT) -> Option<String> {
+    unsafe { api_wide_string(WebAuthNGetErrorName(hr)) }
+}
+
 fn platform_attestation_version_supported(version: u32) -> bool {
     // This parser and its cleanup guard share the same official v7/v8 prefix contract.
     matches!(version, 7 | 8)
@@ -2611,6 +2643,7 @@ impl WindowsWebAuthnBackend {
         let _ = focus_monitor.map(WebAuthnForegroundMonitor::finish_observation);
         diagnostic.failure_stage = Some(FailureStage::Api);
         if hr < 0 {
+            diagnostic.set_api_failure(hr, api_error_name_of(hr).as_deref());
             return Err(platform_make_error(hr));
         }
         diagnostic.failure_stage = Some(FailureStage::Response);
@@ -2618,6 +2651,10 @@ impl WindowsWebAuthnBackend {
             return Err(FidoError::PlatformPrfUnsupported);
         }
         let att = unsafe { &*attestation.allocation };
+        // D9-F2: Windows may complete a PLATFORM request with a security key after an Ngc failure.
+        // Reject before the credential ID is copied: no pending-delete guard exists yet, so no
+        // platform deletion is ever attempted for an ID that is not a local Hello credential.
+        require_internal_platform_transport(|| att.dwVersion, || att.dwUsedTransport)?;
         let credential_id =
             unsafe { copy_api_bytes(att.pbCredentialId, att.cbCredentialId, "credential ID")? };
         if credential_id.is_empty() {
@@ -2813,6 +2850,9 @@ impl WindowsWebAuthnBackend {
         if hr < 0 {
             if !assertion.is_null() {
                 unsafe { WebAuthNFreeAssertion(assertion) };
+            }
+            if platform {
+                diagnostic.set_api_failure(hr, api_error_name_of(hr).as_deref());
             }
             return Err(if platform {
                 platform_prf_error(hr)
@@ -3220,6 +3260,124 @@ mod tests {
         let salt = &*att.p_hmac_secret;
         D3_FREE_SAW_ZERO.store(slice::from_raw_parts(salt.pbFirst, 32).iter().all(|b| *b == 0), Ordering::SeqCst);
         D3_FREE_CALLS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn d9f2_platform_attestation_requires_internal_transport() {
+        let internal = WEBAUTHN_CTAP_TRANSPORT_INTERNAL;
+        assert_eq!(internal, 0x10);
+        // Only INTERNAL (alone or combined) is acceptable.
+        assert!(platform_attestation_used_internal_transport(7, internal));
+        assert!(platform_attestation_used_internal_transport(8, internal));
+        assert!(platform_attestation_used_internal_transport(7, internal | WEBAUTHN_CTAP_TRANSPORT_USB));
+        for other in [
+            0,
+            WEBAUTHN_CTAP_TRANSPORT_USB,
+            WEBAUTHN_CTAP_TRANSPORT_NFC,
+            WEBAUTHN_CTAP_TRANSPORT_BLE,
+            WEBAUTHN_CTAP_TRANSPORT_TEST,
+            WEBAUTHN_CTAP_TRANSPORT_USB | WEBAUTHN_CTAP_TRANSPORT_NFC | WEBAUTHN_CTAP_TRANSPORT_BLE,
+            0x20,
+            0x40,
+            0xFFFF_FFE0,
+        ] {
+            assert!(!platform_attestation_used_internal_transport(8, other), "{other:#x}");
+        }
+        // dwUsedTransport exists from attestation v3, but only the v7/v8 layouts are trusted on this
+        // platform path: every other version fails closed.
+        for version in [0, 1, 2, 3, 4, 5, 6, 9] {
+            assert!(!platform_attestation_used_internal_transport(version, internal), "{version}");
+        }
+    }
+
+    #[test]
+    fn d9f2_transport_gate_rejects_unsupported_versions_before_reading_the_transport_field() {
+        for version in [0u32, 1, 2, 3, 4, 5, 6, 9, 10, u32::MAX] {
+            let reads = std::cell::RefCell::new(Vec::<&str>::new());
+            let got = require_internal_platform_transport(
+                || {
+                    reads.borrow_mut().push("version");
+                    version
+                },
+                || {
+                    reads.borrow_mut().push("transport");
+                    WEBAUTHN_CTAP_TRANSPORT_INTERNAL
+                },
+            );
+            assert!(
+                matches!(got, Err(FidoError::PlatformPrfUnsupported)),
+                "version {version}: {got:?}"
+            );
+            assert_eq!(
+                reads.into_inner(),
+                vec!["version"],
+                "version {version}: the transport field must not be read for an unsupported layout"
+            );
+        }
+    }
+
+    #[test]
+    fn d9f2_transport_gate_reads_version_first_then_transport_for_supported_versions() {
+        for version in [7u32, 8] {
+            for (transport, accepted) in [
+                (WEBAUTHN_CTAP_TRANSPORT_INTERNAL, true),
+                (WEBAUTHN_CTAP_TRANSPORT_INTERNAL | WEBAUTHN_CTAP_TRANSPORT_USB, true),
+                (WEBAUTHN_CTAP_TRANSPORT_USB, false),
+                (0, false),
+            ] {
+                let reads = std::cell::RefCell::new(Vec::<&str>::new());
+                let got = require_internal_platform_transport(
+                    || {
+                        reads.borrow_mut().push("version");
+                        version
+                    },
+                    || {
+                        reads.borrow_mut().push("transport");
+                        transport
+                    },
+                );
+                assert_eq!(reads.into_inner(), vec!["version", "transport"]);
+                if accepted {
+                    assert!(got.is_ok(), "{version} {transport:#x}: {got:?}");
+                } else {
+                    assert!(
+                        matches!(got, Err(FidoError::PlatformAuthenticatorSubstituted)),
+                        "{version} {transport:#x}: {got:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn d9f2_transport_gate_runs_before_any_attestation_copy_or_delete_guard() {
+        let source = include_str!("windows_webauthn.rs").replace(char::from(13), "");
+        // The first match is the production implementation (later matches are test literals).
+        let production = source.as_str();
+        let start = production
+            .find("fn make_platform_credential_with_diagnostics")
+            .expect("platform MakeCredential wrapper");
+        let body = &production[start..];
+        let gate = body
+            .find("require_internal_platform_transport(")
+            .expect("the transport gate is applied to the native response");
+        for later in [
+            "att.dwUsedTransport",
+            "copy_api_bytes(att.pbCredentialId",
+            "PendingPlatformCredential(",
+            "platform_attestation_prf(att)",
+            "copy_api_bytes(\n                att.pbAuthenticatorData",
+        ] {
+            let at = body.find(later).unwrap_or_else(|| panic!("{later} present"));
+            assert!(
+                gate <= at,
+                "{later} must come after (or inside the lazy closure of) the transport gate"
+            );
+        }
+        assert!(
+            !body[..gate].contains("att.dwUsedTransport"),
+            "dwUsedTransport must not be read before the version check"
+        );
     }
 
     #[test]

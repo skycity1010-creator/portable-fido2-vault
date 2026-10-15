@@ -314,7 +314,29 @@ struct AppInner {
     registration_cleanup_receipts: Vec<RegistrationCleanupReceipt>,
     registration_cleanup_journal: Option<registration_cleanup_journal::Journal>,
     registration_cleanup_storage_unavailable: bool,
+    /// D9-F2：目前是否有金鑰操作（WebAuthn ceremony）進行中，及其間收到的上鎖要求。
+    key_op: KeyOpState,
 }
+
+/// D9-F2：金鑰操作狀態機。`active` 與 `pending_lock` 只在 `VaultState` 的短暫鎖內讀寫；
+/// 鎖不會跨 ceremony 持有，所以其他指令（含主執行緒）隨時可以讀到它而不被卡住。
+#[derive(Default)]
+struct KeyOpState {
+    active: bool,
+    /// ceremony 期間收到的上鎖要求（保留 reason）；ceremony 結束、回傳前才執行。
+    pending_lock: Option<Option<String>>,
+    /// Pending registrations taken out of the state that still have to be cancelled through the
+    /// real backend. The cancellation (platform list/delete) runs by the operation that leases the
+    /// backend, **outside** the state lock, so queries on the main thread never wait for it.
+    cleanups: Vec<(PendingRegistrationSlot, &'static str)>,
+}
+
+/// 第二個金鑰操作被拒的訊息（不排隊、不碰前景、不呼叫 backend）。
+const KEY_OPERATION_BUSY_MSG: &str = "已有金鑰操作進行中，請先完成或取消";
+/// ceremony 期間收到上鎖要求時，該 ceremony 的回應（不含任何條目）。
+const KEY_OPERATION_LOCKED_MSG: &str = "金鑰操作期間已收到上鎖要求，金庫已上鎖；請重新登入";
+/// 已解鎖的金庫不接受新的金鑰登入（避免登入 ceremony 期間金庫仍可讀寫、結果又以舊快照覆寫）。
+const VAULT_ALREADY_UNLOCKED_MSG: &str = "金庫已解鎖；請先上鎖後再以金鑰登入";
 
 /// pending 註冊的有效期限；逾時視同取消（Windows Hello 會刪除本次 credential）。
 const PENDING_REGISTRATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
@@ -379,49 +401,101 @@ fn record_registration_cleanup(g: &mut AppInner, generation: u64, reason: &'stat
         });
 }
 
-/// 取消並清理 pending 註冊（Windows Hello：RP 清單證明後刪除）。
-/// 失敗僅留非機密收據，直到使用者確認；秘密隨 pending drop 清零。
-fn cancel_pending_registration_with_reason(
-    g: &mut AppInner,
+/// Result of cancelling one pending registration through the real backend.
+struct CancelledRegistration {
+    generation: u64,
     reason: &'static str,
-) -> RegistrationCleanup {
-    let Some(slot) = g.pending_registration.take() else {
-        // No pending: report the unacknowledged durable warnings (journal is authoritative,
-        // unreadable storage is conservatively a warning), never a stale in-memory copy.
-        return if has_unacknowledged_cleanup(g) {
-            RegistrationCleanup::ManualRemovalRequired
-        } else {
-            RegistrationCleanup::None
-        };
-    };
+    cleanup: RegistrationCleanup,
+}
+
+/// Cancel one pending registration (Windows Hello: delete only after the RP list proves the
+/// credential is local). Touches only the backend it is handed: callers run it **outside** the
+/// state lock, then publish the receipt with `record_cancelled_registration`.
+fn cancel_slot_with_backend(
+    backend: &mut (dyn fido2::FidoBackend + 'static),
+    slot: PendingRegistrationSlot,
+    reason: &'static str,
+) -> CancelledRegistration {
     let generation = slot.generation;
-    let cleanup = match vault::cancel_registration(g.backend.as_mut(), slot.pending) {
+    let cleanup = match vault::cancel_registration(backend, slot.pending) {
         vault::CancelOutcome::Removed => RegistrationCleanup::Removed,
         vault::CancelOutcome::ManualRemovalRequired => RegistrationCleanup::ManualRemovalRequired,
         vault::CancelOutcome::Discarded => RegistrationCleanup::Discarded,
     };
-    if cleanup == RegistrationCleanup::ManualRemovalRequired {
-        record_registration_cleanup(g, generation, reason);
+    CancelledRegistration {
+        generation,
+        reason,
+        cleanup,
     }
-    cleanup
 }
 
-fn cancel_pending_registration(g: &mut AppInner) -> RegistrationCleanup {
-    cancel_pending_registration_with_reason(g, "implicit")
+/// 失敗僅留非機密收據，直到使用者確認；秘密隨 pending drop 清零。
+fn record_cancelled_registration(g: &mut AppInner, done: &CancelledRegistration) {
+    if done.cleanup == RegistrationCleanup::ManualRemovalRequired {
+        record_registration_cleanup(g, done.generation, done.reason);
+    }
 }
 
-/// 已逾時的 pending 註冊視同取消；`generation` 給定時只清除該代。回傳是否清除。
-fn sweep_expired_registration(
+/// Take the pending registration out of the state so that the operation that owns the backend
+/// lease cancels it (outside the lock) before it returns. The caller must hold such a lease.
+fn queue_pending_cancellation(g: &mut AppInner, reason: &'static str) -> bool {
+    match g.pending_registration.take() {
+        Some(slot) => {
+            g.key_op.cleanups.push((slot, reason));
+            true
+        }
+        None => false,
+    }
+}
+
+/// What a cancellation reports when nothing was pending: the unacknowledged durable warnings
+/// (journal is authoritative; unreadable storage is conservatively a warning).
+fn no_pending_cleanup_status(g: &mut AppInner) -> RegistrationCleanup {
+    if has_unacknowledged_cleanup(g) {
+        RegistrationCleanup::ManualRemovalRequired
+    } else {
+        RegistrationCleanup::None
+    }
+}
+
+/// Take an expired pending registration (any generation when `generation` is `None`) out of the
+/// state without touching the backend; the caller cancels it off-lock.
+fn take_expired_registration(
     g: &mut AppInner,
     generation: Option<u64>,
     now: std::time::Instant,
-) -> bool {
+) -> Option<PendingRegistrationSlot> {
     let expired = g.pending_registration.as_ref().is_some_and(|slot| {
         now >= slot.deadline && generation.is_none_or(|generation| generation == slot.generation)
     });
     if expired {
-        cancel_pending_registration_with_reason(g, "expired");
+        g.pending_registration.take()
+    } else {
+        None
     }
+}
+
+/// Expiry timer. The cancellation (platform list/delete) happens outside the state lock; while a
+/// key operation is active the backend is leased out, the timer is skipped and the operation's
+/// completion performs the catch-up (see `KeyOperationGuard::finish`).
+fn sweep_expired_registration_off_lock(
+    state: &VaultState,
+    generation: Option<u64>,
+    now: std::time::Instant,
+) -> bool {
+    let Ok((guard, expired)) = KeyOperationGuard::begin_native(state, |g| {
+        let expired = g.pending_registration.as_ref().is_some_and(|slot| {
+            now >= slot.deadline
+                && generation.is_none_or(|generation| generation == slot.generation)
+        });
+        if expired {
+            queue_pending_cancellation(g, "expired");
+        }
+        Ok(expired)
+    }) else {
+        return false;
+    };
+    let _ = guard.complete(|_, _| Ok(()));
     expired
 }
 
@@ -519,6 +593,7 @@ impl AppInner {
             registration_cleanup_receipts: Vec::new(),
             registration_cleanup_journal: journal,
             registration_cleanup_storage_unavailable: storage_unavailable,
+            key_op: KeyOpState::default(),
         })
     }
 }
@@ -546,6 +621,326 @@ impl VaultState {
             .map_err(|_| "state lock poisoned".to_string())?;
         f(&mut g)
     }
+}
+
+/// D9-F2：ceremony 進行中占位的 backend。真正的 backend 被「租出」給進行中的金鑰操作，
+/// 其他指令（含主執行緒指令）因此不必等待 ceremony 持有的鎖；任何動到 authenticator 的呼叫一律拒絕。
+struct BusyBackend {
+    brokered: bool,
+}
+
+fn busy_fido_error() -> fido2::FidoError {
+    fido2::FidoError::Internal(KEY_OPERATION_BUSY_MSG.into())
+}
+
+impl fido2::FidoBackend for BusyBackend {
+    fn detect(&mut self) -> std::result::Result<fido2::DetectedKey, fido2::FidoError> {
+        Err(busy_fido_error())
+    }
+
+    fn register_credential(
+        &mut self,
+        _detected: &fido2::DetectedKey,
+        _pin: Option<&str>,
+    ) -> std::result::Result<fido2::RegisteredCredential, fido2::FidoError> {
+        Err(busy_fido_error())
+    }
+
+    fn get_prf_secret(
+        &mut self,
+        _credential_id: &[u8],
+        _pin: Option<&str>,
+    ) -> std::result::Result<[u8; 32], fido2::FidoError> {
+        Err(busy_fido_error())
+    }
+
+    fn uses_brokered_key_selection(&self) -> bool {
+        self.brokered
+    }
+
+    fn key_unavailable_reason(&self) -> Option<String> {
+        Some(KEY_OPERATION_BUSY_MSG.into())
+    }
+}
+
+fn lock_state_tolerant(state: &VaultState) -> std::sync::MutexGuard<'_, AppInner> {
+    // A panicking ceremony must still be able to release its operation; never deadlock on poison.
+    state.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// D9-F2：程序級（每個 `VaultState`）單一進行中的金鑰操作。每個 WebAuthn 指令在任何前景／backend
+/// 動作前呼叫 `begin*`；已有進行中操作時立即回 `KEY_OPERATION_BUSY_MSG`（不排隊）。
+///
+/// `begin*` 在短暫的狀態鎖內檢查、占用並把 backend（及需要時的金庫）租出，之後 ceremony 與所有
+/// native 呼叫（WebAuthn、平台清單／刪除、IsUVPAA）都在 **不持有狀態鎖** 的情況下執行。`complete`
+/// 重新取鎖、歸還金庫、套用結果；ceremony 期間收到的上鎖要求、逾時的 pending 註冊與排入佇列的
+/// pending 取消，一律在鎖外以租出的 backend 完成，最後才歸還 backend 並釋放。Drop（錯誤、panic、
+/// 提前返回）走同一條收尾流程（fail closed）。
+struct KeyOperationGuard<'a> {
+    state: &'a VaultState,
+    backend: Option<Box<dyn fido2::FidoBackend>>,
+    vault: Option<vault::Vault>,
+    done: bool,
+}
+
+impl<'a> KeyOperationGuard<'a> {
+    /// A key operation that leases the backend and, when `lease_vault`, the unlocked vault.
+    fn begin<P>(
+        state: &'a VaultState,
+        lease_vault: bool,
+        prepare: impl FnOnce(&mut AppInner) -> Result<P>,
+    ) -> Result<(Self, P)> {
+        Self::begin_with(state, lease_vault, false, prepare)
+    }
+
+    /// A key **login**: refused while a vault is already unlocked, so no vault can be read or
+    /// written during the ceremony and no stale snapshot can later replace newer data.
+    fn begin_login<P>(
+        state: &'a VaultState,
+        prepare: impl FnOnce(&mut AppInner) -> Result<P>,
+    ) -> Result<(Self, P)> {
+        Self::begin_with(state, false, true, prepare)
+    }
+
+    /// Leases only the backend: used for any work that calls native APIs (status, list, delete,
+    /// password login/creation with platform repair) so it never runs under the state lock.
+    fn begin_native<P>(
+        state: &'a VaultState,
+        prepare: impl FnOnce(&mut AppInner) -> Result<P>,
+    ) -> Result<(Self, P)> {
+        Self::begin_with(state, false, false, prepare)
+    }
+
+    fn begin_with<P>(
+        state: &'a VaultState,
+        lease_vault: bool,
+        reject_unlocked: bool,
+        prepare: impl FnOnce(&mut AppInner) -> Result<P>,
+    ) -> Result<(Self, P)> {
+        state.with_lock(|g| {
+            if g.key_op.active {
+                return Err(KEY_OPERATION_BUSY_MSG.to_string());
+            }
+            if reject_unlocked && g.vault.is_some() {
+                return Err(VAULT_ALREADY_UNLOCKED_MSG.to_string());
+            }
+            let prepared = prepare(g)?;
+            Ok((Self::lease(state, g, lease_vault), prepared))
+        })
+    }
+
+    /// Mark the operation active and lease the backend (and vault) out of the locked state.
+    fn lease(state: &'a VaultState, g: &mut AppInner, lease_vault: bool) -> Self {
+        g.key_op.active = true;
+        g.key_op.pending_lock = None;
+        let brokered = g.backend.uses_brokered_key_selection();
+        let backend = std::mem::replace(&mut g.backend, Box::new(BusyBackend { brokered }));
+        let vault = if lease_vault { g.vault.take() } else { None };
+        Self {
+            state,
+            backend: Some(backend),
+            vault,
+            done: false,
+        }
+    }
+
+    /// The leased backend and (when leased) the unlocked vault, for use outside the state lock.
+    fn parts(&mut self) -> (&mut (dyn fido2::FidoBackend + 'static), Option<&mut vault::Vault>) {
+        (
+            self.backend
+                .as_deref_mut()
+                .expect("backend is leased while the operation is active"),
+            self.vault.as_mut(),
+        )
+    }
+
+    /// Briefly take the state lock (the backend stays leased) to read or take state.
+    fn with_state<R>(&mut self, f: impl FnOnce(&mut AppInner) -> R) -> R {
+        let mut g = lock_state_tolerant(self.state);
+        f(&mut g)
+    }
+
+    /// Cancel a pending registration through the leased backend **outside** the state lock, then
+    /// publish its receipt (if any) under a short lock.
+    fn cancel_off_lock(
+        &mut self,
+        slot: PendingRegistrationSlot,
+        reason: &'static str,
+    ) -> RegistrationCleanup {
+        let done = self.cancel_slots_off_lock(vec![(slot, reason)]).remove(0);
+        self.with_state(|g| record_cancelled_registration(g, &done));
+        done.cleanup
+    }
+
+    fn cancel_slots_off_lock(
+        &mut self,
+        jobs: Vec<(PendingRegistrationSlot, &'static str)>,
+    ) -> Vec<CancelledRegistration> {
+        jobs.into_iter()
+            .map(|(slot, reason)| {
+                let generation = slot.generation;
+                let backend = self.backend.as_deref_mut();
+                let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    backend.map(|backend| cancel_slot_with_backend(backend, slot, reason))
+                }));
+                match attempt {
+                    Ok(Some(done)) => done,
+                    // A panicking or missing backend: fail closed with a durable warning.
+                    _ => CancelledRegistration {
+                        generation,
+                        reason,
+                        cleanup: RegistrationCleanup::ManualRemovalRequired,
+                    },
+                }
+            })
+            .collect()
+    }
+
+    /// Work that must follow an operation: a lock request that arrived meanwhile, a pending
+    /// registration whose deadline passed while the one-shot timer was skipped (the backend was
+    /// leased), and every queued cancellation. Runs under the state lock but only *moves* things
+    /// (no native call); the returned cancellations are executed outside the lock.
+    fn follow_up_work(g: &mut AppInner) -> Vec<(PendingRegistrationSlot, &'static str)> {
+        if let Some(reason) = g.key_op.pending_lock.take() {
+            let _ = lock_locked(g, reason.as_deref());
+        } else if let Some(slot) = take_expired_registration(g, None, std::time::Instant::now()) {
+            g.key_op.cleanups.push((slot, "expired"));
+        }
+        std::mem::take(&mut g.key_op.cleanups)
+    }
+
+    /// Return the vault, publish the result (`publish` gets whether a lock request arrived during
+    /// the operation), run the follow-up work, then give the backend back and release.
+    fn finish<R>(
+        &mut self,
+        publish: Option<impl FnOnce(&mut AppInner, bool) -> Result<R>>,
+        discard_login_on_late_lock: bool,
+        after_first_lock: impl FnOnce(),
+    ) -> Option<Result<R>> {
+        if self.done {
+            return None;
+        }
+        let mut result = None;
+        // follow_up_work consumes pending_lock. Retain a local sticky observation until the
+        // response is finalized: a lock during native cleanup must invalidate login entries.
+        let mut lock_requested = false;
+        let mut jobs = {
+            let mut g = lock_state_tolerant(self.state);
+            if let Some(vault) = self.vault.take() {
+                // The lock is only deferred, never dropped, while leased: nothing else may fill it.
+                if g.vault.is_none() {
+                    g.vault = Some(vault);
+                }
+            }
+            let deferred_lock = g.key_op.pending_lock.is_some();
+            lock_requested |= deferred_lock;
+            if let Some(publish) = publish {
+                result = Some(publish(&mut g, deferred_lock));
+            }
+            Self::follow_up_work(&mut g)
+        };
+        // The real caller passes a no-op; the test seam deterministically exercises a lock
+        // arriving even when no native cleanup jobs were queued.
+        after_first_lock();
+        loop {
+            let finished = self.cancel_slots_off_lock(jobs);
+            let mut g = lock_state_tolerant(self.state);
+            for done in &finished {
+                record_cancelled_registration(&mut g, done);
+            }
+            lock_requested |= g.key_op.pending_lock.is_some();
+            jobs = Self::follow_up_work(&mut g);
+            if jobs.is_empty() {
+                // This decision and active=false share the final short lock. Drop any prepared
+                // secret-bearing response if lock was requested at ANY point in the operation.
+                if discard_login_on_late_lock && lock_requested {
+                    result = Some(Err(KEY_OPERATION_LOCKED_MSG.to_string()));
+                }
+                if let Some(backend) = self.backend.take() {
+                    g.backend = backend;
+                }
+                g.key_op.active = false;
+                self.done = true;
+                break;
+            }
+        }
+        result
+    }
+
+    fn complete<R>(mut self, f: impl FnOnce(&mut AppInner, bool) -> Result<R>) -> Result<R> {
+        self.finish(Some(f), false, || {})
+            .expect("a guard is completed exactly once")
+    }
+
+    fn complete_login(
+        mut self,
+        opened: Result<vault::Vault>,
+        reset: impl FnOnce(&mut AppInner),
+    ) -> Result<Vec<vault::Entry>> {
+        self.finish(Some(|g: &mut AppInner, deferred_lock| {
+            publish_login(g, opened, deferred_lock, reset)
+        }), true, || {})
+            .expect("a guard is completed exactly once")
+    }
+}
+
+impl Drop for KeyOperationGuard<'_> {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        // Panic / early return: same fail-closed epilogue, and never panic out of Drop.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.finish(None::<fn(&mut AppInner, bool) -> Result<()>>, false, || {})
+        }));
+        if !self.done {
+            let mut g = lock_state_tolerant(self.state);
+            if let Some(backend) = self.backend.take() {
+                g.backend = backend;
+            }
+            g.key_op.active = false;
+            self.done = true;
+        }
+    }
+}
+
+/// Publish a freshly opened vault (login result) unless a lock request arrived meanwhile.
+fn publish_login(
+    g: &mut AppInner,
+    opened: Result<vault::Vault>,
+    deferred_lock: bool,
+    reset: impl FnOnce(&mut AppInner),
+) -> Result<Vec<vault::Entry>> {
+    let v = opened?;
+    if deferred_lock {
+        // The user asked to lock while the key prompt was open: discard the unlock.
+        drop(v.lock());
+        return Err(KEY_OPERATION_LOCKED_MSG.to_string());
+    }
+    let entries = v.entries().to_vec();
+    reset(g);
+    queue_pending_cancellation(g, "implicit");
+    g.vault = Some(v);
+    Ok(entries)
+}
+
+fn require_key_operation_idle(g: &AppInner) -> Result<()> {
+    if g.key_op.active {
+        return Err(KEY_OPERATION_BUSY_MSG.to_string());
+    }
+    Ok(())
+}
+
+/// Every read or write of the unlocked vault goes through this check first: nothing may be read
+/// or changed while a key operation runs, nor after a lock request has been recorded.
+fn require_vault_readable(g: &AppInner) -> Result<()> {
+    if g.key_op.active {
+        return Err(KEY_OPERATION_BUSY_MSG.to_string());
+    }
+    if g.key_op.pending_lock.is_some() {
+        return Err(KEY_OPERATION_LOCKED_MSG.to_string());
+    }
+    Ok(())
 }
 
 fn path_from_state_or_default() -> std::path::PathBuf {
@@ -653,24 +1048,40 @@ fn get_edition() -> edition::Edition {
 }
 
 /// 啟動畫面資訊：是否有金庫、已註冊金鑰清單（供登入畫面）。
-#[tauri::command]
+#[tauri::command(async)]
 fn boot_info(state: tauri::State<VaultState>) -> Result<LoginScreenInfo> {
-    let path = path_from_state_or_default();
+    boot_info_inner(&state, &path_from_state_or_default(), edition::current())
+}
+
+fn boot_info_inner(
+    state: &VaultState,
+    path: &std::path::Path,
+    ed: edition::Edition,
+) -> Result<LoginScreenInfo> {
     let has_vault = path.exists();
-    let keys = if has_vault && edition::current() == edition::Edition::Single {
-        let h = vault::Vault::read_header(&path, edition::Edition::Single)
+    let keys = if has_vault && ed == edition::Edition::Single {
+        let h = vault::Vault::read_header(path, edition::Edition::Single)
             .map_err(|e| e.to_string())?;
-        state.with_lock(|g| {
-            // RP-local discovery is read-only. Failure must not prevent password login.
-            let local = if g.backend.platform_status().available() {
-                g.backend.list_platform_credentials().ok()
-            } else {
-                None
-            };
-            Ok(key_infos_with_local(&h, local.as_deref()))
-        })?
+        // RP-local discovery is read-only and runs on the leased backend, outside the state lock.
+        // Failure (or a busy backend) must not prevent password login.
+        let local = match KeyOperationGuard::begin_native(state, |_| Ok(())) {
+            Ok((mut guard, ())) => {
+                let local = {
+                    let (backend, _) = guard.parts();
+                    if backend.platform_status().available() {
+                        backend.list_platform_credentials().ok()
+                    } else {
+                        None
+                    }
+                };
+                let _ = guard.complete(|_, _| Ok(()));
+                local
+            }
+            Err(_) => None,
+        };
+        key_infos_with_local(&h, local.as_deref())
     } else if has_vault {
-        read_keys_from_file(&path)?
+        read_keys_from_file(path)?
     } else {
         Vec::new()
     };
@@ -705,7 +1116,9 @@ fn query_platform_status(
     ed: edition::Edition,
 ) -> Result<PlatformStatusInfo> {
     require_windows_hello_single(ed)?;
-    state.with_lock(|g| {
+    // The header read is plain file I/O under the short lock; every native call (IsUVPAA, session
+    // queries, RP-scoped credential listing) runs on the leased backend with the lock released.
+    let (mut guard, header) = KeyOperationGuard::begin_native(state, |g| {
         let header = match g.vault.as_ref() {
             // Vault exposes no header accessor; use its checked persisted header.
             Some(v) => Some(vault::Vault::read_header(&v.path, ed).map_err(|e| e.to_string())?),
@@ -717,16 +1130,17 @@ fn query_platform_status(
         if let Some(h) = header.as_ref() {
             vault::check_header_edition(h, ed).map_err(|e| e.to_string())?;
         }
-        let status = g.backend.platform_status();
+        Ok(header)
+    })?;
+    let info = (|| -> Result<PlatformStatusInfo> {
+        let (backend, _) = guard.parts();
+        let status = backend.platform_status();
         let mut local_credential = false;
         if status.available() {
             if let Some(h) = header {
                 // RP-scoped membership also recognizes R3 marker-lost slots.
                 // This is a query only: do not repair or persist the header here.
-                let local = g
-                    .backend
-                    .list_platform_credentials()
-                    .map_err(|e| e.to_string())?;
+                let local = backend.list_platform_credentials().map_err(|e| e.to_string())?;
                 for slot in &h.key_slots {
                     let id = crypto::base64_decode(&slot.credential_id)
                         .map_err(|_| "credential_id 解碼失敗".to_string())?;
@@ -740,7 +1154,8 @@ fn query_platform_status(
             console: status.console,
             local_credential,
         })
-    })
+    })();
+    guard.complete(|_, _| info)
 }
 
 fn require_windows_hello_single(ed: edition::Edition) -> Result<()> {
@@ -750,7 +1165,7 @@ fn require_windows_hello_single(ed: edition::Edition) -> Result<()> {
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn platform_status(state: tauri::State<VaultState>) -> Result<PlatformStatusInfo> {
     query_platform_status(&state, &path_from_state_or_default(), edition::current())
 }
@@ -785,21 +1200,34 @@ fn register_windows_hello_inner_with_clock(
     mut clock: impl FnMut() -> std::time::Instant,
 ) -> Result<RegisterResult> {
     require_windows_hello_single(ed)?;
-    state.with_lock(|g| {
+    let (mut guard, stale) = KeyOperationGuard::begin(state, true, |g| {
         if g.vault.is_none() {
             return Err("金庫未解鎖".to_string());
         }
         let now = clock();
-        sweep_expired_registration(g, None, now);
+        // An expired pending is taken out here and cancelled off-lock below.
+        let stale = take_expired_registration(g, None, now);
         require_no_pending_registration(g)?;
-        require_windows_hello_available(g.backend.as_ref())?;
+        Ok(stale)
+    })?;
+    // From here on the state lock is not held: the WebAuthn call may block for a long time.
+    let ceremony = (|| -> Result<_> {
+        if let Some(slot) = stale {
+            guard.cancel_off_lock(slot, "expired");
+        }
+        require_windows_hello_available(&*guard.parts().0)?;
         let name = computer_name()?;
         let owner = raise(true)?;
-        g.backend.set_webauthn_parent_hwnd(owner);
-        let v = g.vault.as_mut().ok_or_else(|| "金庫未解鎖".to_string())?;
+        let (backend, vault) = guard.parts();
+        backend.set_webauthn_parent_hwnd(owner);
+        let v = vault.ok_or_else(|| "金庫未解鎖".to_string())?;
         let vault_path = v.path.clone();
-        let outcome = v.begin_register_windows_hello(g.backend.as_mut(), &name, ed);
+        let outcome = v.begin_register_windows_hello(backend, &name, ed);
         let cleanup_report = v.take_registration_cleanup_report();
+        Ok((vault_path, outcome, cleanup_report))
+    })();
+    guard.complete(|g, deferred_lock| {
+        let (vault_path, outcome, cleanup_report) = ceremony?;
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -810,11 +1238,16 @@ fn register_windows_hello_inner_with_clock(
             }
         };
         // 註冊第一階段可能等待使用者操作；pending 的完整期限從返回後起算。
-        Ok(store_registration_outcome(g, outcome, vault_path, clock()))
+        let result = store_registration_outcome(g, outcome, vault_path, clock());
+        if deferred_lock && matches!(result, RegisterResult::HandoffRequired { .. }) {
+            // The deferred lock cancels the pending registration right after this returns.
+            return Err(KEY_OPERATION_LOCKED_MSG.to_string());
+        }
+        Ok(result)
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn register_windows_hello(
     window: tauri::WebviewWindow,
     state: tauri::State<VaultState>,
@@ -853,10 +1286,7 @@ fn schedule_registration_sweep(
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         std::thread::sleep(remaining + std::time::Duration::from_millis(250));
         let state = app.state::<VaultState>();
-        let _ = state.with_lock(|g| {
-            sweep_expired_registration(g, Some(generation), std::time::Instant::now());
-            Ok(())
-        });
+        sweep_expired_registration_off_lock(&state, Some(generation), std::time::Instant::now());
     });
 }
 
@@ -886,7 +1316,7 @@ fn continue_registration_inner(
     raise: impl FnOnce(bool) -> Result<isize>,
     mut clock: impl FnMut() -> std::time::Instant,
 ) -> Result<RegisterResult> {
-    state.with_lock(|g| {
+    let (mut guard, expired_at_start) = KeyOperationGuard::begin(state, true, |g| {
         let Some(vault_path) = g.vault.as_ref().map(|v| v.path.clone()) else {
             return Err("金庫未解鎖".to_string());
         };
@@ -898,7 +1328,22 @@ fn continue_registration_inner(
             });
         };
         if clock() >= slot.deadline || slot.vault_path != vault_path {
-            let cleanup = cancel_pending_registration(g);
+            // Cancelled below, by the operation that owns the backend lease (outside the lock).
+            return Ok(true);
+        }
+        if slot.pending.is_platform() {
+            require_windows_hello_single(ed)?;
+        }
+        Ok(false)
+    })?;
+    // The state lock is not held while the foreground is confirmed or the assertion runs.
+    let ceremony = (|| -> Result<_> {
+        if expired_at_start {
+            let slot = guard.with_state(|g| g.pending_registration.take());
+            let cleanup = match slot {
+                Some(slot) => guard.cancel_off_lock(slot, "implicit"),
+                None => RegistrationCleanup::None,
+            };
             return Err(format!(
                 "註冊確認已逾時或金庫已變更，已取消本次註冊（金庫未新增金鑰槽）。{}",
                 if cleanup == RegistrationCleanup::ManualRemovalRequired {
@@ -908,36 +1353,49 @@ fn continue_registration_inner(
                 }
             ));
         }
-        if slot.pending.is_platform() {
-            require_windows_hello_single(ed)?;
-        }
         // 視窗無法成為前景時保留 pending，使用者可再按一次或取消。
         let owner = raise(true)?;
-        // 前景確認本身可能跨過期限；在消耗 pending 前再核對鎖內的即時時鐘。
-        if clock() >= g.pending_registration.as_ref().expect("pending under lock").deadline {
-            let cleanup = cancel_pending_registration(g);
-            return Err(format!(
-                "註冊確認已逾時，已取消本次註冊（金庫未新增金鑰槽）。{}",
-                if cleanup == RegistrationCleanup::ManualRemovalRequired {
-                    "本次建立的 Windows Hello 憑證未能自動刪除，請到「設定 → 帳戶 → 通行金鑰」只刪除本次測試項目。"
-                } else {
-                    ""
-                }
-            ));
+        // 前景確認本身可能跨過期限；在消耗 pending 前再核對即時時鐘。
+        enum Taken {
+            Missing,
+            Expired(PendingRegistrationSlot),
+            Live(PendingRegistrationSlot),
         }
+        let taken = guard.with_state(|g| match g.pending_registration.take() {
+            None => Taken::Missing,
+            Some(slot) if clock() >= slot.deadline => Taken::Expired(slot),
+            Some(slot) => Taken::Live(slot),
+        });
+        let slot = match taken {
+            Taken::Missing => return Err("沒有待完成的金鑰註冊；請重新註冊".to_string()),
+            Taken::Expired(slot) => {
+                let cleanup = guard.cancel_off_lock(slot, "implicit");
+                return Err(format!(
+                    "註冊確認已逾時，已取消本次註冊（金庫未新增金鑰槽）。{}",
+                    if cleanup == RegistrationCleanup::ManualRemovalRequired {
+                        "本次建立的 Windows Hello 憑證未能自動刪除，請到「設定 → 帳戶 → 通行金鑰」只刪除本次測試項目。"
+                    } else {
+                        ""
+                    }
+                ));
+            }
+            Taken::Live(slot) => slot,
+        };
         let PendingRegistrationSlot {
             pending,
             deadline,
             vault_path,
             generation,
-        } = g
-            .pending_registration
-            .take()
-            .ok_or_else(|| "沒有待完成的金鑰註冊；請重新註冊".to_string())?;
-        g.backend.set_webauthn_parent_hwnd(owner);
-        let v = g.vault.as_mut().ok_or_else(|| "金庫未解鎖".to_string())?;
-        let outcome = v.continue_registration(g.backend.as_mut(), pending, ed);
+        } = slot;
+        let (backend, vault) = guard.parts();
+        backend.set_webauthn_parent_hwnd(owner);
+        let v = vault.ok_or_else(|| "金庫未解鎖".to_string())?;
+        let outcome = v.continue_registration(backend, pending, ed);
         let cleanup_report = v.take_registration_cleanup_report();
+        Ok((outcome, cleanup_report, deadline, vault_path, generation))
+    })();
+    guard.complete(|g, deferred_lock| {
+        let (outcome, cleanup_report, deadline, vault_path, generation) = ceremony?;
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -957,6 +1415,10 @@ fn continue_registration_inner(
                     vault_path,
                     generation,
                 });
+                if deferred_lock {
+                    // The deferred lock cancels this pending registration right after we return.
+                    return Err(KEY_OPERATION_LOCKED_MSG.to_string());
+                }
                 Ok(RegisterResult::HandoffRequired {
                     message: fido2::FidoError::ForegroundHandoffRequired.to_string(),
                 })
@@ -965,7 +1427,7 @@ fn continue_registration_inner(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn continue_registration(
     window: tauri::WebviewWindow,
     state: tauri::State<VaultState>,
@@ -979,15 +1441,27 @@ fn continue_registration(
 }
 
 fn cancel_registration_inner(state: &VaultState) -> Result<CancelRegistrationInfo> {
-    state.with_lock(|g| {
+    // The pending registration is taken under the short lock; the platform list/delete that
+    // proves and removes the credential runs on the leased backend with the lock released.
+    let (mut guard, (slot, idle_status)) = KeyOperationGuard::begin_native(state, |g| {
+        Ok(match g.pending_registration.take() {
+            Some(slot) => (Some(slot), RegistrationCleanup::None),
+            None => (None, no_pending_cleanup_status(g)),
+        })
+    })?;
+    let cleanup = match slot {
+        Some(slot) => guard.cancel_off_lock(slot, "implicit"),
+        None => idle_status,
+    };
+    guard.complete(|_, _| {
         Ok(CancelRegistrationInfo {
             status: "cancelled",
-            cleanup: cancel_pending_registration(g),
+            cleanup,
         })
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn cancel_registration(state: tauri::State<VaultState>) -> Result<CancelRegistrationInfo> {
     cancel_registration_inner(&state)
 }
@@ -1100,24 +1574,23 @@ fn login_windows_hello_inner(
     raise: impl FnOnce(bool) -> Result<isize>,
 ) -> Result<Vec<vault::Entry>> {
     require_windows_hello_single(ed)?;
-    state.with_lock(|g| {
-        require_windows_hello_available(g.backend.as_ref())?;
+    let (mut guard, ()) = KeyOperationGuard::begin_login(state, |_| Ok(()))?;
+    let opened = (|| -> Result<vault::Vault> {
+        // The capability probe is a native call: it runs on the leased backend, off the lock.
+        require_windows_hello_available(&*guard.parts().0)?;
         let owner = raise(true)?;
-        g.backend.set_webauthn_parent_hwnd(owner);
-        let v = vault::Vault::open_windows_hello(path, g.backend.as_mut(), ed)
-            .map_err(|e| e.to_string())?;
-        let entries = v.entries().to_vec();
-        // Authentication, successful persistence and publication share one lock.
-        // A concurrent lock command cannot interleave and be undone by login.
+        let (backend, _) = guard.parts();
+        backend.set_webauthn_parent_hwnd(owner);
+        vault::Vault::open_windows_hello(path, backend, ed).map_err(|e| e.to_string())
+    })();
+    // Late lock requests during lock-free cleanup also discard the result.
+    guard.complete_login(opened, |g| {
         g.pending_csv_import = None;
         g.dual_pending = None;
-        cancel_pending_registration(g);
-        g.vault = Some(v);
-        Ok(entries)
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn login_windows_hello(
     window: tauri::WebviewWindow,
     state: tauri::State<VaultState>,
@@ -1131,28 +1604,62 @@ fn login_windows_hello(
 }
 
 /// 首次執行：建立帳號（主密碼）。
-#[tauri::command]
+#[tauri::command(async)]
 fn create_vault(state: tauri::State<VaultState>, password: String) -> Result<()> {
-    if password.len() < 8 {
-        return Err("主密碼至少 8 個字元".into());
-    }
-    let path = path_from_state_or_default();
-    if path.exists() {
-        return Err("vault.db 已存在（請改走登入）".into());
-    }
-    let v = vault::Vault::create_for(&path, &password, edition::current())
-        .map_err(|e| e.to_string())?;
-    state.with_lock(|g| {
+    create_vault_inner(
+        &state,
+        &path_from_state_or_default(),
+        &password,
+        edition::current(),
+    )
+}
+
+fn create_vault_inner(
+    state: &VaultState,
+    path: &std::path::Path,
+    password: &str,
+    ed: edition::Edition,
+) -> Result<()> {
+    create_vault_inner_with_hook(state, path, password, ed, || {})
+}
+
+/// `after_reservation` runs right after the creation has been reserved (before any exists/KDF/file
+/// work); tests use it to park the first creation.
+fn create_vault_inner_with_hook(
+    state: &VaultState,
+    path: &std::path::Path,
+    password: &str,
+    ed: edition::Edition,
+    after_reservation: impl FnOnce(),
+) -> Result<()> {
+    // The reservation is taken before any exists/KDF/file work and held until the vault is
+    // published: it excludes every other creation and every key operation.
+    let (guard, ()) = KeyOperationGuard::begin_native(state, |_| Ok(()))?;
+    after_reservation();
+    let created = (|| -> Result<vault::Vault> {
+        if password.len() < 8 {
+            return Err("主密碼至少 8 個字元".into());
+        }
+        if path.exists() {
+            return Err("vault.db 已存在（請改走登入）".into());
+        }
+        vault::Vault::create_for(path, password, ed).map_err(|e| e.to_string())
+    })();
+    guard.complete(|g, deferred_lock| {
+        let v = created?;
+        if deferred_lock {
+            drop(v.lock());
+            return Err(KEY_OPERATION_LOCKED_MSG.to_string());
+        }
         g.dual_pending = None;
-        cancel_pending_registration(g);
+        queue_pending_cancellation(g, "implicit");
         g.vault = Some(v);
         Ok(())
-    })?;
-    Ok(())
+    })
 }
 
 /// 主密碼登入。
-#[tauri::command]
+#[tauri::command(async)]
 fn login_password(state: tauri::State<VaultState>, password: String) -> Result<Vec<vault::Entry>> {
     login_password_inner(
         &state,
@@ -1168,67 +1675,81 @@ fn login_password_inner(
     password: &str,
     ed: edition::Edition,
 ) -> Result<Vec<vault::Entry>> {
-    state.with_lock(|g| {
-        let v = if ed == edition::Edition::Single {
-            vault::Vault::open_password_with_platform(path, password, ed, g.backend.as_mut())
+    // Platform repair may call native list APIs: the backend is leased, the lock is released.
+    let (mut guard, ()) = KeyOperationGuard::begin_native(state, |_| Ok(()))?;
+    let opened = (|| -> Result<vault::Vault> {
+        if ed == edition::Edition::Single {
+            vault::Vault::open_password_with_platform(path, password, ed, guard.parts().0)
         } else {
             vault::Vault::open_password_for(path, password, ed)
         }
-        .map_err(|e| e.to_string())?;
-        let entries = v.entries().to_vec();
-        // 改用主密碼登入：放棄進行中的兩步驟登入（share 清零）。
-        g.dual_pending = None;
-        cancel_pending_registration(g);
-        g.vault = Some(v);
-        Ok(entries)
-    })
+        .map_err(|e| e.to_string())
+    })();
+    guard.complete_login(opened, |g| g.dual_pending = None)
 }
 
 /// FIDO2 金鑰登入。pin：PIN 型金鑰必填；其他類型忽略。
-#[tauri::command]
+#[tauri::command(async)]
 fn login_key(
     window: tauri::WebviewWindow,
     state: tauri::State<VaultState>,
     credential_id: String,
     pin: Option<String>,
 ) -> Result<Vec<vault::Entry>> {
-    let require_foreground = state.with_lock(|g| Ok(g.backend.uses_brokered_key_selection()))?;
-    let owner_hwnd = raise_key_operation_window(&window, require_foreground)?;
-    let path = path_from_state_or_default();
-    let v = state.with_lock(|g| {
-        g.backend.set_webauthn_parent_hwnd(owner_hwnd);
-        vault::Vault::open_key(&path, &credential_id, pin.as_deref(), g.backend.as_mut())
-            .map_err(|e| e.to_string())
+    login_key_inner(
+        &state,
+        &path_from_state_or_default(),
+        &credential_id,
+        pin.as_deref(),
+        |required| raise_key_operation_window(&window, required),
+    )
+}
+
+fn login_key_inner(
+    state: &VaultState,
+    path: &std::path::Path,
+    credential_id: &str,
+    pin: Option<&str>,
+    raise: impl FnOnce(bool) -> Result<isize>,
+) -> Result<Vec<vault::Entry>> {
+    let (mut guard, require_foreground) = KeyOperationGuard::begin_login(state, |g| {
+        Ok(g.backend.uses_brokered_key_selection())
     })?;
-    let entries = v.entries().to_vec();
-    state.with_lock(|g| {
-        cancel_pending_registration(g);
-        g.vault = Some(v);
-        Ok(())
-    })?;
-    Ok(entries)
+    let opened = (|| -> Result<vault::Vault> {
+        let owner_hwnd = raise(require_foreground)?;
+        let (backend, _) = guard.parts();
+        backend.set_webauthn_parent_hwnd(owner_hwnd);
+        vault::Vault::open_key(path, credential_id, pin, backend).map_err(|e| e.to_string())
+    })();
+    guard.complete_login(opened, |_| {})
 }
 
 /// FIDO2 key login without a UI-selected key; let the active backend select from every vault slot.
-#[tauri::command]
+#[tauri::command(async)]
 fn login_any_key(
     window: tauri::WebviewWindow,
     state: tauri::State<VaultState>,
 ) -> Result<Vec<vault::Entry>> {
-    let require_foreground = state.with_lock(|g| Ok(g.backend.uses_brokered_key_selection()))?;
-    let owner_hwnd = raise_key_operation_window(&window, require_foreground)?;
-    let path = path_from_state_or_default();
-    let v = state.with_lock(|g| {
-        g.backend.set_webauthn_parent_hwnd(owner_hwnd);
-        vault::Vault::open_any_key(&path, None, g.backend.as_mut()).map_err(|e| e.to_string())
+    login_any_key_inner(&state, &path_from_state_or_default(), |required| {
+        raise_key_operation_window(&window, required)
+    })
+}
+
+fn login_any_key_inner(
+    state: &VaultState,
+    path: &std::path::Path,
+    raise: impl FnOnce(bool) -> Result<isize>,
+) -> Result<Vec<vault::Entry>> {
+    let (mut guard, require_foreground) = KeyOperationGuard::begin_login(state, |g| {
+        Ok(g.backend.uses_brokered_key_selection())
     })?;
-    let entries = v.entries().to_vec();
-    state.with_lock(|g| {
-        cancel_pending_registration(g);
-        g.vault = Some(v);
-        Ok(())
-    })?;
-    Ok(entries)
+    let opened = (|| -> Result<vault::Vault> {
+        let owner_hwnd = raise(require_foreground)?;
+        let (backend, _) = guard.parts();
+        backend.set_webauthn_parent_hwnd(owner_hwnd);
+        vault::Vault::open_any_key(path, None, backend).map_err(|e| e.to_string())
+    })();
+    guard.complete_login(opened, |_| {})
 }
 
 /// 雙人版兩步驟登入第一步的回應（不含任何機密）。
@@ -1250,27 +1771,57 @@ fn require_dual_edition() -> Result<()> {
 }
 
 /// 雙人版金鑰登入第一步：任一群組的金鑰。成功後暫存該群組 share 並開始倒數。
-#[tauri::command]
+#[tauri::command(async)]
 fn login_dual_begin(
     window: tauri::WebviewWindow,
     state: tauri::State<VaultState>,
     pin: Option<String>,
 ) -> Result<DualBeginInfo> {
     require_dual_edition()?;
-    let require_foreground = state.with_lock(|g| Ok(g.backend.uses_brokered_key_selection()))?;
-    let owner_hwnd = raise_key_operation_window(&window, require_foreground)?;
-    let path = path_from_state_or_default();
-    state.with_lock(|g| {
+    let app = window.app_handle().clone();
+    login_dual_begin_inner(
+        &state,
+        &path_from_state_or_default(),
+        pin.as_deref(),
+        |required| raise_key_operation_window(&window, required),
+        move |generation, remaining| {
+            // Rust 端主動逾時清除，不依賴前端呼叫（§4.3、R5）。
+            std::thread::spawn(move || {
+                std::thread::sleep(remaining + std::time::Duration::from_millis(250));
+                let state = app.state::<VaultState>();
+                let _ = state.with_lock(|g| {
+                    sweep_expired_dual(g, generation, std::time::Instant::now());
+                    Ok(())
+                });
+            });
+        },
+    )
+}
+
+fn login_dual_begin_inner(
+    state: &VaultState,
+    path: &std::path::Path,
+    pin: Option<&str>,
+    raise: impl FnOnce(bool) -> Result<isize>,
+    schedule_expiry: impl FnOnce(u64, std::time::Duration),
+) -> Result<DualBeginInfo> {
+    let (mut guard, require_foreground) = KeyOperationGuard::begin_login(state, |g| {
+        Ok(g.backend.uses_brokered_key_selection())
+    })?;
+    let begun = (|| -> Result<_> {
+        let owner_hwnd = raise(require_foreground)?;
+        let (backend, _) = guard.parts();
+        backend.set_webauthn_parent_hwnd(owner_hwnd);
+        vault::Vault::dual_login_begin(path, pin, backend, &mut std::time::Instant::now)
+            .map_err(|e| e.to_string())
+    })();
+    guard.complete(|g, deferred_lock| {
         // 新的第一步一律先丟棄舊的暫存（清零），避免殘留 share。
         g.dual_pending = None;
-        g.backend.set_webauthn_parent_hwnd(owner_hwnd);
-        let pending = vault::Vault::dual_login_begin(
-            &path,
-            pin.as_deref(),
-            g.backend.as_mut(),
-            &mut std::time::Instant::now,
-        )
-        .map_err(|e| e.to_string())?;
+        let pending = begun?;
+        if deferred_lock {
+            return Err(KEY_OPERATION_LOCKED_MSG.to_string());
+        }
         let remaining = pending.remaining(std::time::Instant::now());
         let info = DualBeginInfo {
             first_group: pending.first_group(),
@@ -1282,58 +1833,63 @@ fn login_dual_begin(
         g.dual_generation = g.dual_generation.wrapping_add(1);
         let generation = g.dual_generation;
         g.dual_pending = Some(pending);
-        // Rust 端主動逾時清除，不依賴前端呼叫（§4.3、R5）。
-        let app = window.app_handle().clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(remaining + std::time::Duration::from_millis(250));
-            let state = app.state::<VaultState>();
-            let _ = state.with_lock(|g| {
-                sweep_expired_dual(g, generation, std::time::Instant::now());
-                Ok(())
-            });
-        });
+        schedule_expiry(generation, remaining);
         Ok(info)
     })
 }
 
 /// 雙人版金鑰登入第二步：只接受另一群組的金鑰。無論成功或失敗，暫存都會被取走（一次性）。
-#[tauri::command]
+#[tauri::command(async)]
 fn login_dual_complete(
     window: tauri::WebviewWindow,
     state: tauri::State<VaultState>,
     pin: Option<String>,
 ) -> Result<Vec<vault::Entry>> {
     require_dual_edition()?;
-    let require_foreground = state.with_lock(|g| Ok(g.backend.uses_brokered_key_selection()))?;
-    let owner_hwnd = raise_key_operation_window(&window, require_foreground)?;
-    let v = state.with_lock(|g| {
-        let pending = g
-            .dual_pending
-            .take()
-            .ok_or_else(|| "沒有進行中的第一步驗證，請從第一步重新開始".to_string())?;
-        g.backend.set_webauthn_parent_hwnd(owner_hwnd);
-        vault::Vault::dual_login_complete(
-            pending,
-            pin.as_deref(),
-            g.backend.as_mut(),
-            &mut std::time::Instant::now,
-        )
-        .map_err(|e| e.to_string())
+    login_dual_complete_inner(&state, pin.as_deref(), |required| {
+        raise_key_operation_window(&window, required)
+    })
+}
+
+fn login_dual_complete_inner(
+    state: &VaultState,
+    pin: Option<&str>,
+    raise: impl FnOnce(bool) -> Result<isize>,
+) -> Result<Vec<vault::Entry>> {
+    let (mut guard, require_foreground) = KeyOperationGuard::begin_login(state, |g| {
+        Ok(g.backend.uses_brokered_key_selection())
     })?;
-    let entries = v.entries().to_vec();
-    state.with_lock(|g| {
-        cancel_pending_registration(g);
-        g.vault = Some(v);
-        Ok(())
-    })?;
-    Ok(entries)
+    let opened = (|| -> Result<vault::Vault> {
+        let owner_hwnd = raise(require_foreground)?;
+        // 取走第一步暫存（一次性）；前景失敗時暫存保留，使用者可重試。
+        let pending = guard.with_state(|g| {
+            g.dual_pending
+                .take()
+                .ok_or_else(|| "沒有進行中的第一步驗證，請從第一步重新開始".to_string())
+        })?;
+        let (backend, _) = guard.parts();
+        backend.set_webauthn_parent_hwnd(owner_hwnd);
+        vault::Vault::dual_login_complete(pending, pin, backend, &mut std::time::Instant::now)
+            .map_err(|e| e.to_string())
+    })();
+    guard.complete_login(opened, |_| {})
 }
 
 /// 雙人版：取消進行中的兩步驟登入（記 sidecar，share 清零）。沒有暫存時為 no-op。
 #[tauri::command]
 fn login_dual_cancel(state: tauri::State<VaultState>) -> Result<()> {
     require_dual_edition()?;
-    let pending = state.with_lock(|g| Ok(g.dual_pending.take()))?;
+    login_dual_cancel_inner(&state)
+}
+
+/// Refused while a key operation runs: a "successful" cancel must never be followed by that
+/// operation still publishing (or storing) its result. The UI's own in-flight lock is no
+/// substitute for this IPC-level contract.
+fn login_dual_cancel_inner(state: &VaultState) -> Result<()> {
+    let pending = state.with_lock(|g| {
+        require_key_operation_idle(g)?;
+        Ok(g.dual_pending.take())
+    })?;
     if let Some(pending) = pending {
         pending.cancel().map_err(|e| e.to_string())?;
     }
@@ -1341,47 +1897,103 @@ fn login_dual_cancel(state: tauri::State<VaultState>) -> Result<()> {
 }
 
 /// 上鎖（手動或閒置）。回傳登入畫面資訊。
-#[tauri::command]
+#[tauri::command(async)]
 fn lock(state: tauri::State<VaultState>, reason: Option<String>) -> Result<LoginScreenInfo> {
     lock_inner(&state, reason)
 }
 
 fn lock_inner(state: &VaultState, reason: Option<String>) -> Result<LoginScreenInfo> {
-    let (header, brokered_key_login) = state.with_lock(|g| {
-        let brokered_key_login = g.backend.uses_brokered_key_selection();
-        g.dual_pending = None;
-        // 上鎖/登出：放棄未完成的註冊（Windows Hello 刪除本次 credential，秘密清零）。
-        cancel_pending_registration_with_reason(g, "locked");
-        match g.vault.take() {
-            Some(v) => {
-                g.pending_csv_import = None;
-                Ok((
-                    if reason.as_deref() == Some("idle") {
-                        v.auto_lock()
-                    } else {
-                        v.lock()
-                    },
-                    brokered_key_login,
-                ))
-            }
-            None => Err("尚未解鎖".to_string()),
+    lock_inner_at(
+        state,
+        reason,
+        &path_from_state_or_default(),
+        edition::current(),
+    )
+}
+
+/// 上鎖（手動或閒置）。金鑰操作進行中時不等待、不阻塞：只記錄「待上鎖」，由該操作在回傳前完成上鎖；
+/// 此時登入畫面資訊改由金庫檔頭取得（不需要被借出的 backend／金庫）。
+fn lock_inner_at(
+    state: &VaultState,
+    reason: Option<String>,
+    path: &std::path::Path,
+    ed: edition::Edition,
+) -> Result<LoginScreenInfo> {
+    enum Locked {
+        Now(vault::Header, bool),
+        Deferred(bool),
+    }
+    let (outcome, cleanup_guard) = state.with_lock(|g| {
+        if g.key_op.active {
+            g.key_op.pending_lock = Some(reason.clone());
+            return Ok((Ok(Locked::Deferred(g.backend.uses_brokered_key_selection())), None));
         }
+        let locked = lock_locked(g, reason.as_deref())
+            .map(|(header, brokered)| Locked::Now(header, brokered));
+        // A pending registration was abandoned: its platform credential is deleted by a short
+        // lease of the backend, after this lock is released.
+        let cleanup_guard =
+            (!g.key_op.cleanups.is_empty()).then(|| KeyOperationGuard::lease(state, g, false));
+        Ok((locked, cleanup_guard))
     })?;
-    Ok(LoginScreenInfo {
-        has_vault: true,
-        keys: (&header).into(),
-        idle_lock_minutes: 5,
-        brokered_key_login,
+    if let Some(guard) = cleanup_guard {
+        let _ = guard.complete(|_, _| Ok(()));
+    }
+    let outcome = outcome?;
+    Ok(match outcome {
+        Locked::Now(header, brokered_key_login) => LoginScreenInfo {
+            has_vault: true,
+            keys: (&header).into(),
+            idle_lock_minutes: 5,
+            brokered_key_login,
+        },
+        Locked::Deferred(brokered_key_login) => LoginScreenInfo {
+            has_vault: path.exists(),
+            keys: vault::Vault::read_header(path, ed)
+                .map(|header| key_infos(&header))
+                .unwrap_or_default(),
+            idle_lock_minutes: 5,
+            brokered_key_login,
+        },
     })
+}
+
+/// The immediate lock: abandon pending work, drop and lock the unlocked vault. The abandoned
+/// pending registration is queued (`key_op.cleanups`); whoever holds the backend lease deletes
+/// its platform credential outside the lock.
+fn lock_locked(g: &mut AppInner, reason: Option<&str>) -> Result<(vault::Header, bool)> {
+    let brokered_key_login = g.backend.uses_brokered_key_selection();
+    g.dual_pending = None;
+    // 上鎖/登出：放棄未完成的註冊（Windows Hello 刪除本次 credential，秘密清零）。
+    queue_pending_cancellation(g, "locked");
+    match g.vault.take() {
+        Some(v) => {
+            g.pending_csv_import = None;
+            Ok((
+                if reason == Some("idle") {
+                    v.auto_lock()
+                } else {
+                    v.lock()
+                },
+                brokered_key_login,
+            ))
+        }
+        None => Err("尚未解鎖".to_string()),
+    }
 }
 
 fn with_unlocked<R>(
     state: &VaultState,
     f: impl FnOnce(&mut vault::Vault) -> Result<R>,
 ) -> Result<R> {
-    state.with_lock(|g| match g.vault.as_mut() {
-        Some(v) => f(v),
-        None => Err("金庫未解鎖".to_string()),
+    state.with_lock(|g| {
+        // Busy / lock-pending is decided first: a present vault is only trusted when no key
+        // operation is running and no lock request is waiting to be executed.
+        require_vault_readable(g)?;
+        match g.vault.as_mut() {
+            Some(v) => f(v),
+            None => Err("金庫未解鎖".to_string()),
+        }
     })
 }
 
@@ -1414,6 +2026,7 @@ async fn preview_csv_import(
     let parsed = csv_import::parse_import_csv(text)?;
 
     state.with_lock(|inner| {
+        require_vault_readable(inner)?;
         let vault = inner
             .vault
             .as_ref()
@@ -1468,7 +2081,12 @@ fn apply_csv_import(
     state: tauri::State<VaultState>,
     token: String,
 ) -> Result<csv_import::ImportPreview> {
+    apply_csv_import_inner(&state, token)
+}
+
+fn apply_csv_import_inner(state: &VaultState, token: String) -> Result<csv_import::ImportPreview> {
     state.with_lock(|inner| {
+        require_key_operation_idle(inner)?;
         let (parsed, expected_fingerprint) = inner
             .pending_csv_import
             .as_ref()
@@ -1543,7 +2161,7 @@ fn list_audit(state: tauri::State<VaultState>) -> Result<Vec<vault::AuditEvent>>
     with_unlocked(&state, |v| Ok(v.audit().to_vec()))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn register_key(
     window: tauri::WebviewWindow,
     state: tauri::State<VaultState>,
@@ -1569,28 +2187,34 @@ fn register_key_inner(
     label: &str,
     group: Option<crypto::KeyGroup>,
 ) -> Result<RegisterResult> {
-    let require_foreground = state.with_lock(|g| {
-        sweep_expired_registration(g, None, std::time::Instant::now());
+    let (mut guard, (require_foreground, stale)) = KeyOperationGuard::begin(state, true, |g| {
+        // An expired pending is taken out here and cancelled off-lock below.
+        let stale = take_expired_registration(g, None, std::time::Instant::now());
         require_no_pending_registration(g)?;
-        Ok(g.backend.uses_brokered_key_selection())
+        Ok((g.backend.uses_brokered_key_selection(), stale))
     })?;
-    let owner_hwnd = raise(require_foreground)?;
     // 同一後端實例內 detect+register → 類型一致。
-    state.with_lock(|g| {
-        require_no_pending_registration(g)?;
-        let v = g.vault.as_mut().ok_or_else(|| "金庫未解鎖".to_string())?;
-        g.backend.set_webauthn_parent_hwnd(owner_hwnd);
+    let ceremony = (|| -> Result<_> {
+        if let Some(slot) = stale {
+            guard.cancel_off_lock(slot, "expired");
+        }
+        let owner_hwnd = raise(require_foreground)?;
+        let (backend, vault) = guard.parts();
+        let v = vault.ok_or_else(|| "金庫未解鎖".to_string())?;
+        backend.set_webauthn_parent_hwnd(owner_hwnd);
         // 單人版不可帶群組、雙人版必須帶群組（vault 層 fail closed，不碰 authenticator）。
         let outcome = v
-            .begin_register_key_for(g.backend.as_mut(), pin, label, group)
+            .begin_register_key_for(backend, pin, label, group)
             .map_err(|e| e.to_string())?;
-        let vault_path = v.path.clone();
-        Ok(store_registration_outcome(
-            g,
-            outcome,
-            vault_path,
-            std::time::Instant::now(),
-        ))
+        Ok((outcome, v.path.clone()))
+    })();
+    guard.complete(|g, deferred_lock| {
+        let (outcome, vault_path) = ceremony?;
+        let result = store_registration_outcome(g, outcome, vault_path, std::time::Instant::now());
+        if deferred_lock && matches!(result, RegisterResult::HandoffRequired { .. }) {
+            return Err(KEY_OPERATION_LOCKED_MSG.to_string());
+        }
+        Ok(result)
     })
 }
 
@@ -1623,7 +2247,7 @@ enum KeyRemovalWarning {
     DeleteFailed,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn remove_key(
     state: tauri::State<VaultState>,
     credential_id: String,
@@ -1636,19 +2260,25 @@ fn remove_key_inner(
     credential_id: &str,
     ed: edition::Edition,
 ) -> Result<Option<KeyRemovalInfo>> {
-    state.with_lock(|g| {
+    // The vault and backend are leased: platform discovery/deletion and the vault save run with the
+    // state lock released.
+    let (mut guard, ()) = KeyOperationGuard::begin(state, true, |g| {
         if g.vault.is_none() {
             return Err("金庫未解鎖".to_string());
         }
-        // 金鑰清單即將改變：先放棄未完成的註冊（UI 在 pending 期間也停用移除）。
-        cancel_pending_registration(g);
-        let v = g.vault.as_mut().ok_or_else(|| "金庫未解鎖".to_string())?;
+        // 金鑰清單即將改變：先放棄未完成的註冊（由本操作在鎖外取消）。
+        queue_pending_cancellation(g, "implicit");
+        Ok(())
+    })?;
+    let removed = (|| -> Result<Option<KeyRemovalInfo>> {
+        let (backend, vault) = guard.parts();
+        let v = vault.ok_or_else(|| "金庫未解鎖".to_string())?;
         if ed == edition::Edition::Dual {
             v.remove_key(credential_id).map_err(|e| e.to_string())?;
             return Ok(None); // Preserve the existing dual JSON null response.
         }
         let outcome = v
-            .remove_key_with_platform(credential_id, g.backend.as_mut(), ed)
+            .remove_key_with_platform(credential_id, backend, ed)
             .map_err(|e| e.to_string())?;
         Ok(match outcome {
             vault::PlatformCleanupOutcome::NotApplicable => None,
@@ -1663,7 +2293,8 @@ fn remove_key_inner(
                 }))
             }
         })
-    })
+    })();
+    guard.complete(|_, _| removed)
 }
 
 #[tauri::command]
@@ -1721,7 +2352,7 @@ fn clear_clipboard_if_matches(app: tauri::AppHandle, expected: String) -> Result
 }
 
 /// 偵測金鑰（註冊前預覽：類型 + label）。**不消耗**後端狀態 → 與緊接的 register_key 一致。
-#[tauri::command]
+#[tauri::command(async)]
 fn detect_key(state: tauri::State<VaultState>) -> Result<fido2::DetectedKey> {
     state.with_lock(|g| detected_key_preview(g.backend.as_ref()))
 }
@@ -1835,6 +2466,39 @@ mod wh_d5_tests {
     use fido2::{FidoBackend, FidoError, MockBackend, PlatformStatus};
     use std::sync::{Arc, Mutex};
 
+    /// In-lock cancellation through `g.backend`; kept for tests of the receipt rules only.
+    fn cancel_pending_registration_with_reason(
+        g: &mut AppInner,
+        reason: &'static str,
+    ) -> RegistrationCleanup {
+        let Some(slot) = g.pending_registration.take() else {
+            return no_pending_cleanup_status(g);
+        };
+        let done = cancel_slot_with_backend(g.backend.as_mut(), slot, reason);
+        record_cancelled_registration(g, &done);
+        done.cleanup
+    }
+
+    /// 已逾時的 pending 註冊視同取消（in-lock，僅供測試；正式路徑一律走 `*_off_lock`）。
+    fn sweep_expired_registration(
+        g: &mut AppInner,
+        generation: Option<u64>,
+        now: std::time::Instant,
+    ) -> bool {
+        if g.key_op.active {
+            // The real backend is leased out; the operation (or its completion) owns the cleanup.
+            return false;
+        }
+        let expired = g.pending_registration.as_ref().is_some_and(|slot| {
+            now >= slot.deadline && generation.is_none_or(|generation| generation == slot.generation)
+        });
+        if expired {
+            cancel_pending_registration_with_reason(g, "expired");
+        }
+        expired
+    }
+
+
     #[derive(Default)]
     struct Calls {
         status: usize,
@@ -1851,6 +2515,44 @@ mod wh_d5_tests {
         clock_ms: Option<Arc<std::sync::atomic::AtomicU64>>,
         assert_error_from: Option<usize>,
         wrong_prf_from: Option<usize>,
+        // D9-F2 R2: park the calling thread inside a native call (the leased/unlocked phase).
+        hold_status: Option<Arc<Hold>>,
+        hold_list: Option<Arc<Hold>>,
+        hold_delete: Option<Arc<Hold>>,
+    }
+
+    /// Parks the thread that calls `park` until the test releases it (20 s safety timeout).
+    struct Hold {
+        entered: Mutex<std::sync::mpsc::Sender<()>>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl Hold {
+        fn park(&self) {
+            let _ = self.entered.lock().unwrap().send(());
+            let _ = self
+                .release
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(20));
+        }
+    }
+
+    struct HoldTicket {
+        entered: std::sync::mpsc::Receiver<()>,
+        release: std::sync::mpsc::Sender<()>,
+    }
+
+    fn new_hold() -> (Arc<Hold>, HoldTicket) {
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        (
+            Arc::new(Hold {
+                entered: Mutex::new(entered_tx),
+                release: Mutex::new(release_rx),
+            }),
+            HoldTicket { entered, release },
+        )
     }
 
     struct Recording {
@@ -1912,11 +2614,23 @@ mod wh_d5_tests {
                     console: false,
                 };
             }
+            let hold = c.hold_status.clone();
+            drop(c);
+            if let Some(hold) = hold {
+                hold.park();
+            }
             self.status
         }
         fn list_platform_credentials(&mut self) -> std::result::Result<Vec<Vec<u8>>, FidoError> {
-            let mut c = self.calls.lock().unwrap();
-            c.list += 1;
+            let hold = {
+                let mut c = self.calls.lock().unwrap();
+                c.list += 1;
+                c.hold_list.clone()
+            };
+            if let Some(hold) = hold {
+                hold.park();
+            }
+            let c = self.calls.lock().unwrap();
             if self.list_error || c.list_fail_from.is_some_and(|from| c.list >= from) {
                 return Err(FidoError::Internal("synthetic discovery failure".into()));
             }
@@ -1966,7 +2680,14 @@ mod wh_d5_tests {
             self.mock.get_platform_prf_secret(ids)
         }
         fn delete_platform_credential(&mut self, id: &[u8]) -> std::result::Result<(), FidoError> {
-            self.calls.lock().unwrap().delete += 1;
+            let hold = {
+                let mut c = self.calls.lock().unwrap();
+                c.delete += 1;
+                c.hold_delete.clone()
+            };
+            if let Some(hold) = hold {
+                hold.park();
+            }
             if self.delete_error {
                 return Err(FidoError::Internal("synthetic delete failure".into()));
             }
@@ -2058,6 +2779,7 @@ mod wh_d5_tests {
                 registration_cleanup_receipts: Vec::new(),
                 registration_cleanup_journal: None,
                 registration_cleanup_storage_unavailable: false,
+                key_op: KeyOpState::default(),
             })),
             calls,
         )
@@ -2662,10 +3384,13 @@ mod wh_d5_tests {
         seed_pending(&s, &p);
         let result = login_windows_hello_inner(&s, &p, edition::Edition::Single, |required| {
             assert!(required);
-            assert!(matches!(
-                s.0.try_lock(),
-                Err(std::sync::TryLockError::WouldBlock)
-            ));
+            // D9-F2: the state lock is deliberately NOT held across the foreground/WebAuthn
+            // phase (it used to be: that froze every main-thread command). The operation is
+            // instead marked in flight; publication below still happens under one lock.
+            assert!(matches!(s.0.try_lock(), Ok(g) if g.key_op.active));
+            // The "one lock" promise (publication and clearing of pending state are a single step)
+            // is pinned by `d9f2_r2_login_publication_is_never_observed_half_done` (a sampler on
+            // the state lock) and its negative control for a publication split across two locks.
             Ok(456)
         });
         assert!(result.is_ok(), "successful D4 login must publish entries");
@@ -4356,6 +5081,1434 @@ mod wh_d5_tests {
             );
         }
     }
+    #[test]
+    fn d9f2_substituted_platform_attestation_leaves_no_slot_and_a_durable_warning() {
+        let p = fixture();
+        let v = vault::Vault::create_for(&p, "synthetic-D9F2-password", edition::Edition::Single)
+            .unwrap();
+        let mut b = Recording::new();
+        b.mock = MockBackend::new().with_platform_mode(fido2::MockPlatformMode::Substituted);
+        let (s, c) = state(Some(v), b);
+        let before = std::fs::read(&p).unwrap();
+        let result = d9f1_hello_handoff(&s);
+        assert!(
+            matches!(&result, Err(m) if m.contains("安全性金鑰完成")),
+            "{result:?}"
+        );
+        assert_eq!(std::fs::read(&p).unwrap(), before, "no slot is written");
+        assert!(!d9f1_has_pending(&s));
+        {
+            let c = c.lock().unwrap();
+            assert_eq!(
+                (c.create, c.assert, c.delete),
+                (1, 0, 0),
+                "no platform delete for a non-local credential"
+            );
+        }
+        let receipts = s
+            .with_lock(|g| Ok(g.registration_cleanup_receipts.clone()))
+            .unwrap();
+        assert_eq!(receipts.len(), 1, "{receipts:?}");
+        assert_eq!(receipts[0].reason, "unverified");
+        assert_eq!(
+            receipts[0].cleanup,
+            RegistrationCleanup::ManualRemovalRequired
+        );
+    }
+
+    // ───────────── D9-F2：WebAuthn 指令移出主執行緒 ─────────────
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Gate {
+        RoamingAssertion,
+        PlatformRegister,
+    }
+
+    /// Delegates to `Recording`, but parks the calling thread inside one ceremony call until the
+    /// test releases it (or panics there on request). One-shot: only the first call parks.
+    struct GateBackend {
+        inner: Recording,
+        gate: Gate,
+        armed: Arc<std::sync::atomic::AtomicBool>,
+        panic_instead: bool,
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl GateBackend {
+        fn hold(&self, at: Gate) {
+            if self.gate != at || !self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            let _ = self.entered.send(());
+            let _ = self
+                .release
+                .recv_timeout(std::time::Duration::from_secs(20));
+            if self.panic_instead {
+                panic!("synthetic backend panic inside ceremony");
+            }
+        }
+    }
+
+    impl FidoBackend for GateBackend {
+        fn detect(&mut self) -> std::result::Result<fido2::DetectedKey, FidoError> {
+            self.inner.detect()
+        }
+        fn register_credential(
+            &mut self,
+            d: &fido2::DetectedKey,
+            pin: Option<&str>,
+        ) -> std::result::Result<fido2::RegisteredCredential, FidoError> {
+            self.inner.register_credential(d, pin)
+        }
+        fn get_prf_secret(
+            &mut self,
+            id: &[u8],
+            pin: Option<&str>,
+        ) -> std::result::Result<[u8; 32], FidoError> {
+            self.hold(Gate::RoamingAssertion);
+            self.inner.get_prf_secret(id, pin)
+        }
+        fn prf_supported(&self) -> bool {
+            self.inner.prf_supported()
+        }
+        fn platform_status(&self) -> PlatformStatus {
+            self.inner.platform_status()
+        }
+        fn list_platform_credentials(&mut self) -> std::result::Result<Vec<Vec<u8>>, FidoError> {
+            self.inner.list_platform_credentials()
+        }
+        fn register_platform_credential(
+            &mut self,
+            label: &str,
+            exclude: &[Vec<u8>],
+        ) -> std::result::Result<fido2::PlatformRegistration, FidoError> {
+            self.hold(Gate::PlatformRegister);
+            self.inner.register_platform_credential(label, exclude)
+        }
+        fn get_platform_prf_secret(
+            &mut self,
+            ids: &[Vec<u8>],
+        ) -> std::result::Result<(Vec<u8>, [u8; 32]), FidoError> {
+            self.inner.get_platform_prf_secret(ids)
+        }
+        fn delete_platform_credential(&mut self, id: &[u8]) -> std::result::Result<(), FidoError> {
+            self.inner.delete_platform_credential(id)
+        }
+        fn set_webauthn_parent_hwnd(&mut self, handle: isize) {
+            self.inner.set_webauthn_parent_hwnd(handle)
+        }
+    }
+
+    struct Gated {
+        p: Fixture,
+        state: Arc<VaultState>,
+        calls: Arc<Mutex<Calls>>,
+        entered: std::sync::mpsc::Receiver<()>,
+        release: std::sync::mpsc::Sender<()>,
+        key_id: String,
+    }
+
+    /// `login`: locked vault with one roaming key (gate in the assertion). Otherwise an unlocked
+    /// vault for registration (gate in the platform makeCredential).
+    fn gated(gate: Gate, panic_instead: bool, mock: Option<MockBackend>) -> Gated {
+        let p = fixture();
+        let mut v =
+            vault::Vault::create_for(&p, "synthetic-D9F2-password", edition::Edition::Single)
+                .unwrap();
+        let mut key_id = String::new();
+        let login = gate == Gate::RoamingAssertion;
+        if login {
+            let mut roaming = MockBackend::new();
+            let reg = v
+                .register_key_with_label(&mut roaming, None, "synthetic-roaming")
+                .unwrap();
+            key_id = crypto::base64_encode(&reg.credential_id);
+        }
+        let v = if login {
+            v.lock();
+            None
+        } else {
+            Some(v)
+        };
+        let mut inner = Recording::new();
+        if let Some(mock) = mock {
+            inner.mock = mock;
+        }
+        let calls = inner.calls.clone();
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let backend = GateBackend {
+            inner,
+            gate,
+            armed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            panic_instead,
+            entered: entered_tx,
+            release: release_rx,
+        };
+        let (state, _) = state(v, Recording::new());
+        state
+            .with_lock(|g| {
+                g.backend = Box::new(backend);
+                Ok(())
+            })
+            .unwrap();
+        Gated {
+            p,
+            state: Arc::new(state),
+            calls,
+            entered,
+            release,
+            key_id,
+        }
+    }
+
+    /// Runs `f` on a helper thread; `None` = it did not return within 2 seconds.
+    fn within<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(2)).ok()
+    }
+
+    fn spawn_login(g: &Gated) -> std::thread::JoinHandle<Result<Vec<vault::Entry>>> {
+        let state = Arc::clone(&g.state);
+        let path = g.p.path.clone();
+        let id = g.key_id.clone();
+        let task =
+            std::thread::spawn(move || login_key_inner(&state, &path, &id, None, |_| Ok(790)));
+        g.entered
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the ceremony never reached the backend");
+        task
+    }
+
+    fn spawn_register(g: &Gated) -> std::thread::JoinHandle<Result<RegisterResult>> {
+        let state = Arc::clone(&g.state);
+        let task = std::thread::spawn(move || d9f1_hello_handoff(&state));
+        g.entered
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the ceremony never reached the backend");
+        task
+    }
+
+    fn key_op_snapshot(state: &Arc<VaultState>) -> Option<(bool, bool, bool)> {
+        let state = Arc::clone(state);
+        within(move || {
+            state
+                .with_lock(|g| {
+                    Ok((
+                        g.key_op.active,
+                        g.key_op.pending_lock.is_some(),
+                        g.vault.is_some(),
+                    ))
+                })
+                .unwrap()
+        })
+    }
+
+    #[test]
+    fn d9f2_main_thread_style_commands_return_while_a_login_ceremony_is_parked() {
+        let g = gated(Gate::RoamingAssertion, false, None);
+        let task = spawn_login(&g);
+        let st = Arc::clone(&g.state);
+        let list = within(move || with_unlocked(&st, |v| Ok(v.entries().len())));
+        let st = Arc::clone(&g.state);
+        let settings = within(move || with_unlocked(&st, |v| Ok(v.settings().clone())));
+        let st = Arc::clone(&g.state);
+        let status = within(move || {
+            query_platform_status(&st, std::path::Path::new("D:/nonexistent/none.db"), edition::Edition::Single)
+        });
+        let st = Arc::clone(&g.state);
+        let path = g.p.path.clone();
+        let locked = within(move || lock_inner_at(&st, None, &path, edition::Edition::Single));
+        let snapshot = key_op_snapshot(&g.state);
+        g.release.send(()).unwrap();
+        let login = task.join().unwrap();
+        assert!(list.is_some(), "list_entries waited for the ceremony");
+        assert!(settings.is_some(), "get_vault_settings waited for the ceremony");
+        assert!(status.is_some(), "platform_status waited for the ceremony");
+        assert!(locked.is_some(), "lock waited for the ceremony");
+        // While the ceremony runs the vault is not unlocked: the answer is "busy", never a
+        // misleading "locked" that would flip the UI.
+        assert_eq!(list.unwrap().unwrap_err(), KEY_OPERATION_BUSY_MSG);
+        assert_eq!(settings.unwrap().unwrap_err(), KEY_OPERATION_BUSY_MSG);
+        assert_eq!(status.unwrap().unwrap_err(), KEY_OPERATION_BUSY_MSG);
+        assert!(locked.unwrap().is_ok(), "lock during a ceremony is deferred, not an error");
+        assert_eq!(snapshot, Some((true, true, false)));
+        // The deferred lock discards the login result and exposes no entries.
+        assert_eq!(login.unwrap_err(), KEY_OPERATION_LOCKED_MSG);
+        assert_eq!(key_op_snapshot(&g.state), Some((false, false, false)));
+    }
+
+    #[test]
+    fn d9f2_lock_during_login_returns_login_screen_info_and_keeps_the_vault_locked() {
+        let g = gated(Gate::RoamingAssertion, false, None);
+        let task = spawn_login(&g);
+        let st = Arc::clone(&g.state);
+        let path = g.p.path.clone();
+        let info = within(move || lock_inner_at(&st, Some("idle".into()), &path, edition::Edition::Single));
+        g.release.send(()).unwrap();
+        let login = task.join().unwrap();
+        let info = info.expect("lock must not wait for the ceremony").unwrap();
+        assert!(info.has_vault);
+        assert_eq!(info.keys.len(), 1, "login screen lists the vault keys");
+        assert!(login.is_err());
+        let snapshot = key_op_snapshot(&g.state);
+        assert_eq!(snapshot, Some((false, false, false)));
+    }
+
+    #[test]
+    fn d9f2_lock_during_successful_registration_locks_before_the_response() {
+        let g = gated(Gate::PlatformRegister, false, None);
+        let task = spawn_register(&g);
+        let st = Arc::clone(&g.state);
+        let list = within(move || with_unlocked(&st, |v| Ok(v.entries().len())));
+        let st = Arc::clone(&g.state);
+        let path = g.p.path.clone();
+        let locked = within(move || lock_inner_at(&st, None, &path, edition::Edition::Single));
+        g.release.send(()).unwrap();
+        let registered = task.join().unwrap();
+        assert_eq!(
+            list.expect("list_entries waited for the ceremony").unwrap_err(),
+            KEY_OPERATION_BUSY_MSG
+        );
+        assert!(locked.expect("lock waited for the ceremony").is_ok());
+        assert!(
+            matches!(&registered, Ok(RegisterResult::Registered { .. })),
+            "{registered:?}"
+        );
+        assert_eq!(key_op_snapshot(&g.state), Some((false, false, false)));
+        let header = vault::Vault::read_header(&g.p, edition::Edition::Single).unwrap();
+        assert_eq!(header.key_slots.len(), 1, "the completed registration is persisted");
+    }
+
+    #[test]
+    fn d9f2_lock_during_registration_handoff_cancels_pending_with_existing_cleanup() {
+        let mock = MockBackend::new()
+            .with_platform_handoff(fido2::MockHandoffRefusal::OwnerNotForeground, 1);
+        let g = gated(Gate::PlatformRegister, false, Some(mock));
+        let task = spawn_register(&g);
+        let st = Arc::clone(&g.state);
+        let path = g.p.path.clone();
+        let locked = within(move || lock_inner_at(&st, None, &path, edition::Edition::Single));
+        g.release.send(()).unwrap();
+        let result = task.join().unwrap();
+        assert!(locked.expect("lock waited for the ceremony").is_ok());
+        assert_eq!(result.unwrap_err(), KEY_OPERATION_LOCKED_MSG);
+        assert_eq!(key_op_snapshot(&g.state), Some((false, false, false)));
+        assert!(!d9f1_has_pending(&g.state), "locking cancels the pending registration");
+        assert_eq!(g.calls.lock().unwrap().delete, 1, "RP-proven local credential is deleted");
+        let header = vault::Vault::read_header(&g.p, edition::Edition::Single).unwrap();
+        assert!(header.key_slots.is_empty());
+    }
+
+    #[test]
+    fn d9f2_second_key_operation_is_rejected_without_focus_or_backend() {
+        let g = gated(Gate::RoamingAssertion, false, None);
+        let task = spawn_login(&g);
+        let before = {
+            let c = g.calls.lock().unwrap();
+            (c.status, c.list, c.create, c.assert, c.delete, c.hwnd.len())
+        };
+        let raised = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut outcomes: Vec<(&str, Option<String>)> = Vec::new();
+        macro_rules! second {
+            ($name:expr, $call:expr) => {{
+                let st = Arc::clone(&g.state);
+                let raised = Arc::clone(&raised);
+                let path = g.p.path.clone();
+                let id = g.key_id.clone();
+                let _ = (&st, &raised, &path, &id);
+                let out = within(move || {
+                    let raise = |_: bool| {
+                        raised.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok(1)
+                    };
+                    let _ = &raise;
+                    $call(&st, &path, &id, raise)
+                });
+                outcomes.push(($name, out.map(|r: Result<()>| r.unwrap_err())));
+            }};
+        }
+        second!("login_key", |st: &VaultState, path: &std::path::Path, id: &str, raise| {
+            login_key_inner(st, path, id, None, raise).map(|_| ())
+        });
+        second!("login_any_key", |st: &VaultState, path: &std::path::Path, _id: &str, raise| {
+            login_any_key_inner(st, path, raise).map(|_| ())
+        });
+        second!("login_windows_hello", |st: &VaultState, path: &std::path::Path, _id: &str, raise| {
+            login_windows_hello_inner(st, path, edition::Edition::Single, raise).map(|_| ())
+        });
+        second!("register_windows_hello", |st: &VaultState, _p: &std::path::Path, _id: &str, raise| {
+            register_windows_hello_inner(
+                st,
+                edition::Edition::Single,
+                raise,
+                || Ok("SYNTHETIC".into()),
+            )
+            .map(|_| ())
+        });
+        second!("register_key", |st: &VaultState, _p: &std::path::Path, _id: &str, raise| {
+            register_key_inner(st, raise, None, "synthetic-label", None).map(|_| ())
+        });
+        second!("continue_registration", |st: &VaultState, _p: &std::path::Path, _id: &str, raise| {
+            continue_registration_inner(
+                st,
+                edition::Edition::Single,
+                raise,
+                std::time::Instant::now,
+            )
+            .map(|_| ())
+        });
+        second!("login_dual_begin", |st: &VaultState, path: &std::path::Path, _id: &str, raise| {
+            login_dual_begin_inner(st, path, None, raise, |_, _| {}).map(|_| ())
+        });
+        second!("login_dual_complete", |st: &VaultState, _p: &std::path::Path, _id: &str, raise| {
+            login_dual_complete_inner(st, None, raise).map(|_| ())
+        });
+        let after = {
+            let c = g.calls.lock().unwrap();
+            (c.status, c.list, c.create, c.assert, c.delete, c.hwnd.len())
+        };
+        g.release.send(()).unwrap();
+        let first = task.join().unwrap();
+        for (name, outcome) in &outcomes {
+            assert_eq!(
+                outcome.as_deref(),
+                Some(KEY_OPERATION_BUSY_MSG),
+                "{name} must be rejected immediately"
+            );
+        }
+        assert_eq!(
+            raised.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a rejected operation never touches the foreground"
+        );
+        assert_eq!(before, after, "a rejected operation never reaches the backend");
+        assert!(first.is_ok(), "the original ceremony is unaffected: {first:?}");
+        assert_eq!(key_op_snapshot(&g.state), Some((false, false, true)));
+    }
+
+    #[test]
+    fn d9f2_guard_is_released_after_error_and_after_panic() {
+        // Error path.
+        let g = gated(Gate::RoamingAssertion, false, None);
+        g.release.send(()).unwrap();
+        let wrong = login_key_inner(&g.state, &g.p, "bm90LWEta2V5", None, |_| Ok(1));
+        assert!(wrong.is_err());
+        assert_eq!(key_op_snapshot(&g.state), Some((false, false, false)));
+        let ok = login_key_inner(&g.state, &g.p, &g.key_id, None, |_| Ok(1));
+        assert!(ok.is_ok(), "{ok:?}");
+
+        // Raise failure (no backend call) also releases.
+        let g = gated(Gate::RoamingAssertion, false, None);
+        let refused = login_key_inner(&g.state, &g.p, &g.key_id, None, |_| Err("no foreground".into()));
+        assert_eq!(refused.unwrap_err(), "no foreground");
+        assert_eq!(key_op_snapshot(&g.state), Some((false, false, false)));
+
+        // Panic inside the ceremony: guard released, real backend restored, vault still locked.
+        let g = gated(Gate::RoamingAssertion, true, None);
+        g.release.send(()).unwrap();
+        let state = Arc::clone(&g.state);
+        let path = g.p.path.clone();
+        let id = g.key_id.clone();
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            login_key_inner(&state, &path, &id, None, |_| Ok(1))
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(key_op_snapshot(&g.state), Some((false, false, false)));
+        let restored = {
+            let st = Arc::clone(&g.state);
+            within(move || st.with_lock(|g| Ok(g.backend.key_unavailable_reason())))
+        };
+        assert_eq!(restored.map(|r| r.unwrap()), Some(None), "real backend must be back");
+        let again = login_key_inner(&g.state, &g.p, &g.key_id, None, |_| Ok(1));
+        assert!(again.is_ok(), "{again:?}");
+    }
+
+    #[test]
+    fn d9f2_panic_after_a_deferred_lock_still_locks_and_releases() {
+        let g = gated(Gate::PlatformRegister, true, None);
+        let state = Arc::clone(&g.state);
+        let task = std::thread::spawn(move || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| d9f1_hello_handoff(&state)))
+        });
+        g.entered
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the ceremony never reached the backend");
+        let st = Arc::clone(&g.state);
+        let path = g.p.path.clone();
+        let locked = within(move || lock_inner_at(&st, None, &path, edition::Edition::Single));
+        g.release.send(()).unwrap();
+        assert!(task.join().unwrap().is_err(), "the synthetic panic propagates");
+        assert!(locked.expect("lock waited for the ceremony").is_ok());
+        // Fail closed: the unlocked vault that was leased to the panicking ceremony is locked.
+        assert_eq!(key_op_snapshot(&g.state), Some((false, false, false)));
+    }
+
+    #[test]
+    fn d9f2_vault_changing_commands_are_rejected_while_a_key_operation_is_active() {
+        let g = gated(Gate::RoamingAssertion, false, None);
+        let task = spawn_login(&g);
+        let fresh = fixture();
+        let (st, p) = (Arc::clone(&g.state), g.p.path.clone());
+        let login_pw = within(move || {
+            login_password_inner(&st, &p, "synthetic-D9F2-password", edition::Edition::Single)
+        });
+        let (st, f) = (Arc::clone(&g.state), fresh.path.clone());
+        let create = within(move || {
+            create_vault_inner(&st, &f, "synthetic-password-8", edition::Edition::Single)
+        });
+        let (st, p) = (Arc::clone(&g.state), g.p.path.clone());
+        let id = g.key_id.clone();
+        let remove = within(move || {
+            let _ = &p;
+            remove_key_inner(&st, &id, edition::Edition::Single)
+        });
+        let st = Arc::clone(&g.state);
+        let cancel = within(move || cancel_registration_inner(&st));
+        let st = Arc::clone(&g.state);
+        let csv = within(move || apply_csv_import_inner(&st, "token".into()));
+        let snapshot = key_op_snapshot(&g.state);
+        g.release.send(()).unwrap();
+        let first = task.join().unwrap();
+        assert_eq!(login_pw.expect("login_password queued behind the ceremony").unwrap_err(), KEY_OPERATION_BUSY_MSG);
+        assert_eq!(create.expect("create_vault queued behind the ceremony").unwrap_err(), KEY_OPERATION_BUSY_MSG);
+        assert!(!fresh.path.exists(), "create_vault must not create a file while busy");
+        assert_eq!(remove.expect("remove_key queued behind the ceremony").unwrap_err(), KEY_OPERATION_BUSY_MSG);
+        assert_eq!(cancel.expect("cancel_registration queued").unwrap_err(), KEY_OPERATION_BUSY_MSG);
+        assert_eq!(csv.expect("apply_csv_import queued").unwrap_err(), KEY_OPERATION_BUSY_MSG);
+        // The rejected login_password did not publish a vault: only the ceremony's own result did.
+        assert_eq!(snapshot, Some((true, false, false)));
+        assert!(first.is_ok());
+        assert_eq!(key_op_snapshot(&g.state), Some((false, false, true)));
+        let header = vault::Vault::read_header(&g.p, edition::Edition::Single).unwrap();
+        assert_eq!(header.key_slots.len(), 1, "remove_key changed nothing");
+    }
+
+
+    // ───────────── D9-F2 R2：審查阻擋項回歸測試 ─────────────
+
+    fn r2_counts(calls: &Arc<Mutex<Calls>>) -> (usize, usize, usize, usize, usize, usize) {
+        let c = calls.lock().unwrap();
+        (c.status, c.list, c.create, c.assert, c.delete, c.hwnd.len())
+    }
+
+    /// Unlocked single-edition vault that owns one roaming key, plus a recording backend.
+    fn r2_unlocked_vault() -> (Fixture, Arc<VaultState>, Arc<Mutex<Calls>>, String) {
+        let p = fixture();
+        let mut v =
+            vault::Vault::create_for(&p, "synthetic-R2-password", edition::Edition::Single)
+                .unwrap();
+        let mut roaming = MockBackend::new();
+        let reg = v
+            .register_key_with_label(&mut roaming, None, "synthetic-roaming")
+            .unwrap();
+        let key_id = crypto::base64_encode(&reg.credential_id);
+        let (s, calls) = state(Some(v), Recording::new());
+        (p, Arc::new(s), calls, key_id)
+    }
+
+    #[test]
+    fn d9f2_r2_s1_every_key_login_is_refused_while_the_vault_is_unlocked() {
+        let (p, s, calls, key_id) = r2_unlocked_vault();
+        let raised = std::sync::atomic::AtomicUsize::new(0);
+        let raise = |_: bool| {
+            raised.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(1)
+        };
+        let before = r2_counts(&calls);
+        let outcomes: Vec<(&str, std::result::Result<(), String>)> = vec![
+            (
+                "login_key",
+                login_key_inner(&s, &p, &key_id, None, raise).map(|_| ()),
+            ),
+            ("login_any_key", login_any_key_inner(&s, &p, raise).map(|_| ())),
+            (
+                "login_windows_hello",
+                login_windows_hello_inner(&s, &p, edition::Edition::Single, raise).map(|_| ()),
+            ),
+            (
+                "login_dual_begin",
+                login_dual_begin_inner(&s, &p, None, raise, |_, _| {}).map(|_| ()),
+            ),
+            (
+                "login_dual_complete",
+                login_dual_complete_inner(&s, None, raise).map(|_| ()),
+            ),
+        ];
+        for (name, outcome) in outcomes {
+            let message = outcome.err().unwrap_or_default();
+            assert!(
+                message.contains("金庫已解鎖"),
+                "{name} must refuse a new key login while the vault is unlocked, got {message:?}"
+            );
+        }
+        assert_eq!(raised.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(before, r2_counts(&calls), "a refused login never reaches the backend");
+        assert_eq!(key_op_snapshot(&s), Some((false, false, true)));
+
+        // Nothing can later overwrite the vault with an older snapshot: a write made now survives
+        // a lock + key login (which re-reads the file).
+        with_unlocked(&s, |v| {
+            v.add_entry("synthetic-site", "synthetic-account", "synthetic-pw", "")
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        lock_inner_at(&s, None, &p, edition::Edition::Single).unwrap();
+        let entries = login_key_inner(&s, &p, &key_id, None, |_| Ok(1)).unwrap();
+        assert_eq!(entries.len(), 1, "the entry written while unlocked is not lost");
+    }
+
+    #[test]
+    fn d9f2_r2_s1_readers_and_writers_refuse_while_an_operation_or_deferred_lock_is_pending() {
+        let (p, s, _calls, _) = r2_unlocked_vault();
+        with_unlocked(&s, |v| {
+            v.add_entry("synthetic-site", "synthetic-account", "synthetic-pw", "")
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        let on_disk = std::fs::read(&p).unwrap();
+        for (active, pending_lock) in [(true, None), (true, Some(None)), (false, Some(None))] {
+            s.with_lock(|g| {
+                g.key_op.active = active;
+                g.key_op.pending_lock = pending_lock.clone();
+                Ok(())
+            })
+            .unwrap();
+            let label = format!("active={active} pending_lock={pending_lock:?}");
+            let results: Vec<(&str, std::result::Result<(), String>)> = vec![
+                ("list_entries", with_unlocked(&s, |v| Ok(v.entries().len())).map(|_| ())),
+                (
+                    "add_entry",
+                    with_unlocked(&s, |v| {
+                        v.add_entry("later", "later", "later", "")
+                            .map(|_| ())
+                            .map_err(|e| e.to_string())
+                    }),
+                ),
+                (
+                    "get_vault_settings",
+                    with_unlocked(&s, |v| Ok(v.settings().clone())).map(|_| ()),
+                ),
+                (
+                    "set_idle_lock",
+                    with_unlocked(&s, |v| v.set_idle_lock(7).map_err(|e| e.to_string())),
+                ),
+                ("list_audit", with_unlocked(&s, |v| Ok(v.audit().len())).map(|_| ())),
+            ];
+            for (name, result) in results {
+                assert!(
+                    result.is_err(),
+                    "{name} returned data / accepted a write while {label}"
+                );
+                if active {
+                    assert_eq!(result.unwrap_err(), KEY_OPERATION_BUSY_MSG, "{name} {label}");
+                }
+            }
+        }
+        s.with_lock(|g| {
+            g.key_op.active = false;
+            g.key_op.pending_lock = None;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), on_disk, "no write reached the vault file");
+        assert_eq!(with_unlocked(&s, |v| Ok(v.entries().len())).unwrap(), 1);
+    }
+
+    fn r2_hello_pending_state(
+        delete_error: bool,
+    ) -> (Fixture, Arc<VaultState>, Arc<Mutex<Calls>>) {
+        let p = fixture();
+        let v = vault::Vault::create_for(&p, "synthetic-R2-password", edition::Edition::Single)
+            .unwrap();
+        let mut b = Recording::new();
+        b.mock = MockBackend::new()
+            .with_platform_handoff(fido2::MockHandoffRefusal::OwnerNotForeground, 1);
+        b.delete_error = delete_error;
+        let (s, calls) = state(Some(v), b);
+        let s = Arc::new(s);
+        assert!(d9f1_hello_handoff(&s).is_ok());
+        assert!(d9f1_has_pending(&s));
+        (p, s, calls)
+    }
+
+    #[test]
+    fn d9f2_r2_s2_expiry_missed_while_an_operation_was_active_is_completed_by_the_operation() {
+        for delete_error in [false, true] {
+            for panics in [false, true] {
+                let case = format!("delete_error={delete_error} panics={panics}");
+                let (_p, s, calls) = r2_hello_pending_state(delete_error);
+                let early = std::time::Instant::now();
+                let deadline = early + std::time::Duration::from_millis(300);
+                let generation = s
+                    .with_lock(|g| {
+                        let slot = g.pending_registration.as_mut().unwrap();
+                        slot.deadline = deadline;
+                        Ok(slot.generation)
+                    })
+                    .unwrap();
+                let state_ref = Arc::clone(&s);
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    continue_registration_inner(
+                        &s,
+                        edition::Edition::Single,
+                        |_| {
+                            while std::time::Instant::now() < deadline {
+                                std::thread::sleep(std::time::Duration::from_millis(20));
+                            }
+                            // The one-shot expiry timer fires now, while this operation is active.
+                            let swept = sweep_expired_registration_off_lock(
+                                &state_ref,
+                                Some(generation),
+                                std::time::Instant::now(),
+                            );
+                            assert!(!swept, "the timer cannot clean while the backend is leased");
+                            if panics {
+                                panic!("synthetic panic after the skipped timer");
+                            }
+                            Err("no foreground".into())
+                        },
+                        // The operation itself still believes the pending is alive.
+                        move || early,
+                    )
+                }));
+                assert_eq!(outcome.is_err(), panics, "{case}");
+                assert!(
+                    !d9f1_has_pending(&s),
+                    "{case}: the pending registration must not outlive its deadline"
+                );
+                assert_eq!(calls.lock().unwrap().delete, 1, "{case}: the credential is deleted once");
+                let receipts = s
+                    .with_lock(|g| Ok(g.registration_cleanup_receipts.clone()))
+                    .unwrap();
+                if delete_error {
+                    assert_eq!(receipts.len(), 1, "{case}: {receipts:?}");
+                    assert_eq!(receipts[0].reason, "expired", "{case}");
+                    assert_eq!(receipts[0].cleanup, RegistrationCleanup::ManualRemovalRequired);
+                } else {
+                    assert!(receipts.is_empty(), "{case}: {receipts:?}");
+                }
+                assert_eq!(key_op_snapshot(&s), Some((false, false, true)), "{case}");
+            }
+        }
+    }
+
+    /// One parked native call, plus everything that must stay alive while it is parked.
+    struct L2Case {
+        name: &'static str,
+        state: Arc<VaultState>,
+        ticket: HoldTicket,
+        task: std::thread::JoinHandle<()>,
+        _keep: Vec<Fixture>,
+    }
+
+    fn l2_spawn(
+        name: &'static str,
+        state: Arc<VaultState>,
+        ticket: HoldTicket,
+        keep: Vec<Fixture>,
+        op: impl FnOnce(Arc<VaultState>) + Send + 'static,
+    ) -> L2Case {
+        let worker_state = Arc::clone(&state);
+        let task = std::thread::spawn(move || op(worker_state));
+        // Generous: some scenarios run an Argon2id derivation (slow in debug builds, and slower
+        // still while the whole suite runs in parallel) before reaching the parked native call.
+        ticket
+            .entered
+            .recv_timeout(std::time::Duration::from_secs(240))
+            .unwrap_or_else(|_| panic!("{name}: the native call was never reached"));
+        L2Case {
+            name,
+            state,
+            ticket,
+            task,
+            _keep: keep,
+        }
+    }
+
+    fn l2_case(name: &'static str) -> L2Case {
+        let single = edition::Edition::Single;
+        match name {
+            "deferred_lock_cleanup_in_complete" => {
+                let (p, s, c) = d9f1_hello_state(1);
+                let (hold, ticket) = new_hold();
+                c.lock().unwrap().hold_delete = Some(hold);
+                let path = p.path.clone();
+                l2_spawn(name, Arc::new(s), ticket, vec![p], move |s| {
+                    let locker = Arc::clone(&s);
+                    let _ = register_windows_hello_inner(
+                        &s,
+                        single,
+                        move |_| {
+                            lock_inner_at(&locker, None, &path, single).unwrap();
+                            Ok(1)
+                        },
+                        || Ok("SYNTHETIC".into()),
+                    );
+                })
+            }
+            "continue_timeout_cleanup" => {
+                let (p, s, c) = r2_hello_pending_state(false);
+                let (hold, ticket) = new_hold();
+                c.lock().unwrap().hold_delete = Some(hold);
+                l2_spawn(name, s, ticket, vec![p], move |s| {
+                    let base = std::time::Instant::now();
+                    let mut n = 0;
+                    let _ = continue_registration_inner(&s, single, |_| Ok(1), move || {
+                        n += 1;
+                        if n == 1 {
+                            base
+                        } else {
+                            base + std::time::Duration::from_secs(100_000)
+                        }
+                    });
+                })
+            }
+            "platform_status_list" => {
+                let (p, s, c) = d9f1_hello_state(1);
+                let (hold, ticket) = new_hold();
+                c.lock().unwrap().hold_list = Some(hold);
+                let path = p.path.clone();
+                l2_spawn(name, Arc::new(s), ticket, vec![p], move |s| {
+                    let _ = query_platform_status(&s, &path, single);
+                })
+            }
+            "idle_lock_with_pending" => {
+                let (p, s, c) = r2_hello_pending_state(false);
+                let (hold, ticket) = new_hold();
+                c.lock().unwrap().hold_delete = Some(hold);
+                let path = p.path.clone();
+                l2_spawn(name, s, ticket, vec![p], move |s| {
+                    let _ = lock_inner_at(&s, None, &path, single);
+                })
+            }
+            "remove_key_platform_delete" => {
+                let p = fixture();
+                let mut b = Recording::new();
+                let mut v =
+                    vault::Vault::create_for(&p, "synthetic-R2-password", single).unwrap();
+                v.register_windows_hello(&mut b.mock, "SYNTHETIC", single).unwrap();
+                let id = vault::Vault::read_header(&p, single).unwrap().key_slots[0]
+                    .credential_id
+                    .clone();
+                let (s, c) = state(Some(v), b);
+                let (hold, ticket) = new_hold();
+                c.lock().unwrap().hold_delete = Some(hold);
+                l2_spawn(name, Arc::new(s), ticket, vec![p], move |s| {
+                    let _ = remove_key_inner(&s, &id, single);
+                })
+            }
+            "cancel_registration_delete" => {
+                let (p, s, c) = r2_hello_pending_state(false);
+                let (hold, ticket) = new_hold();
+                c.lock().unwrap().hold_delete = Some(hold);
+                l2_spawn(name, s, ticket, vec![p], move |s| {
+                    let _ = cancel_registration_inner(&s);
+                })
+            }
+            "expiry_timer_delete" => {
+                let (p, s, c) = r2_hello_pending_state(false);
+                let generation = s
+                    .with_lock(|g| {
+                        let slot = g.pending_registration.as_mut().unwrap();
+                        slot.deadline = std::time::Instant::now();
+                        Ok(slot.generation)
+                    })
+                    .unwrap();
+                let (hold, ticket) = new_hold();
+                c.lock().unwrap().hold_delete = Some(hold);
+                l2_spawn(name, s, ticket, vec![p], move |s| {
+                    let _ = sweep_expired_registration_off_lock(
+                        &s,
+                        Some(generation),
+                        std::time::Instant::now(),
+                    );
+                })
+            }
+            "boot_info_list" => {
+                let (p, s, c) = d9f1_hello_state(1);
+                let (hold, ticket) = new_hold();
+                c.lock().unwrap().hold_list = Some(hold);
+                let path = p.path.clone();
+                l2_spawn(name, Arc::new(s), ticket, vec![p], move |s| {
+                    let _ = boot_info_inner(&s, &path, single);
+                })
+            }
+            "create_vault_cancels_pending" => {
+                let (p, s, c) = r2_hello_pending_state(false);
+                let (hold, ticket) = new_hold();
+                c.lock().unwrap().hold_delete = Some(hold);
+                let fresh = fixture();
+                let target = fresh.path.clone();
+                l2_spawn(name, s, ticket, vec![p, fresh], move |s| {
+                    let _ = create_vault_inner(&s, &target, "synthetic-password-8", single);
+                })
+            }
+            "login_password_cancels_pending" => {
+                let (p, s, c) = r2_hello_pending_state(false);
+                let (hold, ticket) = new_hold();
+                c.lock().unwrap().hold_delete = Some(hold);
+                let path = p.path.clone();
+                l2_spawn(name, s, ticket, vec![p], move |s| {
+                    let _ = login_password_inner(&s, &path, "synthetic-R2-password", single);
+                })
+            }
+            other => panic!("unknown scenario {other}"),
+        }
+    }
+
+    #[test]
+    fn d9f2_r2_l2_native_work_never_parks_main_thread_style_queries() {
+        let mut stuck = Vec::new();
+        for name in [
+            "deferred_lock_cleanup_in_complete",
+            "continue_timeout_cleanup",
+            "platform_status_list",
+            "idle_lock_with_pending",
+            "remove_key_platform_delete",
+            "cancel_registration_delete",
+            "expiry_timer_delete",
+            "boot_info_list",
+            "create_vault_cancels_pending",
+            "login_password_cancels_pending",
+        ] {
+            let case = l2_case(name);
+            let probe = Arc::clone(&case.state);
+            let answered = within(move || {
+                let _ = with_unlocked(&probe, |v| Ok(v.entries().len()));
+                let _ = with_unlocked(&probe, |v| Ok(v.settings().clone()));
+                let _ = registration_cleanup_status_inner(&probe);
+            });
+            if answered.is_none() {
+                stuck.push(case.name);
+            }
+            case.ticket.release.send(()).unwrap();
+            case.task.join().unwrap();
+        }
+        assert!(
+            stuck.is_empty(),
+            "main-thread style queries waited for native work in: {stuck:?}"
+        );
+    }
+
+    #[test]
+    fn d9f2_r3_lock_during_post_publication_cleanup_never_returns_entries() {
+        let (p, state, calls) = r2_hello_pending_state(false);
+        let (hold, ticket) = new_hold();
+        calls.lock().unwrap().hold_delete = Some(hold);
+        let path = p.path.clone();
+        let worker_state = Arc::clone(&state);
+        let worker = std::thread::spawn(move || {
+            login_password_inner(&worker_state, &path, "synthetic-R2-password", edition::Edition::Single)
+        });
+        ticket.entered.recv_timeout(std::time::Duration::from_secs(30)).expect("cleanup not reached");
+        let locked = lock_inner_at(&state, Some("manual".into()), &p.path, edition::Edition::Single);
+        ticket.release.send(()).unwrap();
+        assert!(locked.is_ok(), "lock should be acknowledged while native cleanup is active");
+        let response = worker.join().unwrap();
+        assert_eq!(response.err().as_deref(), Some(KEY_OPERATION_LOCKED_MSG),
+            "a late lock must discard a prepared login result, never return secret entries");
+        assert_eq!(key_op_snapshot(&state), Some((false, false, false)));
+        assert!(with_unlocked(&state, |v| Ok(v.entries().len())).is_err());
+    }
+
+    #[test]
+    fn d9f2_r3_lock_in_empty_cleanup_gap_discards_login_before_return() {
+        let (p, state, _, _) = r2_unlocked_vault();
+        lock_inner_at(&state, None, &p.path, edition::Edition::Single).unwrap();
+        let (mut guard, ()) = KeyOperationGuard::begin_login(&state, |_| Ok(())).unwrap();
+        let opened = vault::Vault::open_password_for(&p.path, "synthetic-R2-password", edition::Edition::Single)
+            .map_err(|e| e.to_string());
+        let result = guard.finish(
+            Some(|g: &mut AppInner, deferred| publish_login(g, opened, deferred, |_| {})),
+            true,
+            || {
+                // No queued native work: lock exactly after publication drops the state lock.
+                lock_inner_at(&state, Some("manual".into()), &p.path, edition::Edition::Single).unwrap();
+            },
+        ).unwrap();
+        assert_eq!(result.err().as_deref(), Some(KEY_OPERATION_LOCKED_MSG));
+        assert_eq!(key_op_snapshot(&state), Some((false, false, false)));
+        assert!(with_unlocked(&state, |v| Ok(v.entries().len())).is_err());
+    }
+
+    #[test]
+    fn d9f2_r2_l3_dual_cancel_is_rejected_while_a_key_operation_is_active() {
+        let p = fixture();
+        let (s, _c) = state(None, Recording::new());
+        let seed = |s: &VaultState| {
+            s.with_lock(|g| {
+                g.dual_pending = Some(vault::DualPending::for_test(
+                    p.path.clone(),
+                    std::time::Instant::now(),
+                ));
+                Ok(())
+            })
+            .unwrap();
+        };
+        let has_pending = |s: &VaultState| s.with_lock(|g| Ok(g.dual_pending.is_some())).unwrap();
+
+        // Cancel issued from inside a running first step.
+        let mid_begin: Arc<Mutex<Option<std::result::Result<(), String>>>> =
+            Arc::new(Mutex::new(None));
+        let slot = Arc::clone(&mid_begin);
+        let s = Arc::new(s);
+        let canceller = Arc::clone(&s);
+        let begun = login_dual_begin_inner(
+            &s,
+            &p.path,
+            None,
+            move |_| {
+                *slot.lock().unwrap() = Some(login_dual_cancel_inner(&canceller));
+                Err("stop before the backend".into())
+            },
+            |_, _| {},
+        );
+        assert!(begun.is_err());
+        assert_eq!(
+            mid_begin.lock().unwrap().take().unwrap().err().as_deref(),
+            Some(KEY_OPERATION_BUSY_MSG),
+            "cancel during the first step must report busy, not success"
+        );
+
+        // Cancel issued from inside a running second step: the stored first step survives.
+        seed(&s);
+        let mid_complete: Arc<Mutex<Option<std::result::Result<(), String>>>> =
+            Arc::new(Mutex::new(None));
+        let slot = Arc::clone(&mid_complete);
+        let canceller = Arc::clone(&s);
+        let completed = login_dual_complete_inner(&s, None, move |_| {
+            *slot.lock().unwrap() = Some(login_dual_cancel_inner(&canceller));
+            Err("stop before the backend".into())
+        });
+        assert!(completed.is_err());
+        assert_eq!(
+            mid_complete.lock().unwrap().take().unwrap().err().as_deref(),
+            Some(KEY_OPERATION_BUSY_MSG),
+            "cancel during the second step must report busy, not a no-op success"
+        );
+        assert!(has_pending(&s), "the rejected cancel left the first step untouched");
+
+        // Idle: cancel works as before.
+        assert!(login_dual_cancel_inner(&s).is_ok());
+        assert!(!has_pending(&s));
+    }
+
+    #[test]
+    fn d9f2_r2_l1_second_create_is_refused_while_the_first_holds_the_reservation() {
+        let (s, _c) = state(None, Recording::new());
+        let s = Arc::new(s);
+        let fx = fixture();
+        let (entered_tx, entered) = std::sync::mpsc::channel::<()>();
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        let (first_state, first_path) = (Arc::clone(&s), fx.path.clone());
+        let first = std::thread::spawn(move || {
+            create_vault_inner_with_hook(
+                &first_state,
+                &first_path,
+                "synthetic-password-A1",
+                edition::Edition::Single,
+                move || {
+                    let _ = entered_tx.send(());
+                    let _ = release_rx.recv_timeout(std::time::Duration::from_secs(20));
+                },
+            )
+        });
+        entered
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the first creation never reached its reservation point");
+        let (second_state, second_path) = (Arc::clone(&s), fx.path.clone());
+        let second = within(move || {
+            create_vault_inner(
+                &second_state,
+                &second_path,
+                "synthetic-password-B2",
+                edition::Edition::Single,
+            )
+        });
+        let list = {
+            let st = Arc::clone(&s);
+            within(move || with_unlocked(&st, |v| Ok(v.entries().len())))
+        };
+        let file_exists_while_parked = fx.path.exists();
+        release.send(()).unwrap();
+        let first = first.join().unwrap();
+        let second = second.expect("the second creation must be refused immediately");
+        assert_eq!(second.err().as_deref(), Some(KEY_OPERATION_BUSY_MSG));
+        assert!(list.is_some(), "a main-thread style query must not wait for the creation");
+        assert!(!file_exists_while_parked, "no file work happens before the reservation holder runs");
+        assert!(first.is_ok(), "{first:?}");
+        // The memory state and the disk agree on one creation.
+        assert_eq!(key_op_snapshot(&s), Some((false, false, true)));
+        let in_memory = s
+            .with_lock(|g| Ok(g.vault.take().unwrap().lock()))
+            .unwrap();
+        let on_disk = vault::Vault::read_header(&fx.path, edition::Edition::Single).unwrap();
+        assert_eq!(
+            serde_json::to_string(&in_memory).unwrap(),
+            serde_json::to_string(&on_disk).unwrap()
+        );
+    }
+
+    #[test]
+    fn d9f2_r2_l1_two_concurrent_creates_on_one_path_succeed_exactly_once() {
+        let (s, _c) = state(None, Recording::new());
+        let s = Arc::new(s);
+        let fx = fixture();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let workers: Vec<_> = ["synthetic-password-A1", "synthetic-password-B2"]
+            .into_iter()
+            .map(|password| {
+                let (s, path, barrier) = (Arc::clone(&s), fx.path.clone(), Arc::clone(&barrier));
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    create_vault_inner(&s, &path, password, edition::Edition::Single)
+                })
+            })
+            .collect();
+        let results: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
+        assert_eq!(
+            results.iter().filter(|r| r.is_ok()).count(),
+            1,
+            "{results:?}"
+        );
+        let in_memory = s
+            .with_lock(|g| Ok(g.vault.take().expect("the winner is published").lock()))
+            .unwrap();
+        let on_disk = vault::Vault::read_header(&fx.path, edition::Edition::Single).unwrap();
+        assert_eq!(
+            serde_json::to_string(&in_memory).unwrap(),
+            serde_json::to_string(&on_disk).unwrap(),
+            "the in-memory vault must be the one that is on disk"
+        );
+    }
+
+    fn r2_torn_publication(g: &AppInner) -> bool {
+        g.vault.is_some() && (g.pending_csv_import.is_some() || g.dual_pending.is_some())
+    }
+
+    #[test]
+    fn d9f2_r2_login_publication_is_never_observed_half_done() {
+        // Positive: a sampler hammering the state lock across a whole Hello login never sees the
+        // vault published while the pending state it must clear is still there.
+        let p = fixture();
+        let mut b = Recording::new();
+        let mut v = vault::Vault::create_for(&p, "synthetic-R2-password", edition::Edition::Single)
+            .unwrap();
+        v.register_windows_hello(&mut b.mock, "SYNTHETIC", edition::Edition::Single)
+            .unwrap();
+        v.lock();
+        let (s, _c) = state(None, b);
+        seed_pending(&s, &p);
+        let s = Arc::new(s);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sampler = {
+            let (s, stop) = (Arc::clone(&s), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                let (mut samples, mut torn, mut published) = (0usize, 0usize, 0usize);
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    s.with_lock(|g| {
+                        samples += 1;
+                        torn += usize::from(r2_torn_publication(g));
+                        published += usize::from(g.vault.is_some());
+                        Ok(())
+                    })
+                    .unwrap();
+                }
+                (samples, torn, published)
+            })
+        };
+        let login = login_windows_hello_inner(&s, &p, edition::Edition::Single, |_| Ok(5));
+        // Make sure the sampler also observes the settled state.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (samples, torn, published) = sampler.join().unwrap();
+        assert!(login.is_ok(), "{login:?}");
+        assert!(samples > 0 && published > 0, "the sampler must have seen the published vault");
+        assert_eq!(torn, 0, "publication and clearing of pending state must be one step");
+    }
+
+    #[test]
+    fn d9f2_r2_negative_control_split_publication_is_detected_by_the_same_observer() {
+        let p = fixture();
+        let (s, _c) = state(None, Recording::new());
+        seed_pending(&s, &p);
+        let s = Arc::new(s);
+        let reached = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        let publisher = {
+            let (s, reached, resume, path) =
+                (Arc::clone(&s), Arc::clone(&reached), Arc::clone(&resume), p.path.clone());
+            std::thread::spawn(move || {
+                let vault = vault::Vault::create_for(
+                    &path.with_file_name("split.db"),
+                    "synthetic-R2-password",
+                    edition::Edition::Single,
+                )
+                .unwrap();
+                // Deliberately wrong: publish under one lock, clear pending under another.
+                s.with_lock(|g| {
+                    g.vault = Some(vault);
+                    Ok(())
+                })
+                .unwrap();
+                reached.wait();
+                resume.wait();
+                s.with_lock(|g| {
+                    g.pending_csv_import = None;
+                    g.dual_pending = None;
+                    Ok(())
+                })
+                .unwrap();
+            })
+        };
+        reached.wait();
+        let torn = s.with_lock(|g| Ok(r2_torn_publication(g))).unwrap();
+        resume.wait();
+        publisher.join().unwrap();
+        assert!(torn, "the observer must catch a publication split across two locks");
+    }
+
+    /// D9-F2 inventory (see docs/plans/windows-hello-single.md §13). Every IPC is classified; a
+    /// command that can reach `FidoBackend`/WebAuthn (UI, CTAP transaction, platform list/delete,
+    /// UVPA query) must not run on the Tauri main thread.
+    const D9F2_WEBAUTHN_COMMANDS: &[&str] = &[
+        "boot_info",
+        "platform_status",
+        "register_windows_hello",
+        "login_windows_hello",
+        "create_vault",
+        "login_password",
+        "login_key",
+        "login_any_key",
+        "login_dual_begin",
+        "login_dual_complete",
+        "lock",
+        "register_key",
+        "continue_registration",
+        "cancel_registration",
+        "remove_key",
+        "detect_key",
+    ];
+
+    /// Reviewed: never touches the backend (state/vault/journal/dialog/clipboard only).
+    const D9F2_NON_WEBAUTHN_COMMANDS: &[&str] = &[
+        "get_edition",
+        "login_dual_cancel",
+        "list_entries",
+        "preview_csv_import",
+        "save_csv_template",
+        "cancel_csv_import",
+        "apply_csv_import",
+        "add_entry",
+        "update_entry",
+        "delete_entry",
+        "list_audit",
+        "registration_cleanup_status",
+        "acknowledge_registration_cleanup",
+        "validate_key_label",
+        "suggest_key_label",
+        "set_idle_lock",
+        "set_dual_step_timeout",
+        "get_vault_settings",
+        "set_password_history_limit",
+        "clear_clipboard_if_matches",
+    ];
+
+    fn d9f2_production_source() -> String {
+        let source = include_str!("lib.rs").replace(char::from(13), "");
+        source.split("\n#[cfg(test)]\n").next().unwrap().to_owned()
+    }
+
+    /// `Some(true)` = off the main thread (`async fn` or `#[tauri::command(async)]`).
+    fn d9f2_command_is_off_main_thread(source: &str, name: &str) -> Option<bool> {
+        for (needle, async_fn) in [
+            (format!("\nasync fn {name}("), true),
+            (format!("\nfn {name}("), false),
+        ] {
+            let Some(pos) = source.find(&needle) else {
+                continue;
+            };
+            let attribute = source[..pos].trim_end().lines().last()?.trim();
+            if !attribute.starts_with("#[tauri::command") {
+                return None;
+            }
+            return Some(async_fn || attribute == "#[tauri::command(async)]");
+        }
+        None
+    }
+
+    fn d9f2_registered_commands(source: &str) -> Vec<String> {
+        source
+            .split(".invoke_handler(tauri::generate_handler![")
+            .nth(1)
+            .unwrap()
+            .split("])")
+            .next()
+            .unwrap()
+            .lines()
+            .map(|line| line.trim().trim_end_matches(',').to_owned())
+            .filter(|line| !line.is_empty())
+            .collect()
+    }
+
+    #[test]
+    fn d9f2_every_webauthn_command_runs_off_the_main_thread() {
+        let source = d9f2_production_source();
+        let mut registered = d9f2_registered_commands(&source);
+        registered.sort();
+        let mut classified: Vec<String> = D9F2_WEBAUTHN_COMMANDS
+            .iter()
+            .chain(D9F2_NON_WEBAUTHN_COMMANDS)
+            .map(|name| name.to_string())
+            .collect();
+        classified.sort();
+        assert_eq!(
+            registered, classified,
+            "a new or removed IPC must be classified as WebAuthn-reaching or not"
+        );
+        for name in D9F2_WEBAUTHN_COMMANDS {
+            assert_eq!(
+                d9f2_command_is_off_main_thread(&source, name),
+                Some(true),
+                "{name} reaches WebAuthn and must be #[tauri::command(async)] or async fn"
+            );
+        }
+    }
+
+    #[test]
+    fn d9f2_non_webauthn_commands_do_not_touch_the_backend() {
+        let source = d9f2_production_source();
+        for name in D9F2_NON_WEBAUTHN_COMMANDS {
+            let body = d9f2_function_text(&source, name);
+            for forbidden in [
+                "backend",
+                "KeyOperationGuard",
+                "raise_key_operation_window",
+                "FidoBackend",
+            ] {
+                assert!(
+                    !body.contains(forbidden),
+                    "{name} is classified as non-WebAuthn but mentions {forbidden}"
+                );
+            }
+        }
+    }
+
+    /// Text of the function whose signature starts with `fn name(`, up to its closing brace.
+    fn d9f2_function_text(source: &str, name: &str) -> String {
+        let marker = ["fn ", name, "("].concat();
+        source
+            .split(marker.as_str())
+            .nth(1)
+            .unwrap_or_else(|| panic!("{name} not found"))
+            .split("
+}
+")
+            .next()
+            .unwrap()
+            .to_owned()
+    }
+
+    fn d9f2_strip_comments(text: &str) -> String {
+        text.lines()
+            .map(|line| line.find("//").map_or(line, |at| &line[..at]))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Free functions called (not methods, not `path::calls`) in `body`.
+    fn d9f2_free_callees(body: &str) -> std::collections::BTreeSet<String> {
+        let chars: Vec<char> = body.chars().collect();
+        let mut found = std::collections::BTreeSet::new();
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i].is_alphabetic() || chars[i] == '_' {
+                let start = i;
+                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                let preceded_by_path_or_method = start > 0 && matches!(chars[start - 1], '.' | ':');
+                if i < chars.len() && chars[i] == '(' && !preceded_by_path_or_method {
+                    found.insert(chars[start..i].iter().collect());
+                }
+            } else {
+                i += 1;
+            }
+        }
+        found
+    }
+
+    const D9F2_BACKEND_MARKERS: &[&str] = &[
+        "backend",
+        "KeyOperationGuard",
+        "raise_key_operation_window",
+        "FidoBackend",
+        "platform_status",
+        "list_platform_credentials",
+        "delete_platform_credential",
+    ];
+
+    /// Every marker mentioned by `name` or by any free function it (transitively) calls.
+    fn d9f2_backend_reach(source: &str, name: &str) -> Vec<(String, &'static str)> {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut queue = vec![name.to_owned()];
+        let mut hits = Vec::new();
+        while let Some(current) = queue.pop() {
+            if !seen.insert(current.clone()) {
+                continue;
+            }
+            let marker = ["fn ", current.as_str(), "("].concat();
+            if !source.contains(marker.as_str()) {
+                continue; // not a function defined in this file
+            }
+            let body = d9f2_strip_comments(&d9f2_function_text(source, &current));
+            for marker in D9F2_BACKEND_MARKERS {
+                if body.contains(marker) {
+                    hits.push((current.clone(), *marker));
+                }
+            }
+            queue.extend(d9f2_free_callees(&body));
+        }
+        hits
+    }
+
+    #[test]
+    fn d9f2_non_webauthn_commands_reach_no_backend_through_helpers() {
+        let source = d9f2_production_source();
+        for name in D9F2_NON_WEBAUTHN_COMMANDS {
+            let hits = d9f2_backend_reach(&source, name);
+            assert!(
+                hits.is_empty(),
+                "{name} is classified as non-WebAuthn but reaches the backend through {hits:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn d9f2_helper_reach_scanner_follows_calls_and_ignores_comments_and_methods() {
+        let sample = "fn cmd() {\n    helper();\n}\n\nfn helper() {\n    inner(); // backend in a comment\n    x.method();\n}\n\nfn inner() {\n    g.backend.platform_status();\n}\n\nfn method() {\n    backend;\n}\n";
+        let hits = d9f2_backend_reach(sample, "cmd");
+        assert!(hits.iter().any(|(f, m)| f == "inner" && *m == "backend"), "{hits:?}");
+        assert!(hits.iter().all(|(f, _)| f != "helper" && f != "method"), "{hits:?}");
+        let clean = "fn cmd() {\n    helper();\n}\n\nfn helper() {\n    let a = 1; // backend\n}\n";
+        assert!(d9f2_backend_reach(clean, "cmd").is_empty());
+    }
+
+    #[test]
+    fn d9f2_contract_detector_distinguishes_sync_async_and_unattributed_functions() {
+        let sample = "#[tauri::command]\nfn plain(a: u8) {}\n\n#[tauri::command(async)]\nfn pooled(a: u8) {}\n\n#[tauri::command]\nasync fn native(a: u8) {}\n\nfn helper() {}\n";
+        assert_eq!(d9f2_command_is_off_main_thread(sample, "plain"), Some(false));
+        assert_eq!(d9f2_command_is_off_main_thread(sample, "pooled"), Some(true));
+        assert_eq!(d9f2_command_is_off_main_thread(sample, "native"), Some(true));
+        assert_eq!(d9f2_command_is_off_main_thread(sample, "helper"), None);
+        assert_eq!(d9f2_command_is_off_main_thread(sample, "missing"), None);
+    }
+
 }
 
 #[cfg(test)]
@@ -4567,6 +6720,7 @@ mod dual_pending_sweep_tests {
             registration_cleanup_receipts: Vec::new(),
             registration_cleanup_journal: None,
             registration_cleanup_storage_unavailable: false,
+            key_op: KeyOpState::default(),
         }
     }
 
@@ -4834,6 +6988,7 @@ mod d9_settings_ipc_tests {
             registration_cleanup_receipts: Vec::new(),
             registration_cleanup_journal: None,
             registration_cleanup_storage_unavailable: false,
+            key_op: KeyOpState::default(),
         }))
     }
 

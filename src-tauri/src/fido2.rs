@@ -138,6 +138,9 @@ pub enum FidoError {
     ForegroundHandoffRequired,
     /// pre-API 守門：owner 視窗不是前景，未呼叫 Windows WebAuthn（訊息與舊 Internal 文字相同）。
     OwnerNotForeground,
+    /// D9-F2：要求 PLATFORM 的 attestation 並非由本機（INTERNAL transport）完成，例如 Windows 在 Ngc
+    /// 失敗後讓使用者以安全性金鑰完成。不寫 slot、也不對該 ID 做 platform 刪除。
+    PlatformAuthenticatorSubstituted,
 }
 
 /// pre-API owner 前景守門拒絕時的原文（`OwnerNotForeground` 的 Display 與舊 Internal 顯示逐字相同）。
@@ -199,6 +202,10 @@ impl std::fmt::Display for FidoError {
             ),
             // 與舊 `Internal(OWNER_NOT_FOREGROUND_MSG)` 顯示相同，登入路徑文字不變。
             Self::OwnerNotForeground => write!(f, "FIDO2 內部錯誤：{OWNER_NOT_FOREGROUND_MSG}"),
+            Self::PlatformAuthenticatorSubstituted => write!(
+                f,
+                "Windows 以安全性金鑰完成，而非本機 Windows Hello；未註冊。該安全性金鑰上可能留下一筆 fido-vault.local 測試憑證，可用 YubiKey 管理工具移除。"
+            ),
         }
     }
 }
@@ -552,6 +559,8 @@ pub enum MockPlatformMode {
     CreationPrfMismatch,
     /// 此電腦／工作階段沒有可用的 Windows Hello。
     Unavailable,
+    /// D9-F2：註冊請求被 Windows 改由安全性金鑰完成（transport 非 INTERNAL）。
+    Substituted,
 }
 
 /// Mock Windows Hello credential ID 前綴（與 roaming mock ID 的 kind 位元組 0..=2 不會衝突）。
@@ -814,6 +823,9 @@ impl FidoBackend for MockBackend {
         self.call_log.push(MockCall::RegisterPlatform);
         if self.platform_mode == MockPlatformMode::Unavailable {
             return Err(platform_unsupported());
+        }
+        if self.platform_mode == MockPlatformMode::Substituted {
+            return Err(FidoError::PlatformAuthenticatorSubstituted);
         }
         // 模擬 excludeCredentials：本機已持有其中任一筆 → NTE_EXISTS，不建立、不提示。
         if exclude
@@ -2423,6 +2435,16 @@ mod tests {
             b.get_prf_secret(&reg.credential_id, Some("1234")).unwrap(),
             MockBackend::prf_for_credential(&reg.credential_id)
         );
+    }
+
+    #[test]
+    fn d9f2_platform_authenticator_substituted_message_is_exact_and_not_a_handoff() {
+        let error = FidoError::PlatformAuthenticatorSubstituted;
+        assert_eq!(
+            error.to_string(),
+            "Windows 以安全性金鑰完成，而非本機 Windows Hello；未註冊。該安全性金鑰上可能留下一筆 fido-vault.local 測試憑證，可用 YubiKey 管理工具移除。"
+        );
+        assert!(!error.is_foreground_handoff());
     }
 
     #[test]

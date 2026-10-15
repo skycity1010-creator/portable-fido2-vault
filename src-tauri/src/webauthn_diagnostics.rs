@@ -262,6 +262,7 @@ fn error_category(error: &FidoError) -> &'static str {
         FidoError::DeviceOpenDenied { .. } => "device-open-denied",
         FidoError::ForegroundHandoffRequired => "foreground-handoff-required",
         FidoError::OwnerNotForeground => "owner-not-foreground",
+        FidoError::PlatformAuthenticatorSubstituted => "platform-authenticator-substituted",
     }
 }
 
@@ -288,6 +289,9 @@ pub(crate) enum FailureStage {
     Response,
 }
 
+/// Upper bound for the W3C-style error name taken from WebAuthNGetErrorName.
+const API_ERROR_NAME_MAX_CHARS: usize = 64;
+
 pub(crate) struct OperationDiagnostics {
     operation: Operation,
     pub(crate) hmac_creation_confirmed: Option<bool>,
@@ -295,6 +299,8 @@ pub(crate) struct OperationDiagnostics {
     pub(crate) output_length: Option<u32>,
     pub(crate) credential_match: Option<bool>,
     pub(crate) failure_stage: Option<FailureStage>,
+    api_hresult: Option<u32>,
+    api_error_name: Option<String>,
 }
 
 impl OperationDiagnostics {
@@ -306,7 +312,18 @@ impl OperationDiagnostics {
             output_length: None,
             credential_match: None,
             failure_stage: None,
+            api_hresult: None,
+            api_error_name: None,
         }
+    }
+
+    /// D9-F2: platform API failure evidence. Only the HRESULT number and a short ASCII-alphanumeric
+    /// W3C-style error name (WebAuthNGetErrorName) can enter; anything else is dropped.
+    pub(crate) fn set_api_failure(&mut self, hresult: i32, error_name: Option<&str>) {
+        self.api_hresult = Some(hresult as u32);
+        self.api_error_name = error_name
+            .filter(|name| !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric()))
+            .map(|name| name.chars().take(API_ERROR_NAME_MAX_CHARS).collect());
     }
 
     fn failure_category(&self, error: &FidoError) -> &'static str {
@@ -340,14 +357,20 @@ impl OperationDiagnostics {
             Operation::MakeCredential => "MakeCredential",
             Operation::GetAssertion => "GetAssertion",
         };
-        json!({
+        let mut record = json!({
             "operation": operation,
             "error_category": error.map(|error| self.failure_category(error)),
             "hmac_creation_confirmed": self.hmac_creation_confirmed,
             "output_present": self.output_present,
             "output_length": self.output_length,
             "credential_match": self.credential_match,
-        })
+        });
+        // D9-F2: exact allowlist additions, present only for a recorded platform API failure.
+        if let (Some(fields), Some(hresult)) = (record.as_object_mut(), self.api_hresult) {
+            fields.insert("hresult".into(), json!(format!("0x{hresult:08X}")));
+            fields.insert("error_name".into(), json!(self.api_error_name));
+        }
+        record
     }
 }
 
@@ -366,6 +389,64 @@ pub(crate) fn diagnose<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn d9f2_api_failure_fields_exact_allowlist() {
+        let mut diagnostic = OperationDiagnostics::new(Operation::MakeCredential);
+        diagnostic.failure_stage = Some(FailureStage::Api);
+        // Unset: the legacy record shape is unchanged (no new keys).
+        let legacy = diagnostic.record(Some(&FidoError::Internal("x".into())));
+        assert_eq!(legacy.as_object().unwrap().len(), 6);
+        assert!(legacy.get("hresult").is_none() && legacy.get("error_name").is_none());
+
+        diagnostic.set_api_failure(0x800704C7_u32 as i32, Some("NotAllowedError"));
+        let record = diagnostic.record(Some(&FidoError::Internal("secret text".into())));
+        assert_eq!(
+            record,
+            json!({
+                "operation": "MakeCredential", "error_category": "api-error",
+                "hmac_creation_confirmed": null, "output_present": null,
+                "output_length": null, "credential_match": null,
+                "hresult": "0x800704C7", "error_name": "NotAllowedError",
+            })
+        );
+        assert_eq!(record.as_object().unwrap().len(), 8);
+    }
+
+    #[test]
+    fn d9f2_api_failure_name_is_sanitized_and_bounded() {
+        let mut diagnostic = OperationDiagnostics::new(Operation::GetAssertion);
+        diagnostic.failure_stage = Some(FailureStage::Api);
+        diagnostic.set_api_failure(-2146893783_i32, Some(&"A".repeat(200)));
+        let record = diagnostic.record(Some(&FidoError::Internal("x".into())));
+        assert_eq!(
+            record["error_name"].as_str(),
+            Some("A".repeat(64).as_str()),
+            "an over-long name is truncated to 64 characters, not dropped"
+        );
+        assert_eq!(record["hresult"].as_str(), Some("0x80090029"));
+        for hostile in [
+            r"C:\Users\alice\vault.db",
+            "Not Allowed",
+            "名稱",
+            "line\nbreak",
+            "",
+        ] {
+            let mut d = OperationDiagnostics::new(Operation::GetAssertion);
+            d.failure_stage = Some(FailureStage::Api);
+            d.set_api_failure(-1, Some(hostile));
+            let record = d.record(Some(&FidoError::Internal("x".into())));
+            assert!(record["error_name"].is_null(), "{hostile:?}");
+            assert_eq!(record["hresult"].as_str(), Some("0xFFFFFFFF"));
+            let text = record.to_string();
+            assert!(!text.contains("alice") && !text.contains("vault.db"), "{text}");
+        }
+        let mut none = OperationDiagnostics::new(Operation::GetAssertion);
+        none.set_api_failure(0x8007_04C7_u32 as i32, None);
+        let record = none.record(None);
+        assert!(record["error_name"].is_null());
+        assert_eq!(record["hresult"].as_str().unwrap(), "0x800704C7");
+    }
 
     #[test]
     fn d9f1_foreground_owner_serializer_exact_null_allowlist() {
