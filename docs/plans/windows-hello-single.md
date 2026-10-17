@@ -525,3 +525,58 @@ R4 Reviewer `D:/scratch/wh-d9f2-20261015/reviewer-R4/reviewer-verdict.json` 為 
 決定性合成 fixture：兩檔清理同時失敗 `70` assertion RED → `71` GREEN；tmp 自身寫入＋清理雙失敗 `72` assertion RED → `73` GREEN。測試僅於測試 fixture 清除自己建立的兩個檔案，絕不碰真金庫。**實際 OS 拒絕刪檔時可能殘留；訊息引導使用者檢查而非盲目重試，並非自動恢復。**
 
 本機完整套件：`real-ctap` **549/549**（`81`）、`real-ctap,dual-control` **549/549**（`80`）及 Node **155/155**（`76`），production check 單人／雙人 exit 0（`parent/p22`、`p23`）。先前雙人套件於 Windows C: TEMP 路徑遭遇既有測試 fixture 的 `PermissionDenied`，第一次 547/549（`75`）、重跑仍有一例（`79`）；兩項單獨重跑均 PASS（`77`、`78`），改將該輪 `TMP`、`TEMP` 指向 `D:/scratch/wh-d9f2-20261015/test-fixtures` 後全套 549/549。**僅證實差異與最後結果，未證明 C: TEMP 拒絕的根因，不得隱藏失敗紀錄。** R5 仍是候選，待獨立審查／mock Gate／Release／CI／實機。
+
+## 14 Lock-overlap Case B 診斷探針（D9-F2 後續）
+
+**狀態：R3 已審查、完整自動化驗證、實機 Case B 驗收 PASS；未部署、未合併。** 探針只在 opt-in feature `lock-overlap-diag`（預設關閉）中編入，正式單人／雙人 GUI 建置不含此功能。
+
+### 14.1 目的與範圍
+
+D9-F2 規定：登入 ceremony 期間收到上鎖要求時，結果須丟棄並回「金鑰操作期間已收到上鎖要求…」。實機上難以精準在「Windows 已驗證成功、金庫已解開、結果尚未發布」這個窗口按下上鎖。Case B 探針在此窗口（post-native/pre-publication）由內部 worker 呼叫與 `lock` command 相同的 `lock_inner_at`，確認 `pending_lock` 已收件後才放行既有發布流程，並寫入不含秘密的 exclusive-create 收據。Case A（native 等待中收到上鎖）不在本探針範圍。
+
+- **Arm 條件（缺一即以 exit 78 拒絕啟動，不碰金庫）：** 命令列旗標 `--lock-overlap-diag-case-b` 恰好一次、固定執行檔名 `fidovault-lock-overlap-diag.exe`、父資料夾 `lock-overlap-diag-*`、內容固定的 marker、既有 `vault.db`、本機磁碟非 UNC／reparse／`FidoVault` 路徑、hardware backend、單人版。
+- **一次性：** arm 只被下一個 `login_any_key` 取走一次，15 分鐘到期；其他入口（密碼、Windows Hello）不取用。
+- **雙人版：** 編入 `dual-control` 時 arm 一律拒絕（`NotSingleEdition`），claim 永遠 inactive。
+
+### 14.2 審查與修正歷程
+
+- **R1／R2：** 獨立審查（R2 Officer 通過；Claude reviewer 因額度中止，無 verdict）。
+- **R2 完整驗證發現：** `dual-control,lock-overlap-diag` 組合有 18 個單人專用測試失敗、reentry 測試無限等待；新增 `Controller::is_armed` 產生 production dead-code lint；Windows Hello mock Gate 首輪偶發失敗無法分類。判定為測試未做版別隔離，非雙人版驗證繞過。
+- **R3 修正（TDD RED→GREEN）：** 單人專用測試加 `#[cfg(not(feature = "dual-control"))]`，新增 2 個 dual-only 測試證明不 arm、不介入、不消耗 arm、不寫收據、金庫不變；reentry 改 `recv_timeout(5s)` 並加 source oracle；`is_armed` 改 `cfg(test)`；Hello mock CLI 失敗時輸出固定 `stage／category／os_code` 診斷，Python 端 allowlist 解析（其他一律 `CLI_FAILURE_REDACTED`），新增 `storage-lock` case（Hello Gate 改為 10 cases／31 checks）。
+- **R3 審查：** Reviewer 與 Officer 兩路獨立審查均 `passed=true`、coverage complete、阻擋項 0（凍結 manifest `d9742b93…3713`，205 檔）。
+
+### 14.3 自動化驗證（R3 凍結副本，MSVC）
+
+| 項目 | 結果 |
+|---|---|
+| Node／Python 診斷 | 155/155；7/7 |
+| Rust `real-ctap` | **首輪 548/1**（見 14.5）；focused 重跑 5×5 通過 |
+| Rust `real-ctap,lock-overlap-diag`（Debug／Release） | 585 通過、1 ignored |
+| Rust `real-ctap,dual-control` | 549/549 |
+| Rust `real-ctap,dual-control,lock-overlap-diag` | 568 通過、1 ignored（R2：565／18 失敗並卡住） |
+| CLI 診斷測試 | 4/4 |
+| Strict Clippy | 只剩 7 項既有 lint，新增 0 |
+| Release wiring／backend；production `cargo check --release` | 13/13、7/7×3；4/4 |
+| Mock Gate 單人／Hello／雙人 | 20/20；10 cases／31 checks；25/25 |
+| Symlink 專項 | BLOCKED_ENVIRONMENT（OS 1314） |
+
+CI 新增：Python 診斷 unittest、`real-ctap,lock-overlap-diag` 全套、dual+diag 的 `lock_overlap_diag::` 模組、Hello mock CLI `diagnostic_tests`；job 時限 40→60 分。
+
+### 14.4 實機 Case B 驗收（2026-10-17，WS2 本機 Console，YubiKey Bio 指紋）
+
+診斷 GUI 由同一凍結來源以 GNU `--release --features real-ctap,lock-overlap-diag --bin portable-fido-vault` 建置，SHA256 `92f11d7d723ff8a091ff7980550753aaeea4239e02014007685ddfd1286aa4d1`，**NON-DEPLOYABLE**；loader 與上一版相同（Microsoft 簽章有效）。Release 執行檔對 5 種錯誤 fixture（重複旗標、資料夾名、執行檔名、缺 marker、缺金庫）皆 exit 78 且未建立金庫。
+
+| 項 | 結果 |
+|---|---|
+| S1–S5 合成金庫、假條目、YubiKey 註冊（0→1）、上鎖關閉 | PASS（使用者回報） |
+| B1 診斷模式第一次金鑰登入 | PASS：顯示「金鑰操作期間已收到上鎖要求，金庫已上鎖；請重新登入」，無條目 |
+| 收據（唯讀檢查 21/21） | `CASE_B_RESPONSE_DISCARDED`；`lock_received`／`pending_lock_after_worker_join`／`vault_locked` 為 true，`entry_count` 0，事件 8 步順序正確，`ffi_observed=false` |
+| B2 同程序再次金鑰登入 | PASS：正常解鎖；未產生第二份收據（不重新 arm） |
+| B3 正常結束 | PASS，EXIT_CODE=0 |
+| UV 方式 | 指紋（使用者回報） |
+
+### 14.5 限制與未完成
+
+- native success 由「brokered backend＋roaming 槽位經 AES-GCM 驗證解開」推論，未觀察 FFI；UV 方式與畫面文字為使用者回報。僅 1 台主機／1 支金鑰；Case A 未涵蓋。10 秒 ack 時限不保證命令總時長；檢查後同使用者惡意程序換檔的窗口仍在。
+- `real-ctap` 首輪 1 例失敗（`d9f1_r2_roaming_direct_register_tmp_write_failure_rolls_back` 測試準備階段新金庫寫入 `Io os 5`），R3 未改動 `vault.rs`；與 Hello Gate 歷史偶發同型，分類 FLAKY_NOT_CLEARED（疑似防毒／索引短暫占用，未提升權限確認），未加重試。
+- 既有 7 項 Clippy lint 與 Symlink 權限缺口另案；部署與合併需另行授權。

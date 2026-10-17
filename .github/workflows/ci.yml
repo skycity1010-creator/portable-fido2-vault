@@ -17,7 +17,7 @@ jobs:
   windows-tests:
     name: UI, Rust, and mock Gate E2E
     runs-on: windows-2025
-    timeout-minutes: 40
+    timeout-minutes: 60
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -38,6 +38,12 @@ jobs:
       - name: Run frontend tests
         run: node --test
 
+      - name: Run Windows Hello Gate diagnostics unit tests
+        env:
+          PYTHONUTF8: '1'
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python -m unittest discover -s tests -p test_windows_hello_gate_diagnostics.py -v
+
       - name: Run Rust unit tests (real CTAP feature, no hardware)
         working-directory: src-tauri
         env:
@@ -55,6 +61,25 @@ jobs:
           CARGO_PROFILE_DEV_DEBUG: 0
           CARGO_INCREMENTAL: 0
         run: cargo test --lib --locked --features real-ctap,dual-control -j 1
+
+      - name: Run Rust unit tests (lock-overlap Case B diagnostic, single, no hardware)
+        working-directory: src-tauri
+        env:
+          CARGO_BUILD_JOBS: 1
+          CARGO_PROFILE_TEST_DEBUG: 0
+          CARGO_PROFILE_DEV_DEBUG: 0
+          CARGO_INCREMENTAL: 0
+        run: cargo test --lib --locked --features real-ctap,lock-overlap-diag -j 1 -- --test-threads=1
+
+      - name: Run lock-overlap diagnostic module tests (dual-control isolation)
+        working-directory: src-tauri
+        env:
+          CARGO_BUILD_JOBS: 1
+          CARGO_PROFILE_TEST_DEBUG: 0
+          CARGO_PROFILE_DEV_DEBUG: 0
+          CARGO_INCREMENTAL: 0
+        run: |
+          cargo test --lib --locked --features real-ctap,dual-control,lock-overlap-diag -j 1 lock_overlap_diag:: -- --test-threads=1
 
       - name: Build mock CLI for offline Gate E2E
         working-directory: src-tauri
@@ -78,6 +103,12 @@ jobs:
       - name: Build Windows Hello mock CLI for offline Gate E2E
         working-directory: src-tauri
         run: cargo build --release --locked --example windows_hello_gate_cli
+      - name: Run Windows Hello mock CLI diagnostic tests
+        working-directory: src-tauri
+        env:
+          CARGO_BUILD_JOBS: 1
+          CARGO_INCREMENTAL: 0
+        run: cargo test --release --locked --example windows_hello_gate_cli -j 1 diagnostic_tests
       - name: Run Windows Hello mock Gate E2E
         working-directory: src-tauri
         shell: pwsh
