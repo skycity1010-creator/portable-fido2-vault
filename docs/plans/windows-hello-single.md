@@ -528,7 +528,7 @@ R4 Reviewer `D:/scratch/wh-d9f2-20261015/reviewer-R4/reviewer-verdict.json` 為 
 
 ## 14 Lock-overlap Case B 診斷探針（D9-F2 後續）
 
-**狀態：R3 已審查、完整自動化驗證、實機 Case B 驗收 PASS；未部署、未合併。** 探針只在 opt-in feature `lock-overlap-diag`（預設關閉）中編入，正式單人／雙人 GUI 建置不含此功能。
+**狀態：R3 已審查；已完成完整自動化驗證流程但首輪非全綠（GATES_NOT_ALL_ACCEPTED，1 例 FLAKY_NOT_CLEARED，見 14.5）；實機 Case B 驗收 PASS；未部署、未合併。** 探針只在 opt-in feature `lock-overlap-diag`（預設關閉）中編入，正式單人／雙人 GUI 建置不含此功能。
 
 ### 14.1 目的與範圍
 
@@ -561,6 +561,8 @@ D9-F2 規定：登入 ceremony 期間收到上鎖要求時，結果須丟棄並�
 | Symlink 專項 | BLOCKED_ENVIRONMENT（OS 1314） |
 
 CI 新增：Python 診斷 unittest、`real-ctap,lock-overlap-diag` 全套、dual+diag 的 `lock_overlap_diag::` 模組、Hello mock CLI `diagnostic_tests`；job 時限 40→60 分。
+
+**首次 hosted CI（run `38995907263`，head `22fac78`）失敗：** single+diag 步驟 556 通過／29 失敗，全部為 `lock_overlap_diag` 的 fixture 驗證 `CanonicalMismatch`。原因是 hosted runner 的 `%TEMP%` 為 8.3 短檔名（`C:\Users\RUNNER~1\…`），`canonicalize` 展開為長檔名後與原路徑不等；本機驗證全程使用長路徑 D: fixture，因此未暴露。本機以同一測試執行檔重現：短路徑 `TMPDIR` → `CanonicalMismatch` 失敗、長路徑 → 通過。屬測試環境問題，探針對短路徑**拒絕（fail closed）**符合設計；修正只改 CI：兩個 diag 步驟改用 `RUNNER_TEMP` 下新建的長路徑 fixture root（既存目錄或含 `~` 即中止），不改已審查的程式碼。限制：診斷版若以 8.3 短路徑啟動也會以 `CanonicalMismatch` 拒絕 arm。
 
 ### 14.4 實機 Case B 驗收（2026-10-17，WS2 本機 Console，YubiKey Bio 指紋）
 
