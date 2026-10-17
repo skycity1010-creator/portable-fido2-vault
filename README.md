@@ -19,7 +19,7 @@ Windows 桌面、**完全離線**、**portable 免安裝**的 FIDO2 密碼金庫
 - 單人版另可在本機 Console 註冊 **Windows Hello**（需 WebAuthn API v8+ 與 PRF；RDP 不提供）作為另一種解鎖方式
 - 金鑰／Windows Hello 驗證在背景執行緒進行，期間 UI 不凍結；驗證途中按「上鎖」或閒置上鎖時，該次登入結果一律丟棄並提示重新登入
 - 另有**雙群組控管版**（`portable-fido-vault-dual.exe`）：金鑰登入須 A、B 群組各一支依序驗證，見下方專節
-- ⚠️ **無復原機制**：主密碼遺忘且所有 FIDO2 金鑰全失 = 資料永久無法取回
+- ⚠️ **無復原機制**：主密碼遺忘、所有外接 FIDO2 金鑰都不可用，且沒有仍可使用的已註冊 Windows Hello 本機憑證時 = 資料永久無法取回（沒有任何額外的重設或復原管道）
 
 ## 目前狀態（2026-10-17）
 
@@ -35,10 +35,10 @@ Windows 桌面、**完全離線**、**portable 免安裝**的 FIDO2 密碼金庫
 - **自動化驗證（GitHub Actions，Windows，`fe520ae` main run `39002784117`）**：UI 155/155、Python Gate 診斷 7/7、Rust `real-ctap` 549/549、`real-ctap,dual-control` 549/549、`real-ctap,lock-overlap-diag` 585 通過＋1 ignored、dual＋diag 診斷模組 19 通過＋1 ignored、Windows Hello mock CLI 診斷 4/4、mock Gate 單人 20/20、Windows Hello 10 cases／31 checks、雙群組 25/25。
 - **實機驗收（使用者回報，非 assistant 操作硬體）**：
   - 單人版 Windows Hello C1–C5（SKYCITY-PC 本機 Console，臉部辨識）、YubiKey Y1–Y4／T1–T3（SKYCITY-PC Console）、YubiKey N1–N4（Win11-NB Console）、RDP R1–R8（SKYCITY-PC → WS2）皆 PASS；R9-1 自動逾時 **WAIVED**（使用者同意略過，非 PASS）。以上驗收對象為候選 `cde4e24`（PR #30 合併前版本），未在 `fe520ae` 正式版重跑。
-  - lock-overlap Case B（金庫已解開、結果尚未顯示時收到上鎖）以診斷版在 WS2 本機 Console、YubiKey Bio 指紋 PASS：登入結果被丟棄並顯示上鎖訊息，下一次登入正常。
-  - 雙群組控管版 D13：Win11-NB 本機 Console、兩支 YubiKey Bio，V1–V11 PASS；V12 軌跡紀錄排序問題修正後於最新候選補驗通過；V13（單人版版本互斥實機選測）**NOT_TESTED**。
+  - lock-overlap Case B（金庫已解開、結果尚未顯示時收到上鎖）以診斷版（EXE SHA-256 前綴 `92f11d7d`，不可發佈）在 WS2 本機 Console、YubiKey Bio 指紋 PASS：登入結果被丟棄並顯示上鎖訊息，下一次登入正常。收據由程式寫出；Windows 驗證成功是由金庫成功解開推定（未直接觀察 Windows API），指紋方式與畫面文字為使用者回報。
+  - 雙群組控管版 D13（2026-10-12 前分批候選驗收，非 `fe520ae` 全套重跑）：Win11-NB 本機 Console、兩支 YubiKey Bio，V1–V11 PASS；V12 軌跡紀錄排序問題修正後於最新候選補驗通過；V13（單人版版本互斥實機選測）**NOT_TESTED**。
 - **已知未處理（2026-10-17 決定暫不處理）**：新金庫寫入偶發 `os error 5`（推測防毒／索引短暫占用，未確認）、7 項既有 Clippy lint、Symlink 權限測試（OS 1314）、Case A（Windows 驗證進行中收到上鎖）未實機驗證；Win11-NB（TPM 1.2）於 S0 spike 時 PRF assertion 不可用，Windows Hello 註冊在該機會 fail closed。
-- 細節與證據：`docs/plans/windows-hello-single.md`（§13 D9-F2、§14 Case B）、`docs/plans/dual-control.md`、`docs/PROJECT.md`、`docs/rdp-webauthn-verification.md`。`docs/PROJECT.md` 與計畫檔中部分 D9／D13 段落仍保留合併前的「未驗收」字樣，以本節為最新狀態。
+- 細節與證據：`docs/plans/windows-hello-single.md`（§13 D9-F2、§14 Case B）、`docs/plans/dual-control.md`、`docs/PROJECT.md`、`docs/rdp-webauthn-verification.md`。`docs/PROJECT.md`、`docs/user-verification-steps.md` 與計畫檔中部分 D9／D13 段落仍保留合併前的「Draft／未驗收」字樣，以本節為最新狀態；那些檢查清單中本節未列為 PASS 的項目仍視為未測。
 
 ## 目錄結構
 
@@ -182,8 +182,8 @@ foreach ($name in $programFiles) {
 **一鍵跑全部 E2E（Gate 2/3/4/5/6/8）**：
 
 ```bash
-cd C:/project/portable-fido2-vault/src-tauri
-cargo +stable-x86_64-pc-windows-gnu build --release --example vault_cli
+cd D:/project/portable-fido2-vault/src-tauri
+cargo +stable-x86_64-pc-windows-gnu build --release --locked --example vault_cli
 python ../scripts/gate_e2e.py     # 逐項 PASS/FAIL + 證據；全綠 = exit 0
 ```
 
@@ -202,7 +202,7 @@ $P audit        --path $V --pw Test1234!
 無 FIDO 硬體時，MockBackend（預設）以軟體金鑰實作 hmac-secret 語義，Gate 3/4 仍可端到端驗證；
 有實體 YubiKey 5+ 時切換 real CTAP2 後端實測。
 
-CI（`.github/workflows/ci.yml`，PR 與 `main` push 觸發）依序執行：`node --test`、Windows Hello Gate 診斷 Python 測試、Rust `real-ctap`／`real-ctap,dual-control`／`real-ctap,lock-overlap-diag` 全套、dual＋diag 的 `lock_overlap_diag::` 模組、三個 mock Gate（`gate_e2e.py`、`gate_e2e_windows_hello.py --case all`、`gate_e2e_dual.py`）。本機重現：
+CI（`.github/workflows/ci.yml`，以 `main` 為 base 的 PR 與 `main` push 觸發）依序執行：`node --test`、Windows Hello Gate 診斷 Python 測試、Rust `real-ctap`／`real-ctap,dual-control`／`real-ctap,lock-overlap-diag` 全套、dual＋diag 的 `lock_overlap_diag::` 模組、三個 mock Gate（`gate_e2e.py`、`gate_e2e_windows_hello.py --case all`、`gate_e2e_dual.py`）。本機重現：
 
 ```bash
 cd src-tauri
@@ -214,7 +214,7 @@ python ../scripts/gate_e2e_windows_hello.py <全新資料夾> --cli ./target/rel
 
 ### lock-overlap Case B 診斷版（僅開發驗證，不可發佈）
 
-Cargo feature `lock-overlap-diag`（預設關閉）可編出用來實機驗證「金庫已解開、登入結果尚未顯示時收到上鎖」的診斷版。只有同時符合以下條件才會啟用一次，否則以結束碼 78 拒絕啟動且不碰金庫：命令列 `--lock-overlap-diag-case-b`、執行檔名 `fidovault-lock-overlap-diag.exe`、所在資料夾名稱 `lock-overlap-diag-*`、固定內容的 marker 檔、既有 `vault.db`、本機磁碟長路徑（非 UNC／reparse／8.3 短檔名，且路徑中沒有名為 `FidoVault` 的資料夾）、硬體 backend 與單人版。結果寫入不含秘密的收據。**正式版建置不得加此 feature**，也不要對正式金庫使用；細節見 `docs/plans/windows-hello-single.md` §14。
+Cargo feature `lock-overlap-diag`（預設關閉）可編出用來實機驗證「金庫已解開、登入結果尚未顯示時收到上鎖」的診斷版。未加命令列旗標 `--lock-overlap-diag-case-b` 時不啟用診斷，照一般流程啟動。加上旗標後，必須同時符合以下條件才會啟用一次；旗標重複或任一條件不符，即以結束碼 78 拒絕啟動且不碰金庫：旗標只出現一次、執行檔名 `fidovault-lock-overlap-diag.exe`、所在資料夾名稱 `lock-overlap-diag-*`、固定內容的 marker 檔、既有 `vault.db`、本機磁碟長路徑（非 UNC／reparse／8.3 短檔名，且路徑中沒有名為 `FidoVault` 的資料夾）、硬體 backend 與單人版。結果寫入不含秘密的收據。**正式版建置不得加此 feature**，也不要對正式金庫使用；細節見 `docs/plans/windows-hello-single.md` §14。
 
 ## 加密機制（KEK 與多槽位設計）
 
