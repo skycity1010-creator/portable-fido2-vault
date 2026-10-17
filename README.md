@@ -16,15 +16,29 @@ Windows 桌面、**完全離線**、**portable 免安裝**的 FIDO2 密碼金庫
 - 安全性金鑰可在註冊時設定 FidoVault 本機別名；名稱以明文存於 vault header，請勿輸入敏感資料
 - 本機 Console 金鑰操作時，第一個 Windows 安全性視窗會盡力拉到前景（已知：同一操作的第二個視窗可能仍在背景）
 - 支援在已實測矩陣內以 RDP（WebAuthn 重新導向）使用金鑰；WebAuthn 不可用（API < v4）時程式仍可啟動並以主密碼登入，金鑰操作會說明原因並拒絕
+- 單人版另可在本機 Console 註冊 **Windows Hello**（需 WebAuthn API v8+ 與 PRF；RDP 不提供）作為另一種解鎖方式
+- 金鑰／Windows Hello 驗證在背景執行緒進行，期間 UI 不凍結；驗證途中按「上鎖」或閒置上鎖時，該次登入結果一律丟棄並提示重新登入
+- 另有**雙群組控管版**（`portable-fido-vault-dual.exe`）：金鑰登入須 A、B 群組各一支依序驗證，見下方專節
 - ⚠️ **無復原機制**：主密碼遺忘且所有 FIDO2 金鑰全失 = 資料永久無法取回
 
-## 目前狀態（2026-10-13）
+## 目前狀態（2026-10-17）
 
-- `main` 已包含 PR #2–#26；目前 Win11-NB 正式部署 GUI 來自 PR #25（commit `5b943c7`，`main` `5073642` 起），SHA-256 `3b3f7367be81baab1a37c5249788f815c397b9e5241289880a3e6f7618996322`，2026-10-11 部署至 `C:\FidoVault`。
-- 自動化驗證（GitHub Actions，Windows）：UI 65/65、Rust `--features real-ctap` 200/200、mock Gate E2E 20/20。
-- 部署、驗收與殘餘未測項目見 `docs/PROJECT.md` §17、`docs/user-verification-steps.md` 末節與 `docs/rdp-webauthn-verification.md` R6。
-- **單人版 Windows Hello（PR #30，Draft）**：D1–D7 程式及 Mock Gate 已完成；D8 文件同步已審查完成；D9 Release／隔離 staging／實機驗收尚未完成。PR 未合併、未部署；目前正式安裝版本沒有由本分支交付的 Windows Hello，不能把 mock 通過當成實機支援。細節見下方「單人版 Windows Hello」、`docs/spec.md` 與 `docs/user-verification-steps.md` 的 V1–V9。
-- **雙群組控管版（開發中）**：分支 `feature/dual-control-20261011`、draft PR #29。D1–D11（程式與全套自動化驗證）已完成，Win11-NB 實機驗收（D13）尚未執行；**未合併、未部署，不是可發佈產物**。見下方「雙群組控管版」與 `docs/plans/dual-control.md`。
+- `main` 已包含 PR #2–#30；最新 merge commit `fe520ae`（PR #30：單人版 Windows Hello、WebAuthn 驗證移出 UI 執行緒、lock-overlap Case B 診斷探針）。PR #29（雙群組控管版）已於 2026-10-12 合併。
+- **正式部署（Win11-NB，2026-10-17）**：由 `fe520ae` 建置（GNU Release，`real-ctap`；不含 `lock-overlap-diag`），只替換 EXE、未動 `vault.db`，部署前 EXE 與 DB 已備份至 `C:\FidoVault\backups\pr30-fe520ae-20261017`；部署後使用者回報可正常登入。
+
+  | 位置 | 版本 | SHA-256 |
+  |---|---|---|
+  | `C:\FidoVault\portable-fido-vault.exe` | 單人版 | `10ca994cfb6195163c8f8ce522367061b0b6e54599a81092160b0429102e9887` |
+  | `C:\FidoVault\dual\portable-fido-vault-dual.exe` | 雙群組控管版 | `b0ad4856cd68d653c90134111df85347a4d52a1cbecf2ecd77f642b92231bf8d` |
+  | 兩資料夾的 `WebView2Loader.dll` | x64 載入器（Microsoft 簽章） | `86545b66cdb0603bc26b626fb9ad610cb6e71f28d468f5ea66df23b03dda96d5` |
+
+- **自動化驗證（GitHub Actions，Windows，`fe520ae` main run `39002784117`）**：UI 155/155、Python Gate 診斷 7/7、Rust `real-ctap` 549/549、`real-ctap,dual-control` 549/549、`real-ctap,lock-overlap-diag` 585 通過＋1 ignored、dual＋diag 診斷模組 19 通過＋1 ignored、Windows Hello mock CLI 診斷 4/4、mock Gate 單人 20/20、Windows Hello 10 cases／31 checks、雙群組 25/25。
+- **實機驗收（使用者回報，非 assistant 操作硬體）**：
+  - 單人版 Windows Hello C1–C5（SKYCITY-PC 本機 Console，臉部辨識）、YubiKey Y1–Y4／T1–T3（SKYCITY-PC Console）、YubiKey N1–N4（Win11-NB Console）、RDP R1–R8（SKYCITY-PC → WS2）皆 PASS；R9-1 自動逾時 **WAIVED**（使用者同意略過，非 PASS）。以上驗收對象為候選 `cde4e24`（PR #30 合併前版本），未在 `fe520ae` 正式版重跑。
+  - lock-overlap Case B（金庫已解開、結果尚未顯示時收到上鎖）以診斷版在 WS2 本機 Console、YubiKey Bio 指紋 PASS：登入結果被丟棄並顯示上鎖訊息，下一次登入正常。
+  - 雙群組控管版 D13：Win11-NB 本機 Console、兩支 YubiKey Bio，V1–V11 PASS；V12 軌跡紀錄排序問題修正後於最新候選補驗通過；V13（單人版版本互斥實機選測）**NOT_TESTED**。
+- **已知未處理（2026-10-17 決定暫不處理）**：新金庫寫入偶發 `os error 5`（推測防毒／索引短暫占用，未確認）、7 項既有 Clippy lint、Symlink 權限測試（OS 1314）、Case A（Windows 驗證進行中收到上鎖）未實機驗證；Win11-NB（TPM 1.2）於 S0 spike 時 PRF assertion 不可用，Windows Hello 註冊在該機會 fail closed。
+- 細節與證據：`docs/plans/windows-hello-single.md`（§13 D9-F2、§14 Case B）、`docs/plans/dual-control.md`、`docs/PROJECT.md`、`docs/rdp-webauthn-verification.md`。`docs/PROJECT.md` 與計畫檔中部分 D9／D13 段落仍保留合併前的「未驗收」字樣，以本節為最新狀態。
 
 ## 目錄結構
 
@@ -32,14 +46,21 @@ Windows 桌面、**完全離線**、**portable 免安裝**的 FIDO2 密碼金庫
 portable-fido2-vault/
 ├─ README.md            ← 本檔
 ├─ docs/spec.md         ← 技術規格（架構、金庫格式、FIDO2 偵測流程）
+├─ docs/plans/          ← 各功能設計／決策與驗證紀錄（windows-hello-single.md、dual-control.md…）
 ├─ src/                 ← 前端（純靜態 HTML/JS/CSS，繁中 UI）
+├─ tests/               ← UI 測試（node --test）與 Windows Hello Gate 診斷 Python 測試
+├─ scripts/             ← mock Gate E2E（gate_e2e*.py）與 Win11-NB 部署／診斷輔助
 └─ src-tauri/           ← Tauri v2 (Rust) 後端
    ├─ src/vault.rs      金庫格式 / 加密落盤
    ├─ src/crypto.rs     Argon2id / AES-GCM / HKDF
    ├─ src/fido2.rs      FIDO2 後端 trait + Mock/Real
+   ├─ src/windows_webauthn.rs  Windows WebAuthn（外接金鑰與 Windows Hello 平台驗證器）
+   ├─ src/registration_cleanup_journal.rs  Windows Hello 註冊失敗清理收據
    ├─ src/edition.rs    版本判斷（single / dual，依 Cargo feature `dual-control`）
+   ├─ src/lock_overlap_diag.rs  Case B 診斷探針（feature `lock-overlap-diag`，預設關閉，不隨正式版發佈）
    ├─ src/bin/portable-fido-vault-dual.rs  雙群組控管版 GUI 入口（需 `dual-control`）
    ├─ examples/vault_cli.rs       E2E 測試 CLI（單人版 Gate 驗證用）
+   ├─ examples/windows_hello_gate_cli.rs  Windows Hello mock Gate CLI（僅供測試，不可發佈）
    └─ examples/dual_vault_cli.rs  雙群組控管版 mock E2E CLI（僅供測試，不可發佈）
 ```
 
@@ -52,9 +73,9 @@ portable-fido2-vault/
 
 ```bash
 # bash / git-bash（WS2）
-export PATH="$HOME/.cargo/bin:$HOME/tools/winlibs-x86_64-posix-seh-gcc-14.2.0-mingw-w64ucrt-12.0.0-r2/bin:$PATH"
-cd C:/project/portable-fido2-vault/src-tauri
-cargo +stable-x86_64-pc-windows-gnu build --release --features real-ctap --bin portable-fido-vault
+export PATH="$HOME/.cargo/bin:$HOME/tools/winlibs-mingw/mingw64/bin:$PATH"
+cd D:/project/portable-fido2-vault/src-tauri
+cargo +stable-x86_64-pc-windows-gnu build --release --locked --features real-ctap --bin portable-fido-vault
 # 產出硬體版 GUI；打包須取 target/release/portable-fido-vault.exe 及同目錄 WebView2Loader.dll
 ```
 
@@ -87,7 +108,7 @@ Windows Release 硬體模式以單一通用「以金鑰登入」入口呼叫 Win
 
 Win11-NB 本機 Console 已確認通用登入不需先選金鑰。每次金鑰操作的第一個 Windows 安全性視窗會被拉到前景；已知問題：同一次操作的第二個視窗（按指紋／觸碰提示）仍可能被 FidoVault 擋住，直接操作金鑰即可完成，不影響使用（需同一操作多次拉前景才能修正，目前未授權）。Windows WebAuthn API v4+ 仍是硬體 GUI 的必要條件；較舊 API 版本會 fail closed。
 
-## 單人版 Windows Hello（本機 Console；尚待 D9 實機驗收）
+## 單人版 Windows Hello（本機 Console）
 
 Windows Hello 是單人版的本機平台憑證，和外接 YubiKey 是兩種不同的解鎖方式。可用性檢查要求 Windows WebAuthn API v8+、Windows Hello 平台驗證器可用，且程式在本機 Console 執行；RDP／WinRM／session 0 不提供此功能。外接 FIDO2 金鑰既有的 API v4+ 與 RDP 支援範圍，不能套用到 Windows Hello。
 
@@ -95,7 +116,9 @@ Windows Hello 是單人版的本機平台憑證，和外接 YubiKey 是兩種不
 
 Windows Hello 使用 Windows platform authenticator；此功能範圍限 Windows 本機儲存的 credential，第三方／同步型 passkey manager 不支援。**目前 backend 使用 v8 options，只要求 PLATFORM attachment；未呼叫 v9 `WebAuthNGetAuthenticatorList`／傳入 authenticator ID 來鎖定特定 provider。**Microsoft API v9 提供指定 authenticator 的能力，但 FidoVault 尚未實作；Windows 的 provider 選擇不是程式可保證的設定。credential 不存放於 `vault.db`，因此複製金庫檔案本身不會匯出該 credential。執行驗收前須在「設定 → 帳戶 → 通行金鑰 → 進階選項」確認使用「儲存到這部 Windows 裝置」的本機 provider；若 provider 為第三方同步服務或狀態不明，停止並標記超出範圍／未測，不要改同步設定。從 Windows 11 24H2 起，應用程式存取 passkeys 前可能出現 privacy-consent 提示；若出現，記錄實際選擇與結果。只有在專用測試機且經使用者／管理員核准時才允許本測試程式使用 passkeys；不要變更組織政策或全域設定。若未授權或被拒絕，將該次驗收標記為「受同意設定阻擋／未測」，不可誤報成 PRF 不支援。
 
-本分支的自動化結果僅為 Mock Gate：9 cases／29 checks；不代表實體 Windows Hello、Windows Settings 清理結果或 GUI 提示前景已驗收。此功能尚未合併／部署；完整狀態以 `docs/PROJECT.md` 最新 Windows Hello 段落為準。
+已合併（PR #30）並隨 2026-10-17 單人版正式部署。實機驗收為 SKYCITY-PC 本機 Console（C1–C5，使用者回報 PASS）；Win11-NB 於 S0 spike 時 PRF assertion 不可用，註冊會 fail closed，屬平台限制。自動化 mock Gate 為 10 cases／31 checks，不代表 Windows Settings 清理結果。
+
+註冊第二階段（PRF 驗證）若因 Windows 未把前景交回 FidoVault 而被拒，程式會保留這次註冊並顯示「繼續驗證／取消」：按「繼續驗證」讓 FidoVault 回到前景後再進行驗證，不會主動搶焦點。
 
 ## portable 部署到別台電腦（含 Win11-NB）
 
@@ -179,6 +202,20 @@ $P audit        --path $V --pw Test1234!
 無 FIDO 硬體時，MockBackend（預設）以軟體金鑰實作 hmac-secret 語義，Gate 3/4 仍可端到端驗證；
 有實體 YubiKey 5+ 時切換 real CTAP2 後端實測。
 
+CI（`.github/workflows/ci.yml`，PR 與 `main` push 觸發）依序執行：`node --test`、Windows Hello Gate 診斷 Python 測試、Rust `real-ctap`／`real-ctap,dual-control`／`real-ctap,lock-overlap-diag` 全套、dual＋diag 的 `lock_overlap_diag::` 模組、三個 mock Gate（`gate_e2e.py`、`gate_e2e_windows_hello.py --case all`、`gate_e2e_dual.py`）。本機重現：
+
+```bash
+cd src-tauri
+cargo test --lib --locked --features real-ctap
+cargo test --lib --locked --features real-ctap,lock-overlap-diag -- --test-threads=1   # fixture 根目錄須為長路徑（非 8.3 短檔名）
+cargo build --release --locked --example windows_hello_gate_cli
+python ../scripts/gate_e2e_windows_hello.py <全新資料夾> --cli ./target/release/examples/windows_hello_gate_cli.exe --case all
+```
+
+### lock-overlap Case B 診斷版（僅開發驗證，不可發佈）
+
+Cargo feature `lock-overlap-diag`（預設關閉）可編出用來實機驗證「金庫已解開、登入結果尚未顯示時收到上鎖」的診斷版。只有同時符合以下條件才會啟用一次，否則以結束碼 78 拒絕啟動且不碰金庫：命令列 `--lock-overlap-diag-case-b`、執行檔名 `fidovault-lock-overlap-diag.exe`、所在資料夾名稱 `lock-overlap-diag-*`、固定內容的 marker 檔、既有 `vault.db`、本機磁碟長路徑（非 UNC／reparse／8.3 短檔名，且路徑中沒有名為 `FidoVault` 的資料夾）、硬體 backend 與單人版。結果寫入不含秘密的收據。**正式版建置不得加此 feature**，也不要對正式金庫使用；細節見 `docs/plans/windows-hello-single.md` §14。
+
 ## 加密機制（KEK 與多槽位設計）
 
 仿 LUKS 的「隨機 master key + 多槽位包裝」架構，核心事實如下：
@@ -193,9 +230,9 @@ $P audit        --path $V --pw Test1234!
 - **全有或全無的存取模型**：主密碼或任一支已註冊 FIDO2 金鑰登入後，可取得所有條目的明文密碼（payload 是單一大塊 blob，無欄位級別名）。因此任何一支金鑰洩露 = 整個金庫失守；金鑰丟失或轉讓前務必先「移除金鑰」（不可逆）。
 - **錯誤判別與失敗軌跡**：GCM tag 驗證失敗即視為密碼／金鑰錯誤（不洩漏 timing）；未解鎖狀態的登入失敗寫入 sidecar `vault.db.failures`（僅時間戳＋method，上限 10 筆），成功解鎖後合併進加密 audit 並刪除 sidecar。
 
-## 雙群組控管版（dual-control，開發中）
+## 雙群組控管版（dual-control）
 
-> 狀態：程式與自動化驗證完成（D1–D11），Win11-NB 本機 Console 實機驗收（D13）**尚未執行**；PR #29 為 draft，未合併、未部署。設計與決策紀錄見 `docs/plans/dual-control.md`，格式見 `docs/spec.md` §3.1。
+> 狀態：PR #29 已合併；Win11-NB 本機 Console 實機驗收 D13（兩支 YubiKey Bio）V1–V11 使用者回報 PASS、V12 修正後補驗通過，V13 NOT_TESTED。正式版部署於 Win11-NB `C:\FidoVault\dual`（2026-10-17 更新為 `fe520ae`）。設計與決策紀錄見 `docs/plans/dual-control.md`，格式見 `docs/spec.md` §3.1。
 
 同一份程式碼以 Cargo feature `dual-control` 另外編出 `portable-fido-vault-dual.exe`。單人版 `portable-fido-vault.exe` 的行為、檔案格式與 UI 不變。
 
