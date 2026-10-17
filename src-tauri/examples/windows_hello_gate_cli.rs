@@ -153,6 +153,51 @@ impl FidoBackend for TracedPlatform {
     }
 }
 
+#[derive(Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum GateStage {
+    PasswordOpen,
+    PlatformRegister,
+    HeaderRead,
+}
+
+#[derive(serde::Serialize)]
+struct GateDiagnostic {
+    stage: GateStage,
+    category: &'static str,
+    os_code: Option<i32>,
+}
+
+fn diagnostic_for(stage: GateStage, error: &VaultError) -> GateDiagnostic {
+    let (category, os_code) = match error {
+        VaultError::Io(error) => ("io", error.raw_os_error()),
+        VaultError::Format(_) | VaultError::Json(_) => ("format", None),
+        VaultError::Crypto(_) => ("crypto", None),
+        VaultError::WrongPassword => ("authentication", None),
+        VaultError::Fido(_) => ("fido", None),
+        VaultError::WrongEdition { .. } => ("edition", None),
+        VaultError::DualNotReady | VaultError::DualStepExpired | VaultError::LastKeyInGroup(_) => {
+            ("dual-state", None)
+        }
+    };
+    GateDiagnostic {
+        stage,
+        category,
+        os_code,
+    }
+}
+
+fn report_gate_error(stage: GateStage, error: &VaultError) -> &'static str {
+    let diagnostic = diagnostic_for(stage, error);
+    let encoded = serde_json::to_string(&diagnostic).expect("fixed mock diagnostic serializes");
+    eprintln!("MOCK_GATE_DIAG {encoded}");
+    match stage {
+        GateStage::PasswordOpen => "unlock failed",
+        GateStage::PlatformRegister => "registration rejected",
+        GateStage::HeaderRead => "header failed",
+    }
+}
+
 fn run() -> Result<&'static str, &'static str> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.len() != 3 {
@@ -197,12 +242,13 @@ fn run() -> Result<&'static str, &'static str> {
         }
         "register" => {
             let mut vault = Vault::open_password_for(&path, &password, Edition::Single)
-                .map_err(|_| "unlock failed")?;
+                .map_err(|error| report_gate_error(GateStage::PasswordOpen, &error))?;
             let mut backend = TracedPlatform::new(local_backend(&path, &args[2])?);
             let registered = vault
                 .register_windows_hello(&mut backend, "gate-host", Edition::Single)
-                .map_err(|_| "registration rejected")?;
-            let header = Vault::read_header(&path, Edition::Single).map_err(|_| "header failed")?;
+                .map_err(|error| report_gate_error(GateStage::PlatformRegister, &error))?;
+            let header = Vault::read_header(&path, Edition::Single)
+                .map_err(|error| report_gate_error(GateStage::HeaderRead, &error))?;
             if header.key_slots.len() != 1
                 || header.key_slots[0].authenticator != Some(SlotAuthenticator::Platform)
                 || backend.created.len() != 1
@@ -336,6 +382,63 @@ fn main() {
         Err(category) => {
             eprintln!("FAIL {category}");
             std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn io_diagnostic_retains_only_stage_and_numeric_os_error() {
+        let error = VaultError::Io(std::io::Error::from_raw_os_error(32));
+        let diag = diagnostic_for(GateStage::PasswordOpen, &error);
+        let value = serde_json::to_value(diag).unwrap();
+        assert_eq!(value["stage"], "password-open");
+        assert_eq!(value["category"], "io");
+        assert_eq!(value["os_code"], 32);
+        assert_eq!(value.as_object().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn format_diagnostic_does_not_serialize_error_message_or_path() {
+        let error = VaultError::Format("synthetic-sensitive-path-and-credential".into());
+        let diag = diagnostic_for(GateStage::HeaderRead, &error);
+        assert_eq!(diag.category, "format");
+        assert_eq!(diag.os_code, None);
+        let output = serde_json::to_string(&diag).unwrap();
+        assert!(!output.contains("synthetic-sensitive-path-and-credential"));
+    }
+
+    #[test]
+    fn fido_diagnostic_never_formats_backend_internal_payload() {
+        let error = VaultError::Fido(FidoError::Internal(
+            "synthetic-sensitive-backend-data".into(),
+        ));
+        let diag = diagnostic_for(GateStage::PlatformRegister, &error);
+        assert_eq!(diag.category, "fido");
+        assert_eq!(diag.os_code, None);
+        assert!(!serde_json::to_string(&diag)
+            .unwrap()
+            .contains("synthetic-sensitive-backend-data"));
+    }
+
+    #[test]
+    fn non_io_diagnostics_keep_fixed_categories_and_no_os_code() {
+        for (error, expected) in [
+            (VaultError::WrongPassword, "authentication"),
+            (
+                VaultError::WrongEdition {
+                    vault: Edition::Dual,
+                },
+                "edition",
+            ),
+            (VaultError::DualNotReady, "dual-state"),
+        ] {
+            let diag = diagnostic_for(GateStage::PasswordOpen, &error);
+            assert_eq!(diag.category, expected);
+            assert_eq!(diag.os_code, None);
         }
     }
 }

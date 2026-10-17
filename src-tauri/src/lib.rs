@@ -25,6 +25,8 @@ pub mod csv_import;
 pub mod diag_log;
 pub mod edition;
 pub mod fido2;
+#[cfg(feature = "lock-overlap-diag")]
+mod lock_overlap_diag;
 mod registration_cleanup_journal;
 pub mod vault;
 #[cfg(all(windows, feature = "real-ctap"))]
@@ -1743,13 +1745,20 @@ fn login_any_key_inner(
     let (mut guard, require_foreground) = KeyOperationGuard::begin_login(state, |g| {
         Ok(g.backend.uses_brokered_key_selection())
     })?;
+    #[cfg(feature = "lock-overlap-diag")]
+    let mut probe = lock_overlap_diag::Probe::claim(path)?;
     let opened = (|| -> Result<vault::Vault> {
         let owner_hwnd = raise(require_foreground)?;
         let (backend, _) = guard.parts();
         backend.set_webauthn_parent_hwnd(owner_hwnd);
         vault::Vault::open_any_key(path, None, backend).map_err(|e| e.to_string())
     })();
-    guard.complete_login(opened, |_| {})
+    #[cfg(feature = "lock-overlap-diag")]
+    let opened = probe.pre_publication(state, path, require_foreground, opened);
+    let result = guard.complete_login(opened, |_| {});
+    #[cfg(feature = "lock-overlap-diag")]
+    let result = probe.conclude(state, path, result);
+    result
 }
 
 /// 雙人版兩步驟登入第一步的回應（不含任何機密）。
@@ -2376,6 +2385,8 @@ pub fn run() {
     // 診斷 file logger（real-ctap）：GUI op 也落 fido2-diag.log → contention retry 可歸因。
     #[cfg(feature = "real-ctap")]
     diag_log::init();
+    #[cfg(feature = "lock-overlap-diag")]
+    lock_overlap_diag::arm_from_process();
     tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
