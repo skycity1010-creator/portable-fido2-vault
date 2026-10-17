@@ -562,7 +562,7 @@ D9-F2 規定：登入 ceremony 期間收到上鎖要求時，結果須丟棄並�
 
 CI 新增：Python 診斷 unittest、`real-ctap,lock-overlap-diag` 全套、dual+diag 的 `lock_overlap_diag::` 模組、Hello mock CLI `diagnostic_tests`；job 時限 40→60 分。
 
-**首次 hosted CI（run `38995907263`，head `22fac78`）失敗：** single+diag 步驟 556 通過／29 失敗，全部為 `lock_overlap_diag` 的 fixture 驗證 `CanonicalMismatch`。原因是 hosted runner 的 `%TEMP%` 為 8.3 短檔名（`C:\Users\RUNNER~1\…`），`canonicalize` 展開為長檔名後與原路徑不等；本機驗證全程使用長路徑 D: fixture，因此未暴露。本機以同一測試執行檔重現：短路徑 `TMPDIR` → `CanonicalMismatch` 失敗、長路徑 → 通過。屬測試環境問題，探針對短路徑**拒絕（fail closed）**符合設計；修正只改 CI：兩個 diag 步驟改用 `RUNNER_TEMP` 下新建的長路徑 fixture root（既存目錄或含 `~` 即中止），不改已審查的程式碼。限制：診斷版若以 8.3 短路徑啟動也會以 `CanonicalMismatch` 拒絕 arm。
+**首次 hosted CI（run `38995907263`，head `22fac78`）失敗：** single+diag 步驟 556 通過／29 失敗，29 個均屬 `lock_overlap_diag`：其中 27 個明列 fixture 驗證 `CanonicalMismatch`，另 2 個為 ancestor／root junction 測試的合法路徑 control 斷言失敗（log 未列出實際拒絕原因），與同一原因相容。依錯誤分布及本機對照（同一測試執行檔以 8.3 短路徑 `TMPDIR` → `CanonicalMismatch` 失敗、長路徑 → 通過），**推定**原因為 hosted runner 的暫存路徑含 8.3 短檔名成分，`canonicalize` 展開後與原路徑不等；hosted 端未保留 TEMP／fixture 原路徑的直接證據，且 `CanonicalMismatch` 也涵蓋 `canonicalize` 本身失敗，因此不排除其他存取失敗。本機驗證全程使用長路徑 D: fixture，因此未暴露。修正只改 CI：兩個 diag 步驟改用 `RUNNER_TEMP` 下新建的 fixture root（既存目錄或含 `~` 即中止；此為字面路徑 guard，非完整 canonical 驗證，Rust 端驗證仍會 fail closed），不改已審查的程式碼或驗證規則。限制：若傳入 `validate_fixture` 的執行檔父路徑仍含未展開的 8.3 成分，診斷版會以 `CanonicalMismatch` 拒絕 arm。
 
 ### 14.4 實機 Case B 驗收（2026-10-17，WS2 本機 Console，YubiKey Bio 指紋）
 
