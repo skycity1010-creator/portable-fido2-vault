@@ -18,6 +18,7 @@
 | RDP 支援（R2–R6，PR #20–#26） | 2026-10-10 實機驗收；R6 GO 限已測矩陣（見 `docs/rdp-webauthn-verification.md`） |
 | WebAuthn 不可用時保留主密碼登入（PR #25） | 2026-10-10 WS2 RDP W1–W6 PASS；2026-10-11 正式部署（見本文末節） |
 | 雙群組控管版（PR #29，開發中） | **未執行**：待 D13 staging 後依本文「雙群組控管版 — 實機驗收清單」逐項回報 |
+| 單人版 Windows Hello（PR #30，Draft） | Mock Gate 9 cases／29 checks PASS；本機 Console V1–V9 尚未測，見本文「單人版 Windows Hello — 本機 Console 驗收清單（D9，尚未執行）」章節 |
 
 各節部署雜湊、備份、槽位數與操作說明保留為**當時快照**；2026-10-01 的 3 slots 不代表後續部署數量。最新已記錄部署為本文末節的 PR #25 版本（2026-10-11，GUI SHA-256 `3b3f7367be81baab…`）；Rust 格式維護版本（來源 `99ff0e5e537c5485f6fb65819f45662c2769c0a1`）已被取代。
 
@@ -288,6 +289,58 @@ Feature 3 standalone 候選 GUI（6,589,440 bytes，SHA-256 `58ba298f7f2bcd5fa4d
 - 備份：`C:\FidoVault\backups\webauthn-unavailable-20261011-5073642`（舊 EXE `be089077c6a37d57…`、`vault.db` `b8423f97626309e0…`，hash 均已驗證）。部署前後 `vault.db` hash 與 1 個 key slot 不變；`WebView2Loader.dll`（簽章 Valid）與 `vault_cli.exe` 未替換。
 - 部署後首次啟動（使用者回報「驗證成功」）：
   - [x] 在 Win11-NB 本機 Console 以一般權限開啟 `C:\FidoVault\portable-fido-vault.exe`，以主密碼或已註冊金鑰登入，確認既有條目正常。唯讀 log 佐證：2026-10-11 00:48 pid 5880，API v9，GetAssertion `credential_match=true`、32 bytes；登入寫入 audit 後 `vault.db` 仍為 1 個 key slot。
+
+## 單人版 Windows Hello — 本機 Console 驗收清單（D9，尚未執行）
+
+> **狀態：清單已準備，所有 V1–V9 尚未實測。** 請只在 D9 明確提供的 Release 候選上，於各測試電腦本機 Console、一般權限依序執行；不要從 RDP／WinRM 啟動 GUI。D7 的 mock Gate 通過不代表這些實體驗收已通過；D8 文件更新也不等於已部署。
+
+### 測試前安全準備
+
+- 使用專用、全新、可寫入的測試資料夾與測試金庫；D9 提供候選時核對其 EXE SHA-256。絕不可把候選放入正式 `C:\FidoVault`，或開啟、複製、修改正式 `C:\FidoVault\vault.db`。
+- SKYCITY-PC 是預期 Windows Hello PRF 可用的正向機；Win11-NB 是已知的 PRF assertion 不支援負向機。只用合成條目、專用測試主密碼與唯一可辨認的 FidoVault 測試名稱，不記錄任何密碼、PIN、credential ID、PRF 或 KEK。
+- 為 V6 預備一支已登錄在**同一隔離測試金庫**的備援 YubiKey；不可用正式金庫或唯一生產金鑰代替。若沒有測試金鑰，V6 的 YubiKey 子項標記「未測」，不要臨時拿正式金庫註冊。
+- 註冊可能先建立 Windows credential，再因 PRF assertion 驗證失敗而不建立 vault slot；程式的清理可能也失敗。若出現 manual-cleanup warning，僅依 V7／V8 查看或刪除本次明確命名的測試 passkey；不得重設 Windows Hello、刪除整個 credential container 或清除其他 passkeys。Windows 也可能使用同步型 passkey provider；不要為測試修改全域／組織設定，逐台記錄目前 provider 狀態。
+- 每個 Windows 安全性提示都另外記錄「前景／背景／不適用」。金鑰操作成功但視窗在背景時，操作結果可記 PASS，前景子項需單獨記 FAIL 或未解；不可混為一談。
+- 測試前記錄 Windows「設定 → 隱私權與安全性 → Passkey access」中此測試程式是否已獲允許，以及「設定 → 帳戶 → 通行金鑰 → 進階選項」的 provider 設定；只有明確確認使用「儲存到這部 Windows 裝置」的本機路徑才執行本計畫。若 provider 為第三方同步服務、設定不明，或組織政策不允許，標示「超出範圍／受阻未測」並停止，不要變更全域／組織政策或 provider 同步設定。從 Windows 11 24H2 起，應用程式可能先遇到 passkey access 同意提示；未核准或被拒時標示「受同意設定阻擋／未測」，不可判作 PRF 不支援。
+- 任一寫檔錯誤、非預期 credential、正式資料夾被選中，或同一操作連續失敗 3 次即停止；正常關閉程式，不強制結束程序，不要反覆註冊或重設 Hello。
+
+### V1–V9（每項填 PASS／FAIL／未測）
+
+> 執行順序：V1 → V2 → V3 → V4 → V5 → V6 → V9 → V7 → V8，各項均須逐項記錄 PASS／FAIL／未測。雖 V9 編號較後，必須在 V7 刪除本機 Hello credential 前完成；遇到安全停止條件時，停止並將未執行項目標為未測，不得為完成序列而繼續操作。
+
+| 項目 | 操作與預期結果 |
+|---|---|
+| **V1 建立隔離測試金庫** | 在 SKYCITY-PC 的 D9 專用資料夾建立新的單人版 v1 測試金庫，設定僅供測試的主密碼與合成條目，並註冊一支專用測試 YubiKey；確認主密碼可解鎖，再記錄 Hello 註冊前 slot 基線（含此測試 YubiKey，預期 1）。不得從正式金庫複製資料。 |
+| **V2 註冊 Windows Hello** | 在 Windows Hello 可用的 SKYCITY-PC，打開金鑰管理並註冊一個可辨認的測試項目。若有 passkey access 同意提示，另行記錄，不把它算作 Create/PRF ceremony；只有經核准才允許。若 UI 顯示第三方／同步 provider，取消並標記超出範圍。觀察建立 credential 與隨後 PRF assertion 的 Windows 安全性提示；兩次若均出現，分別記錄前景狀態。預期 assertion 成功後，金庫總 slot 數相對基線恰好增加 1，畫面列出此 Windows 平台金鑰。不要把提示次數或焦點狀態當成 slot 結果。 |
+| **V3 鎖定後以 Hello 解鎖** | 上鎖，從通用 Windows Hello 登入入口完成系統驗證；預期成功回到原測試金庫，slot 數不變。記錄提示是否在前景。 |
+| **V4 重啟後以 Hello 登入** | 正常關閉候選程式，再由同一隔離資料夾重新開啟；以 Windows Hello 登入同一測試金庫，確認條目仍在且 slot 數不變。記錄每個提示的前景狀態。 |
+| **V5 同機重複註冊遭拒** | 在 SKYCITY-PC 對同一金庫再嘗試註冊第二個 Windows Hello credential。預期顯示「此電腦／Windows 帳號已註冊」類訊息、vault slot 數不變；記錄是否出現提示以及其前景狀態。若意外建立額外測試 credential，停止並按清理規則處理。 |
+| **V6 備援方式仍能解鎖** | 分別上鎖並用測試 YubiKey、測試主密碼各解鎖一次；兩種方式都應成功且不新增／刪除 slot。兩次結果分開記錄。未備妥測試 YubiKey 時只將該子項列未測，主密碼子項仍可單獨記錄。 |
+| **V9 跨機複製不帶入本機 Hello** | **請在 V7 移除 Hello 之前執行。** 正常關閉 SKYCITY-PC 上仍含 Hello slot 的隔離測試金庫，複製到 Win11-NB 的另一個全新目錄；只複製測試資料。首次登入前核對測試 DB 的來源／目的 SHA-256 相同（登入可能更新 audit，之後 hash 可改變）。在兩台均確認為本機限定的 Windows Hello provider 後，預期 NB 不提供該 slot 的可用 Hello 登入入口，仍可用測試主密碼或已註冊 YubiKey 解鎖。若發現第三方／同步 provider，或無法確認 provider 是否同步，V9 標記「超出範圍／受阻未測」並停止，不要改動全域設定；若兩台均確認本機限定卻仍能用來源 credential 登入 NB，才將 V9 標 FAIL 並暫停驗收。 |
+| **V7 移除 Hello 並查核清理** | 從 FidoVault 金鑰管理移除剛建立的 Hello slot；確認 app 回報移除結果及 UI slot 消失。再到 Windows「設定 → 帳戶 → 通行金鑰」檢查本機儲存的測試 passkey；只有確定屬於本次 FidoVault 測試的單一項目才可刪除。若無法確認、找不到項目，或 app 要求手動清理，記錄原文並停止，不可宣稱已清乾淨或重設 Hello 容器。若使用同步型 provider，需另在該 provider 確認，不能以 Windows 設定頁未列出推定同步副本不存在。 |
+| **V8 Win11-NB PRF 負向測試** | 在 Win11-NB 另一個全新隔離測試金庫，用測試主密碼與測試資料嘗試註冊 Hello。預期第二階段 PRF assertion 被拒並說明不支援 PRF、vault slot 數保持不變；逐一記錄已出現提示的前景狀態。接著依 V7 方法確認本次測試是否留下 Windows passkey；如需清除，只刪明確辨識出的測試項目。不可重複嘗試或更動正式金庫。 |
+
+Windows 本機 passkeys 管理入口可能隨版本／provider 改變；參考 Microsoft「[管理儲存在 Windows 的 passkeys](https://support.microsoft.com/en-us/accounts-billing/security/manage-your-saved-passkeys)」。該頁面的清單只代表 Windows 本機儲存項目，其他同步 provider 需另行核對。不要把密碼、PIN、QR code、credential ID 或診斷 payload 傳到聊天。
+
+### 回報格式
+
+```text
+候選 SHA-256：只在本機驗證，不要貼入公開聊天
+V1 PASS／FAIL／未測 — 說明：
+V2 PASS／FAIL／未測 — 建立提示前景：__；PRF assertion 提示前景：__；slot 變化：__
+V3 PASS／FAIL／未測 — 提示前景：__；slot 變化：__
+V4 PASS／FAIL／未測 — 提示前景：__；slot 變化：__
+V5 PASS／FAIL／未測 — 是否出現提示：__；slot 變化：__
+V6 YubiKey：__；主密碼：__
+V7 PASS／FAIL／未測 — app 清理結果：__；Windows/provider 個別 passkey：__
+V8 PASS／FAIL／未測 — 錯誤類別：__；slot 變化：__；提示前景：__；清理：__
+V9 PASS／FAIL／未測 — NB Hello 入口：__；備援解鎖：__；來源/目的 hash 比對（首次登入前）：__
+備註：只填非機密畫面現象及大約時間，不貼 credential／密碼／PIN／PRF
+```
+
+Microsoft 參考：[Windows WebAuthn API](https://learn.microsoft.com/en-us/windows/win32/api/_webauthn/)；[WebAuthn API 與 plugin passkey managers](https://learn.microsoft.com/en-us/windows/security/identity-protection/hello-for-business/webauthn-apis)；[MakeCredential options（含 PRF 欄位）](https://learn.microsoft.com/en-us/windows/win32/api/webauthn/ns-webauthn-webauthn_authenticator_make_credential_options)；[Windows passkey access consent](https://learn.microsoft.com/en-us/windows/security/identity-protection/passkeys/)；[Windows／同步 provider passkey 管理](https://support.microsoft.com/en-us/accounts-billing/security/manage-your-saved-passkeys)。
+
+---
 
 ## 雙群組控管版 — Win11-NB 本機 Console 實機驗收清單（D13，待執行）
 

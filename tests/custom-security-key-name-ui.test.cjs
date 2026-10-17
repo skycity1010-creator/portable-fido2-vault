@@ -101,7 +101,7 @@ function loadKeyNameUi({ keys = [], detected = { key_type: "fingerprint", label:
             return undefined;
           }
           if (command === "register_key") {
-            return { label: args.label, key_type: detected.key_type };
+            return { status: "registered", credential: { label: args.label, key_type: detected.key_type } };
           }
           if (command === "list_entries") return [];
           if (command === "get_vault_settings") return { idle_lock_minutes: 5, password_history_limit: 3 };

@@ -70,6 +70,9 @@ mock-fido = []
 real-ctap = ["dep:authenticator"]
 # dual-control: 雙群組（A/B）金鑰控管版；只用於 portable-fido-vault-dual 執行檔
 dual-control = []
+# lock-overlap-diag: 單人 Case B（post-native/pre-publication）lock-overlap 診斷探針。預設關閉，
+# 不新增依賴；啟用後仍須顯式命令列旗標＋fixture marker 才 arm 一次（src/lock_overlap_diag.rs）。
+lock-overlap-diag = []
 
 [profile.release]
 strip = true

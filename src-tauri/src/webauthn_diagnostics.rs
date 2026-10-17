@@ -173,6 +173,64 @@ impl ContinuationDiagnostics {
     }
 }
 
+/// Where a foreground-owner refusal was decided.
+#[derive(Clone, Copy)]
+pub(crate) enum ForegroundSite {
+    Continuation,
+    PreApi,
+}
+
+/// Bounded foreground-window evidence, gathered only after a refusal was decided.
+/// Fields are private: values can only enter through the sanitizing constructor,
+/// so a window title or full image path can never reach the serializer.
+#[derive(Default)]
+pub(crate) struct ForegroundOwnerDiagnostics {
+    foreground_class: Option<String>,
+    foreground_process: Option<String>,
+    foreground_same_session: Option<bool>,
+    foreground_is_owner_process: Option<bool>,
+}
+
+impl ForegroundOwnerDiagnostics {
+    pub(crate) fn new(
+        class_name: Option<&str>,
+        image_path: Option<&str>,
+        same_session: Option<bool>,
+        is_owner_process: Option<bool>,
+    ) -> Self {
+        Self {
+            foreground_class: class_name.and_then(bounded_text),
+            foreground_process: image_path
+                .and_then(|path| path.rsplit(['\\', '/']).next())
+                .map(str::to_lowercase)
+                .as_deref()
+                .and_then(bounded_text),
+            foreground_same_session: same_session,
+            foreground_is_owner_process: is_owner_process,
+        }
+    }
+
+    pub(crate) fn record(&self, operation: Operation, site: ForegroundSite) -> Value {
+        json!({
+            "operation": operation.label(),
+            "site": match site {
+                ForegroundSite::Continuation => "continuation",
+                ForegroundSite::PreApi => "pre-api",
+            },
+            "foreground_class": self.foreground_class,
+            "foreground_process": self.foreground_process,
+            "foreground_same_session": self.foreground_same_session,
+            "foreground_is_owner_process": self.foreground_is_owner_process,
+        })
+    }
+}
+
+const FOREGROUND_TEXT_MAX_CHARS: usize = 64;
+
+fn bounded_text(text: &str) -> Option<String> {
+    (!text.is_empty()).then(|| text.chars().take(FOREGROUND_TEXT_MAX_CHARS).collect())
+}
+
 pub(crate) fn capability_record(
     api_version: Option<u32>,
     process_id: Option<u32>,
@@ -196,9 +254,15 @@ fn error_category(error: &FidoError) -> &'static str {
         FidoError::PrfNotSupported => "prf-unsupported",
         FidoError::PrfNotConfirmed => "hmac-creation-unconfirmed",
         FidoError::CredentialExcluded => "credential-excluded",
+        FidoError::PlatformCredentialExists => "platform-credential-exists",
+        FidoError::PlatformPrfUnsupported => "platform-prf-unsupported",
+        FidoError::PlatformCredentialMissing => "platform-credential-missing",
         FidoError::NotSupported(_) => "capability-unsupported",
         FidoError::Internal(_) => "internal",
         FidoError::DeviceOpenDenied { .. } => "device-open-denied",
+        FidoError::ForegroundHandoffRequired => "foreground-handoff-required",
+        FidoError::OwnerNotForeground => "owner-not-foreground",
+        FidoError::PlatformAuthenticatorSubstituted => "platform-authenticator-substituted",
     }
 }
 
@@ -225,6 +289,9 @@ pub(crate) enum FailureStage {
     Response,
 }
 
+/// Upper bound for the W3C-style error name taken from WebAuthNGetErrorName.
+const API_ERROR_NAME_MAX_CHARS: usize = 64;
+
 pub(crate) struct OperationDiagnostics {
     operation: Operation,
     pub(crate) hmac_creation_confirmed: Option<bool>,
@@ -232,6 +299,8 @@ pub(crate) struct OperationDiagnostics {
     pub(crate) output_length: Option<u32>,
     pub(crate) credential_match: Option<bool>,
     pub(crate) failure_stage: Option<FailureStage>,
+    api_hresult: Option<u32>,
+    api_error_name: Option<String>,
 }
 
 impl OperationDiagnostics {
@@ -243,7 +312,18 @@ impl OperationDiagnostics {
             output_length: None,
             credential_match: None,
             failure_stage: None,
+            api_hresult: None,
+            api_error_name: None,
         }
+    }
+
+    /// D9-F2: platform API failure evidence. Only the HRESULT number and a short ASCII-alphanumeric
+    /// W3C-style error name (WebAuthNGetErrorName) can enter; anything else is dropped.
+    pub(crate) fn set_api_failure(&mut self, hresult: i32, error_name: Option<&str>) {
+        self.api_hresult = Some(hresult as u32);
+        self.api_error_name = error_name
+            .filter(|name| !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric()))
+            .map(|name| name.chars().take(API_ERROR_NAME_MAX_CHARS).collect());
     }
 
     fn failure_category(&self, error: &FidoError) -> &'static str {
@@ -277,14 +357,20 @@ impl OperationDiagnostics {
             Operation::MakeCredential => "MakeCredential",
             Operation::GetAssertion => "GetAssertion",
         };
-        json!({
+        let mut record = json!({
             "operation": operation,
             "error_category": error.map(|error| self.failure_category(error)),
             "hmac_creation_confirmed": self.hmac_creation_confirmed,
             "output_present": self.output_present,
             "output_length": self.output_length,
             "credential_match": self.credential_match,
-        })
+        });
+        // D9-F2: exact allowlist additions, present only for a recorded platform API failure.
+        if let (Some(fields), Some(hresult)) = (record.as_object_mut(), self.api_hresult) {
+            fields.insert("hresult".into(), json!(format!("0x{hresult:08X}")));
+            fields.insert("error_name".into(), json!(self.api_error_name));
+        }
+        record
     }
 }
 
@@ -303,6 +389,143 @@ pub(crate) fn diagnose<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn d9f2_api_failure_fields_exact_allowlist() {
+        let mut diagnostic = OperationDiagnostics::new(Operation::MakeCredential);
+        diagnostic.failure_stage = Some(FailureStage::Api);
+        // Unset: the legacy record shape is unchanged (no new keys).
+        let legacy = diagnostic.record(Some(&FidoError::Internal("x".into())));
+        assert_eq!(legacy.as_object().unwrap().len(), 6);
+        assert!(legacy.get("hresult").is_none() && legacy.get("error_name").is_none());
+
+        diagnostic.set_api_failure(0x800704C7_u32 as i32, Some("NotAllowedError"));
+        let record = diagnostic.record(Some(&FidoError::Internal("secret text".into())));
+        assert_eq!(
+            record,
+            json!({
+                "operation": "MakeCredential", "error_category": "api-error",
+                "hmac_creation_confirmed": null, "output_present": null,
+                "output_length": null, "credential_match": null,
+                "hresult": "0x800704C7", "error_name": "NotAllowedError",
+            })
+        );
+        assert_eq!(record.as_object().unwrap().len(), 8);
+    }
+
+    #[test]
+    fn d9f2_api_failure_name_is_sanitized_and_bounded() {
+        let mut diagnostic = OperationDiagnostics::new(Operation::GetAssertion);
+        diagnostic.failure_stage = Some(FailureStage::Api);
+        diagnostic.set_api_failure(-2146893783_i32, Some(&"A".repeat(200)));
+        let record = diagnostic.record(Some(&FidoError::Internal("x".into())));
+        assert_eq!(
+            record["error_name"].as_str(),
+            Some("A".repeat(64).as_str()),
+            "an over-long name is truncated to 64 characters, not dropped"
+        );
+        assert_eq!(record["hresult"].as_str(), Some("0x80090029"));
+        for hostile in [
+            r"C:\Users\alice\vault.db",
+            "Not Allowed",
+            "名稱",
+            "line\nbreak",
+            "",
+        ] {
+            let mut d = OperationDiagnostics::new(Operation::GetAssertion);
+            d.failure_stage = Some(FailureStage::Api);
+            d.set_api_failure(-1, Some(hostile));
+            let record = d.record(Some(&FidoError::Internal("x".into())));
+            assert!(record["error_name"].is_null(), "{hostile:?}");
+            assert_eq!(record["hresult"].as_str(), Some("0xFFFFFFFF"));
+            let text = record.to_string();
+            assert!(!text.contains("alice") && !text.contains("vault.db"), "{text}");
+        }
+        let mut none = OperationDiagnostics::new(Operation::GetAssertion);
+        none.set_api_failure(0x8007_04C7_u32 as i32, None);
+        let record = none.record(None);
+        assert!(record["error_name"].is_null());
+        assert_eq!(record["hresult"].as_str().unwrap(), "0x800704C7");
+    }
+
+    #[test]
+    fn d9f1_foreground_owner_serializer_exact_null_allowlist() {
+        let record = ForegroundOwnerDiagnostics::new(None, None, None, None)
+            .record(Operation::GetAssertion, ForegroundSite::Continuation);
+        assert_eq!(
+            record,
+            json!({
+                "operation": "GetAssertion", "site": "continuation",
+                "foreground_class": null, "foreground_process": null,
+                "foreground_same_session": null, "foreground_is_owner_process": null,
+            })
+        );
+        let record = ForegroundOwnerDiagnostics::new(
+            Some("Shell_TrayWnd"),
+            Some(r"C:\Windows\explorer.exe"),
+            Some(true),
+            Some(false),
+        )
+        .record(Operation::MakeCredential, ForegroundSite::PreApi);
+        assert_eq!(
+            record,
+            json!({
+                "operation": "MakeCredential", "site": "pre-api",
+                "foreground_class": "Shell_TrayWnd", "foreground_process": "explorer.exe",
+                "foreground_same_session": true, "foreground_is_owner_process": false,
+            })
+        );
+        assert_eq!(record.as_object().unwrap().len(), 6);
+    }
+
+    #[test]
+    fn d9f1_foreground_owner_basename_lowercase_and_truncation() {
+        let cases: [(Option<&str>, Option<&str>); 7] = [
+            (
+                Some(r"C:\Program Files\Vendor\Some App.EXE"),
+                Some("some app.exe"),
+            ),
+            (Some("C:/Users/alice/AppData/Tool.exe"), Some("tool.exe")),
+            (Some("PLAIN.EXE"), Some("plain.exe")),
+            (Some(r"C:\dir\"), None),
+            (Some(""), None),
+            (None, None),
+            (
+                Some(r"\\?\C:\Windows\System32\CredentialUIBroker.exe"),
+                Some("credentialuibroker.exe"),
+            ),
+        ];
+        for (path, expected) in cases {
+            let record = ForegroundOwnerDiagnostics::new(None, path, None, None)
+                .record(Operation::GetAssertion, ForegroundSite::PreApi);
+            assert_eq!(record["foreground_process"].as_str(), expected, "{path:?}");
+            // Directory components (including a user name) never leak.
+            let text = record.to_string();
+            assert!(
+                !text.contains("alice") && !text.contains("Program Files"),
+                "{text}"
+            );
+        }
+        let long_name = format!(r"C:\x\{}.exe", "N".repeat(100));
+        let record =
+            ForegroundOwnerDiagnostics::new(Some(&"類".repeat(100)), Some(&long_name), None, None)
+                .record(Operation::GetAssertion, ForegroundSite::PreApi);
+        assert_eq!(
+            record["foreground_class"].as_str().unwrap().chars().count(),
+            64
+        );
+        assert_eq!(
+            record["foreground_class"].as_str().unwrap(),
+            "類".repeat(64)
+        );
+        assert_eq!(
+            record["foreground_process"].as_str().unwrap(),
+            "n".repeat(64)
+        );
+        let empty = ForegroundOwnerDiagnostics::new(Some(""), None, None, None)
+            .record(Operation::GetAssertion, ForegroundSite::PreApi);
+        assert!(empty["foreground_class"].is_null());
+    }
 
     #[test]
     fn continuation_serializer_exact_null_allowlist() {
@@ -593,7 +816,7 @@ mod tests {
         for (start, end, ffi) in [
             (
                 "fn make_credential_with_diagnostics(",
-                "fn get_hmac_secret(",
+                "fn make_platform_credential(",
                 "WebAuthNAuthenticatorMakeCredential(",
             ),
             (
@@ -1040,7 +1263,7 @@ mod tests {
             ),
             (
                 "fn make_credential_with_diagnostics(",
-                "fn get_hmac_secret(",
+                "fn make_platform_credential(",
                 ".map(WebAuthnForegroundMonitor::finish_observation)",
                 ".map(drop)",
                 "NATIVE_RETURN_SHUTDOWN",
@@ -1109,6 +1332,18 @@ mod tests {
             (FidoError::PrfNotSupported, "prf-unsupported"),
             (FidoError::PrfNotConfirmed, "hmac-creation-unconfirmed"),
             (FidoError::CredentialExcluded, "credential-excluded"),
+            (
+                FidoError::PlatformCredentialExists,
+                "platform-credential-exists",
+            ),
+            (
+                FidoError::PlatformPrfUnsupported,
+                "platform-prf-unsupported",
+            ),
+            (
+                FidoError::PlatformCredentialMissing,
+                "platform-credential-missing",
+            ),
             (
                 FidoError::NotSupported("SENTINEL".into()),
                 "capability-unsupported",
@@ -1292,13 +1527,18 @@ mod tests {
             ("GetAssertion", "GET_OPERATION_WRAPPER"),
         ] {
             let wrapper = format!("diagnose(\n            Operation::{operation}");
-            let mutant = mutate_unique(
-                &source,
-                "impl WindowsWebAuthnBackend",
-                "impl FidoBackend for WindowsWebAuthnBackend",
-                &wrapper,
-                "removed_wrapper(",
-            );
+            let (start, end) = if operation == "MakeCredential" {
+                (
+                    "    fn make_credential(",
+                    "    fn make_credential_with_diagnostics(",
+                )
+            } else {
+                (
+                    "    fn get_hmac_secret_for_any(",
+                    "    fn get_platform_secret(",
+                )
+            };
+            let mutant = mutate_unique(&source, start, end, &wrapper, "removed_wrapper(");
             assert_wiring_rejected_for_both_line_endings(&mutant, tag);
         }
     }
@@ -1312,14 +1552,14 @@ mod tests {
         let removed = mutate_unique(
             &source,
             "pub fn new(hwnd:",
-            "fn hwnd(",
+            "fn require_platform_available(",
             "capability_record(",
             "removed_capability(",
         );
         let mutant = mutate_unique(
             &removed,
             "pub fn new(hwnd:",
-            "fn hwnd(",
+            "fn require_platform_available(",
             guard,
             &format!("{guard}\ncapability_record();"),
         );
@@ -1334,7 +1574,7 @@ mod tests {
         for (start, end, ffi) in [
             (
                 "fn make_credential_with_diagnostics(",
-                "fn get_hmac_secret(",
+                "fn make_platform_credential(",
                 "WebAuthNAuthenticatorMakeCredential(",
             ),
             (
@@ -1361,7 +1601,7 @@ mod tests {
         for (start, end, ffi) in [
             (
                 "fn make_credential_with_diagnostics(",
-                "fn get_hmac_secret(",
+                "fn make_platform_credential(",
                 "WebAuthNAuthenticatorMakeCredential(",
             ),
             (
@@ -1380,7 +1620,11 @@ mod tests {
     fn assert_backend_wiring(source: &str) {
         // Normalize checkout line endings only; preserve every statement and space.
         let source = source.replace("\r\n", "\n");
-        let constructor = contract_section(&source, "pub fn new(hwnd:", "fn hwnd(");
+        let constructor = contract_section(
+            &source,
+            "pub fn new(hwnd:",
+            "fn require_platform_available(",
+        );
         let capability = contract_position(constructor, "capability_record(", "CAPABILITY_PRESENT");
         let guard = contract_position(
             constructor,
@@ -1395,7 +1639,7 @@ mod tests {
         for (start, end, ffi) in [
             (
                 "fn make_credential_with_diagnostics(",
-                "fn get_hmac_secret(",
+                "fn make_platform_credential(",
                 "WebAuthNAuthenticatorMakeCredential(",
             ),
             (
@@ -1416,11 +1660,21 @@ mod tests {
             assert_eq!(gap.trim(), ";\n        if let Some(monitor) = focus_monitor.as_ref() {\n            monitor.arm();\n        }\n        let hr = unsafe {");
         }
         assert!(
-            source.contains("diagnose(\n            Operation::MakeCredential"),
+            contract_section(
+                &source,
+                "    fn make_credential(",
+                "    fn make_credential_with_diagnostics("
+            )
+            .contains("diagnose(\n            Operation::MakeCredential"),
             "CONTRACT:MAKE_OPERATION_WRAPPER"
         );
         assert!(
-            source.contains("diagnose(\n            Operation::GetAssertion"),
+            contract_section(
+                &source,
+                "    fn get_hmac_secret_for_any(",
+                "    fn get_platform_secret("
+            )
+            .contains("diagnose(\n            Operation::GetAssertion"),
             "CONTRACT:GET_OPERATION_WRAPPER"
         );
     }

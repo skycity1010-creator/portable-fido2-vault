@@ -117,6 +117,12 @@ pub enum FidoError {
     PrfNotConfirmed,
     /// makeCredential 的 excludeCredentials 命中：此實體金鑰已持有本金庫的 credential（dual-control Q3）。
     CredentialExcluded,
+    /// Windows Hello：本機已持有金庫的 platform credential（excludeCredentials 命中，NTE_EXISTS）。
+    PlatformCredentialExists,
+    /// Windows Hello：斷言時無法取得 PRF（例：TPM 1.2／software KSP 的 NTE_BAD_KEY_STATE）。
+    PlatformPrfUnsupported,
+    /// Windows Hello：本機沒有允許清單中的任何 credential（另一台電腦、已刪除或重設）。
+    PlatformCredentialMissing,
     NotSupported(String),
     Internal(String),
     /// FIDO HID open 被 Win32 拒絕（os error 5/32）：只證明此次 open 失敗，不代表已識別 holder；
@@ -127,6 +133,28 @@ pub enum FidoError {
         last_err: String,
         attempts: usize,
     },
+    /// 註冊第二階段：第一個 ceremony 已建立 credential，但 Windows 未把前景交回 FidoVault，
+    /// 驗證斷言依既有守門被拒（未呼叫 API）。呼叫方可保留 pending 註冊，待使用者點擊後重試。
+    ForegroundHandoffRequired,
+    /// pre-API 守門：owner 視窗不是前景，未呼叫 Windows WebAuthn（訊息與舊 Internal 文字相同）。
+    OwnerNotForeground,
+    /// D9-F2：要求 PLATFORM 的 attestation 並非由本機（INTERNAL transport）完成，例如 Windows 在 Ngc
+    /// 失敗後讓使用者以安全性金鑰完成。不寫 slot、也不對該 ID 做 platform 刪除。
+    PlatformAuthenticatorSubstituted,
+}
+
+/// pre-API owner 前景守門拒絕時的原文（`OwnerNotForeground` 的 Display 與舊 Internal 顯示逐字相同）。
+pub const OWNER_NOT_FOREGROUND_MSG: &str =
+    "Windows WebAuthn was not started because its owner window is not foreground. Bring FidoVault to the foreground and retry.";
+
+impl FidoError {
+    /// 第二個 ceremony 因前景未交回而被拒（未呼叫 API）；註冊流程可保留 pending 讓使用者重試。
+    pub fn is_foreground_handoff(&self) -> bool {
+        matches!(
+            self,
+            Self::ForegroundHandoffRequired | Self::OwnerNotForeground
+        )
+    }
 }
 
 impl std::fmt::Display for FidoError {
@@ -147,6 +175,18 @@ impl std::fmt::Display for FidoError {
                 f,
                 "此安全性金鑰已註冊於本金庫（同一支實體金鑰只能註冊一次，且只能屬於 A 或 B 其中一個群組）；未新增金鑰槽。"
             ),
+            Self::PlatformCredentialExists => write!(
+                f,
+                "這台電腦（此 Windows 帳號）已註冊 Windows Hello 到本金庫；每台電腦只能註冊一個，未新增金鑰槽。"
+            ),
+            Self::PlatformPrfUnsupported => write!(
+                f,
+                "此電腦的 Windows Hello 不支援金庫解鎖所需的 PRF（斷言時無法取得 hmac-secret）；未新增金鑰槽。請改用 YubiKey 或主密碼。"
+            ),
+            Self::PlatformCredentialMissing => write!(
+                f,
+                "這台電腦沒有此金庫的 Windows Hello 憑證（可能在其他電腦註冊，或已被刪除／重設）；請改用 YubiKey 或主密碼。"
+            ),
             Self::NotSupported(m) => write!(f, "不支援：{m}"),
             Self::Internal(m) => write!(f, "FIDO2 內部錯誤：{m}"),
             Self::DeviceOpenDenied { what, last_err, attempts } => write!(
@@ -155,6 +195,16 @@ impl std::fmt::Display for FidoError {
                  此錯誤無法確認 holder 身分或區分 share-lock/access policy；可能是其他 FIDO client、Windows WebAuthN / Windows Hello 正在使用介面，或 Windows access policy 拒絕。最後 vendor 回報：{last_err}。\
                  請先完成/取消安全金鑰操作並關閉瀏覽器 WebAuthn/Windows Hello 頁面；勿 force-kill svchost / BioEnrollmentHost。 \
                  本 CLI 目前走 raw HID；非管理員情境需採用 Windows WebAuthN API backend（Yubico sample 的路徑），或在管理員互動 session 執行。"
+            ),
+            Self::ForegroundHandoffRequired => write!(
+                f,
+                "金鑰已建立，但 Windows 未將焦點交回 FidoVault；請按「繼續驗證」完成註冊，或按「取消」放棄。"
+            ),
+            // 與舊 `Internal(OWNER_NOT_FOREGROUND_MSG)` 顯示相同，登入路徑文字不變。
+            Self::OwnerNotForeground => write!(f, "FIDO2 內部錯誤：{OWNER_NOT_FOREGROUND_MSG}"),
+            Self::PlatformAuthenticatorSubstituted => write!(
+                f,
+                "Windows 以安全性金鑰完成，而非本機 Windows Hello；未註冊。該安全性金鑰上可能留下一筆 fido-vault.local 測試憑證，可用 YubiKey 管理工具移除。"
             ),
         }
     }
@@ -186,6 +236,48 @@ impl std::fmt::Display for BackendInitError {
             Self::Fido(error) => error.fmt(f),
         }
     }
+}
+
+/// Windows Hello（平台 authenticator）可用性，不跳任何提示（docs/plans/windows-hello-single.md §4.1）。
+/// 三項皆真才可註冊／登入；預設全為 false（fail closed）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct PlatformStatus {
+    /// `WebAuthNGetApiVersionNumber() >= 8`（PRF 需 API v8）。
+    pub api_ok: bool,
+    /// `WebAuthNIsUserVerifyingPlatformAuthenticatorAvailable`。
+    pub uvpa: bool,
+    /// 本機 Console 工作階段（RDP／session 0 不提供 Windows Hello）。
+    pub console: bool,
+}
+
+impl PlatformStatus {
+    pub fn available(&self) -> bool {
+        self.api_ok && self.uvpa && self.console
+    }
+}
+
+/// Windows Hello credential 建立結果：credential + 建立時的 PRF 輸出（API v8 `pHmacSecret`，32 bytes）。
+/// 建立時有 PRF 不代表斷言時有 PRF（Win11-NB），所以 vault 必須再做一次斷言並比對此值。
+pub struct PlatformRegistration {
+    pub credential: RegisteredCredential,
+    pub creation_prf: zeroize::Zeroizing<[u8; 32]>,
+}
+
+impl std::fmt::Debug for PlatformRegistration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlatformRegistration")
+            .field("credential", &self.credential)
+            .field("creation_prf", &"<redacted>")
+            .finish()
+    }
+}
+
+/// 後端未實作 Windows Hello 時的共用訊息（不影響 YubiKey／主密碼）。
+pub const PLATFORM_UNSUPPORTED_MSG: &str =
+    "此金鑰後端不支援 Windows Hello；YubiKey 與主密碼登入不受影響";
+
+fn platform_unsupported() -> FidoError {
+    FidoError::NotSupported(PLATFORM_UNSUPPORTED_MSG.into())
 }
 
 /// FIDO2 後端 trait。`get_prf_secret` 對應 CTAP2 getAssertion + hmac-secret extension
@@ -274,6 +366,43 @@ pub trait FidoBackend: Send {
     /// Some(訊息) = 此工作階段無任何可用金鑰路徑（UI 不得假裝偵測到金鑰）。
     fn key_unavailable_reason(&self) -> Option<String> {
         None
+    }
+
+    // ── Windows Hello（平台 authenticator）；預設全部 fail closed ──
+
+    /// 不跳提示的可用性檢查。預設：全部不可用。
+    fn platform_status(&self) -> PlatformStatus {
+        PlatformStatus::default()
+    }
+
+    /// 建立 Windows Hello credential（PLATFORM、UV required、resident key、PRF v8）。
+    /// `exclude` = 金庫內所有 platform slot 的 credential ID；本機已持有其一 →
+    /// `FidoError::PlatformCredentialExists`，不建立新 credential。
+    fn register_platform_credential(
+        &mut self,
+        _label: &str,
+        _exclude: &[Vec<u8>],
+    ) -> Result<PlatformRegistration, FidoError> {
+        Err(platform_unsupported())
+    }
+
+    /// Windows Hello 斷言 + 固定 raw salt 的 PRF；回傳實際使用的 credential ID 與 32-byte secret。
+    /// 呼叫方必須自行確認回傳 ID 屬於金庫的 platform slot（不信任 backend 選擇）。
+    fn get_platform_prf_secret(
+        &mut self,
+        _credential_ids: &[Vec<u8>],
+    ) -> Result<(Vec<u8>, [u8; 32]), FidoError> {
+        Err(platform_unsupported())
+    }
+
+    /// 本機（此 Windows 帳號）在本 RP 下的 Windows Hello credential ID；空清單 = Ok(vec![])。
+    fn list_platform_credentials(&mut self) -> Result<Vec<Vec<u8>>, FidoError> {
+        Err(platform_unsupported())
+    }
+
+    /// 刪除本機的 Windows Hello credential（best effort，由呼叫方決定失敗是否阻擋）。
+    fn delete_platform_credential(&mut self, _credential_id: &[u8]) -> Result<(), FidoError> {
+        Err(platform_unsupported())
     }
 }
 
@@ -377,7 +506,65 @@ pub struct MockBackend {
     reuse_device_next: bool,
     /// 每個 mock 實例代表一組獨立的實體金鑰；與 seq 一起決定「裝置標記」。
     instance_key: [u8; 16],
+    /// 模擬 Windows Hello 的行為模式（預設 Supported = SKYCITY-PC 型）。
+    platform_mode: MockPlatformMode,
+    /// 模擬「這台電腦 × Windows 帳號」持有的 Windows Hello credential（每個 mock 實例 = 一台電腦）。
+    platform_credentials: Vec<Vec<u8>>,
+    /// 測試用：接下來 N 次 roaming 斷言回傳「前景未交回」拒絕（不碰 authenticator）。
+    roaming_handoff: Option<(MockHandoffRefusal, usize)>,
+    /// 測試用：接下來 N 次 Windows Hello 斷言回傳「前景未交回」拒絕。
+    platform_handoff: Option<(MockHandoffRefusal, usize)>,
+    /// 呼叫順序紀錄（供測試驗證 delete 等是否被呼叫）。
+    call_log: Vec<MockCall>,
 }
+
+/// MockBackend 模擬的「前景未交回」拒絕種類（對應 Windows backend 的兩個守門）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MockHandoffRefusal {
+    /// roaming continuation 拒絕（broker 未觀察到／前景非 broker／被動期限）。
+    ForegroundHandoffRequired,
+    /// pre-API owner 前景守門拒絕。
+    OwnerNotForeground,
+}
+
+impl MockHandoffRefusal {
+    fn error(self) -> FidoError {
+        match self {
+            Self::ForegroundHandoffRequired => FidoError::ForegroundHandoffRequired,
+            Self::OwnerNotForeground => FidoError::OwnerNotForeground,
+        }
+    }
+}
+
+/// MockBackend 呼叫紀錄（不含任何參數或秘密）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MockCall {
+    Detect,
+    RegisterCredential,
+    GetPrfSecret,
+    RegisterPlatform,
+    GetPlatformPrf,
+    ListPlatform,
+    DeletePlatform,
+}
+
+/// MockBackend 的 Windows Hello 模擬模式（docs/plans/windows-hello-single.md §6.1）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MockPlatformMode {
+    /// 建立與斷言都有 PRF，且輸出相同（SKYCITY-PC 實測）。
+    Supported,
+    /// 建立有 PRF，但所有帶 salt 的斷言失敗（Win11-NB：TPM 1.2／software KSP）。
+    AssertionPrfFails,
+    /// 建立回報的 PRF 與斷言輸出不同（驗證 vault 的比對）。
+    CreationPrfMismatch,
+    /// 此電腦／工作階段沒有可用的 Windows Hello。
+    Unavailable,
+    /// D9-F2：註冊請求被 Windows 改由安全性金鑰完成（transport 非 INTERNAL）。
+    Substituted,
+}
+
+/// Mock Windows Hello credential ID 前綴（與 roaming mock ID 的 kind 位元組 0..=2 不會衝突）。
+pub const MOCK_PLATFORM_ID_PREFIX: &[u8; 8] = b"f2vl-wh:";
 
 impl Default for MockBackend {
     fn default() -> Self {
@@ -399,7 +586,58 @@ impl MockBackend {
                 rand::rngs::OsRng.fill_bytes(&mut k);
                 k
             },
+            platform_mode: MockPlatformMode::Supported,
+            platform_credentials: Vec::new(),
+            roaming_handoff: None,
+            platform_handoff: None,
+            call_log: Vec::new(),
         }
+    }
+
+    /// 接下來 `times` 次 roaming 斷言（get_prf_secret）回傳 `refusal`。
+    pub fn with_roaming_handoff(mut self, refusal: MockHandoffRefusal, times: usize) -> Self {
+        self.set_roaming_handoff(refusal, times);
+        self
+    }
+
+    pub fn set_roaming_handoff(&mut self, refusal: MockHandoffRefusal, times: usize) {
+        self.roaming_handoff = (times > 0).then_some((refusal, times));
+    }
+
+    /// 接下來 `times` 次 Windows Hello 斷言回傳 `refusal`。
+    pub fn with_platform_handoff(mut self, refusal: MockHandoffRefusal, times: usize) -> Self {
+        self.set_platform_handoff(refusal, times);
+        self
+    }
+
+    pub fn set_platform_handoff(&mut self, refusal: MockHandoffRefusal, times: usize) {
+        self.platform_handoff = (times > 0).then_some((refusal, times));
+    }
+
+    /// 測試檢視：呼叫順序。
+    pub fn calls(&self) -> &[MockCall] {
+        &self.call_log
+    }
+
+    /// 設定 Windows Hello 模擬模式。
+    pub fn with_platform_mode(mut self, mode: MockPlatformMode) -> Self {
+        self.platform_mode = mode;
+        self
+    }
+
+    /// 模擬同一台電腦重新啟動程式：預先載入本機已持有的 Windows Hello credential。
+    pub fn with_platform_credentials(mut self, ids: Vec<Vec<u8>>) -> Self {
+        self.platform_credentials = ids;
+        self
+    }
+
+    /// 測試檢視：目前本機持有的 Windows Hello credential。
+    pub fn platform_credential_ids(&self) -> &[Vec<u8>] {
+        &self.platform_credentials
+    }
+
+    pub fn is_mock_platform_credential(credential_id: &[u8]) -> bool {
+        credential_id.len() == 32 && credential_id[..8] == MOCK_PLATFORM_ID_PREFIX[..]
     }
 
     /// 目前這支模擬金鑰的裝置標記（8B）：嵌在 credential_id[1..9]，供 excludeCredentials 判斷
@@ -454,6 +692,17 @@ impl MockBackend {
         id.to_vec()
     }
 
+    /// 消耗一次注入的「前景未交回」拒絕（剩餘次數歸零即解除）。
+    fn take_handoff(slot: &mut Option<(MockHandoffRefusal, usize)>) -> Option<FidoError> {
+        let (refusal, remaining) = slot.as_mut()?;
+        let error = refusal.error();
+        *remaining -= 1;
+        if *remaining == 0 {
+            *slot = None;
+        }
+        Some(error)
+    }
+
     /// 模擬 PIN 驗證：PIN 型金鑰要求非空且長度 ≥4（不儲存、不記錄 PIN）。
     fn check_pin(kind: KeyKind, pin: Option<&str>) -> Result<(), FidoError> {
         if kind != KeyKind::Pin {
@@ -469,6 +718,7 @@ impl MockBackend {
 
 impl FidoBackend for MockBackend {
     fn detect(&mut self) -> Result<DetectedKey, FidoError> {
+        self.call_log.push(MockCall::Detect);
         // override（CLI --kind / UI 指定）只生效一次，**不推進自動循環計數** →
         // 其後回到的仍是循環起點（與 peek_kind 一致）。
         let kind = match self.next_kind_override.take() {
@@ -498,6 +748,7 @@ impl FidoBackend for MockBackend {
         detected: &DetectedKey,
         _pin: Option<&str>,
     ) -> Result<RegisteredCredential, FidoError> {
+        self.call_log.push(MockCall::RegisterCredential);
         Ok(RegisteredCredential {
             credential_id: self.make_credential_id(detected.kind),
             aaguid: detected.aaguid,
@@ -528,8 +779,16 @@ impl FidoBackend for MockBackend {
         credential_id: &[u8],
         pin: Option<&str>,
     ) -> Result<[u8; 32], FidoError> {
+        self.call_log.push(MockCall::GetPrfSecret);
+        if let Some(error) = Self::take_handoff(&mut self.roaming_handoff) {
+            return Err(error);
+        }
         if credential_id.is_empty() {
             return Err(FidoError::Internal("credential_id 為空".into()));
+        }
+        // 模擬實體 YubiKey：不持有 Windows Hello credential。
+        if Self::is_mock_platform_credential(credential_id) {
+            return Err(FidoError::NoDevice);
         }
         let kind = KeyKind::from_u8(credential_id[0]);
         Self::check_pin(kind, pin)?;
@@ -545,6 +804,99 @@ impl FidoBackend for MockBackend {
     fn prf_supported(&self) -> bool {
         // mock 預設模擬支援 PRF 的金鑰（YubiKey 5+）；with_prf(false) 模擬不支援者。
         self.prf_enabled
+    }
+
+    fn platform_status(&self) -> PlatformStatus {
+        let on = self.platform_mode != MockPlatformMode::Unavailable;
+        PlatformStatus {
+            api_ok: on,
+            uvpa: on,
+            console: on,
+        }
+    }
+
+    fn register_platform_credential(
+        &mut self,
+        label: &str,
+        exclude: &[Vec<u8>],
+    ) -> Result<PlatformRegistration, FidoError> {
+        self.call_log.push(MockCall::RegisterPlatform);
+        if self.platform_mode == MockPlatformMode::Unavailable {
+            return Err(platform_unsupported());
+        }
+        if self.platform_mode == MockPlatformMode::Substituted {
+            return Err(FidoError::PlatformAuthenticatorSubstituted);
+        }
+        // 模擬 excludeCredentials：本機已持有其中任一筆 → NTE_EXISTS，不建立、不提示。
+        if exclude
+            .iter()
+            .any(|id| self.platform_credentials.contains(id))
+        {
+            return Err(FidoError::PlatformCredentialExists);
+        }
+        let mut id = [0u8; 32];
+        use rand::RngCore;
+        rand::rngs::OsRng.fill_bytes(&mut id);
+        id[..8].copy_from_slice(MOCK_PLATFORM_ID_PREFIX);
+        let id = id.to_vec();
+        let mut creation = Self::prf_for_credential(&id);
+        if self.platform_mode == MockPlatformMode::CreationPrfMismatch {
+            creation[0] ^= 0xFF;
+        }
+        self.platform_credentials.push(id.clone());
+        Ok(PlatformRegistration {
+            credential: RegisteredCredential {
+                credential_id: id,
+                aaguid: [0u8; 16],
+                label: label.to_owned(),
+                kind: KeyKind::WindowsManaged,
+            },
+            creation_prf: zeroize::Zeroizing::new(creation),
+        })
+    }
+
+    fn get_platform_prf_secret(
+        &mut self,
+        credential_ids: &[Vec<u8>],
+    ) -> Result<(Vec<u8>, [u8; 32]), FidoError> {
+        self.call_log.push(MockCall::GetPlatformPrf);
+        if self.platform_mode == MockPlatformMode::Unavailable {
+            return Err(platform_unsupported());
+        }
+        // 模擬 Windows backend 的前景守門：在呼叫 authenticator 之前拒絕。
+        if let Some(error) = Self::take_handoff(&mut self.platform_handoff) {
+            return Err(error);
+        }
+        let id = credential_ids
+            .iter()
+            .find(|id| self.platform_credentials.contains(id))
+            .ok_or(FidoError::PlatformCredentialMissing)?;
+        if self.platform_mode == MockPlatformMode::AssertionPrfFails {
+            return Err(FidoError::PlatformPrfUnsupported);
+        }
+        Ok((id.clone(), Self::prf_for_credential(id)))
+    }
+
+    fn list_platform_credentials(&mut self) -> Result<Vec<Vec<u8>>, FidoError> {
+        self.call_log.push(MockCall::ListPlatform);
+        if self.platform_mode == MockPlatformMode::Unavailable {
+            return Err(platform_unsupported());
+        }
+        Ok(self.platform_credentials.clone())
+    }
+
+    fn delete_platform_credential(&mut self, credential_id: &[u8]) -> Result<(), FidoError> {
+        self.call_log.push(MockCall::DeletePlatform);
+        if self.platform_mode == MockPlatformMode::Unavailable {
+            return Err(platform_unsupported());
+        }
+        let pos = self
+            .platform_credentials
+            .iter()
+            .position(|id| id.as_slice() == credential_id)
+            .ok_or(FidoError::PlatformCredentialMissing)?;
+        self.platform_credentials.remove(pos);
+        Ok(())
     }
 }
 
@@ -1594,6 +1946,388 @@ mod tests {
 
     // ── D6：excludeCredentials ──
 
+    // ── windows-hello D2：平台 authenticator trait + Mock ──
+
+    fn wh_label() -> &'static str {
+        "Windows Hello（本機 TEST-PC）"
+    }
+
+    #[test]
+    fn wh_d2_trait_defaults_fail_closed() {
+        let mut b = MinimalBackend(MockBackend::new());
+        assert_eq!(b.platform_status(), PlatformStatus::default());
+        assert!(!b.platform_status().available());
+        assert!(matches!(
+            b.register_platform_credential(wh_label(), &[]),
+            Err(FidoError::NotSupported(_))
+        ));
+        assert!(matches!(
+            b.get_platform_prf_secret(&[vec![1u8; 32]]),
+            Err(FidoError::NotSupported(_))
+        ));
+        assert!(matches!(
+            b.list_platform_credentials(),
+            Err(FidoError::NotSupported(_))
+        ));
+        assert!(matches!(
+            b.delete_platform_credential(&[1u8; 32]),
+            Err(FidoError::NotSupported(_))
+        ));
+    }
+
+    #[test]
+    fn wh_d2_unavailable_backend_platform_ops_fail_closed() {
+        let mut b = UnavailableBackend::new(1);
+        assert!(!b.platform_status().available());
+        assert!(matches!(
+            b.register_platform_credential(wh_label(), &[]),
+            Err(FidoError::NotSupported(_))
+        ));
+        assert!(matches!(
+            b.get_platform_prf_secret(&[vec![1u8; 32]]),
+            Err(FidoError::NotSupported(_))
+        ));
+        assert!(matches!(
+            b.list_platform_credentials(),
+            Err(FidoError::NotSupported(_))
+        ));
+    }
+
+    #[test]
+    fn wh_d2_platform_status_requires_all_three() {
+        let all = PlatformStatus {
+            api_ok: true,
+            uvpa: true,
+            console: true,
+        };
+        assert!(all.available());
+        for missing in 0..3 {
+            let mut s = all;
+            match missing {
+                0 => s.api_ok = false,
+                1 => s.uvpa = false,
+                _ => s.console = false,
+            }
+            assert!(!s.available(), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn wh_d2_mock_platform_available_by_default() {
+        let b = MockBackend::new();
+        assert!(
+            b.platform_status().available(),
+            "default mock models a supported machine: {:?}",
+            b.platform_status()
+        );
+    }
+
+    #[test]
+    fn wh_d2_mock_register_then_assert_returns_creation_prf() {
+        let mut b = MockBackend::new();
+        let reg = b.register_platform_credential(wh_label(), &[]);
+        assert!(reg.is_ok(), "register: {:?}", reg.err());
+        let reg = reg.unwrap();
+        let id = reg.credential.credential_id.clone();
+        assert!(MockBackend::is_mock_platform_credential(&id), "{id:?}");
+        assert_eq!(reg.credential.kind, KeyKind::WindowsManaged);
+        assert_eq!(reg.credential.label, wh_label());
+        let got = b.get_platform_prf_secret(std::slice::from_ref(&id));
+        assert!(got.is_ok(), "assert: {:?}", got.err());
+        let (got_id, secret) = got.unwrap();
+        assert_eq!(got_id, id);
+        assert_eq!(
+            secret, *reg.creation_prf,
+            "create output must equal assertion output"
+        );
+        let listed = b.list_platform_credentials();
+        assert!(
+            matches!(&listed, Ok(ids) if ids == &vec![id.clone()]),
+            "{listed:?}"
+        );
+    }
+
+    #[test]
+    fn wh_d2_mock_exclude_existing_rejects_without_creating() {
+        let mut b = MockBackend::new();
+        let first = b.register_platform_credential(wh_label(), &[]);
+        assert!(first.is_ok(), "{:?}", first.err());
+        let id = first.unwrap().credential.credential_id;
+        let again = b.register_platform_credential(wh_label(), std::slice::from_ref(&id));
+        assert!(
+            matches!(again, Err(FidoError::PlatformCredentialExists)),
+            "same machine must be excluded: {:?}",
+            again.err()
+        );
+        assert_eq!(b.platform_credential_ids().len(), 1, "no second credential");
+
+        // 另一台電腦的 platform ID 不會命中本機（每台電腦各可註冊一個，Q3）。
+        let mut other = MockBackend::new();
+        let foreign = other
+            .register_platform_credential(wh_label(), &[])
+            .map(|r| r.credential.credential_id);
+        assert!(foreign.is_ok(), "{:?}", foreign.err());
+        let mut third = MockBackend::new();
+        let ok = third.register_platform_credential(wh_label(), &[foreign.unwrap()]);
+        assert!(ok.is_ok(), "foreign id must not block: {:?}", ok.err());
+    }
+
+    #[test]
+    fn wh_d2_mock_nb_mode_creation_prf_but_assertion_fails() {
+        let mut b = MockBackend::new().with_platform_mode(MockPlatformMode::AssertionPrfFails);
+        let reg = b.register_platform_credential(wh_label(), &[]);
+        assert!(reg.is_ok(), "NB type still creates: {:?}", reg.err());
+        let id = reg.unwrap().credential.credential_id;
+        let got = b.get_platform_prf_secret(std::slice::from_ref(&id));
+        assert!(
+            matches!(got, Err(FidoError::PlatformPrfUnsupported)),
+            "salted assertion must fail: {:?}",
+            got.err()
+        );
+        assert_eq!(
+            b.platform_credential_ids(),
+            &[id.clone()][..],
+            "still present until deleted"
+        );
+        let del = b.delete_platform_credential(&id);
+        assert!(del.is_ok(), "{:?}", del.err());
+        assert!(matches!(b.list_platform_credentials(), Ok(ids) if ids.is_empty()));
+    }
+
+    #[test]
+    fn wh_d2_mock_creation_prf_mismatch_mode() {
+        let mut b = MockBackend::new().with_platform_mode(MockPlatformMode::CreationPrfMismatch);
+        let reg = b.register_platform_credential(wh_label(), &[]);
+        assert!(reg.is_ok(), "{:?}", reg.err());
+        let reg = reg.unwrap();
+        let id = reg.credential.credential_id.clone();
+        let got = b.get_platform_prf_secret(std::slice::from_ref(&id));
+        assert!(got.is_ok(), "{:?}", got.err());
+        assert_ne!(got.unwrap().1, *reg.creation_prf);
+    }
+
+    #[test]
+    fn wh_d2_mock_unavailable_mode() {
+        let mut b = MockBackend::new().with_platform_mode(MockPlatformMode::Unavailable);
+        assert!(!b.platform_status().available());
+        assert!(matches!(
+            b.register_platform_credential(wh_label(), &[]),
+            Err(FidoError::NotSupported(_))
+        ));
+        assert!(matches!(
+            b.get_platform_prf_secret(&[vec![1u8; 32]]),
+            Err(FidoError::NotSupported(_))
+        ));
+        assert!(matches!(
+            b.list_platform_credentials(),
+            Err(FidoError::NotSupported(_))
+        ));
+        assert!(b.platform_credential_ids().is_empty());
+    }
+
+    #[test]
+    fn wh_d2_mock_assert_picks_local_credential_only() {
+        let mut b = MockBackend::new();
+        let own = b
+            .register_platform_credential(wh_label(), &[])
+            .map(|r| r.credential.credential_id);
+        assert!(own.is_ok(), "{:?}", own.err());
+        let own = own.unwrap();
+        let mut other = MockBackend::new();
+        let foreign = other
+            .register_platform_credential(wh_label(), &[])
+            .map(|r| r.credential.credential_id);
+        assert!(foreign.is_ok(), "{:?}", foreign.err());
+        let foreign = foreign.unwrap();
+
+        assert!(b.get_platform_prf_secret(&[]).is_err(), "empty allow list");
+        let missing = b.get_platform_prf_secret(std::slice::from_ref(&foreign));
+        assert!(
+            matches!(missing, Err(FidoError::PlatformCredentialMissing)),
+            "{:?}",
+            missing.err()
+        );
+        let got = b.get_platform_prf_secret(&[foreign, own.clone()]);
+        assert!(matches!(&got, Ok((id, _)) if id == &own), "{:?}", got.err());
+    }
+
+    #[test]
+    fn wh_d2_mock_restart_keeps_machine_credentials() {
+        let mut first = MockBackend::new();
+        let reg = first.register_platform_credential(wh_label(), &[]);
+        assert!(reg.is_ok(), "{:?}", reg.err());
+        let reg = reg.unwrap();
+        let id = reg.credential.credential_id.clone();
+
+        let mut restarted = MockBackend::new().with_platform_credentials(vec![id.clone()]);
+        let got = restarted.get_platform_prf_secret(std::slice::from_ref(&id));
+        assert!(
+            matches!(&got, Ok((_, s)) if s == &*reg.creation_prf),
+            "same machine after restart: {:?}",
+            got.err()
+        );
+        let mut other_machine = MockBackend::new();
+        assert!(matches!(
+            other_machine.get_platform_prf_secret(std::slice::from_ref(&id)),
+            Err(FidoError::PlatformCredentialMissing)
+        ));
+    }
+
+    #[test]
+    fn wh_d2_mock_roaming_path_rejects_platform_ids() {
+        let mut b = MockBackend::new();
+        let reg = b.register_platform_credential(wh_label(), &[]);
+        assert!(reg.is_ok(), "{:?}", reg.err());
+        let id = reg.unwrap().credential.credential_id;
+        let one = b.get_prf_secret(&id, None);
+        assert!(one.is_err(), "YubiKey path must not assert a platform id");
+        let any = b.get_prf_secret_for_any(std::slice::from_ref(&id), None);
+        assert!(any.is_err(), "YubiKey path must not assert a platform id");
+        // roaming ID 仍正常
+        let d = b.detect().unwrap();
+        let roaming = b.register_credential(&d, None).unwrap();
+        assert!(!MockBackend::is_mock_platform_credential(
+            &roaming.credential_id
+        ));
+        assert!(b.get_prf_secret(&roaming.credential_id, None).is_ok());
+    }
+
+    #[test]
+    fn wh_d2_mock_delete_unknown_and_twice() {
+        let mut b = MockBackend::new();
+        let reg = b.register_platform_credential(wh_label(), &[]);
+        assert!(reg.is_ok(), "{:?}", reg.err());
+        let id = reg.unwrap().credential.credential_id;
+        assert!(b.delete_platform_credential(&id).is_ok());
+        assert!(matches!(
+            b.delete_platform_credential(&id),
+            Err(FidoError::PlatformCredentialMissing)
+        ));
+        assert!(matches!(
+            b.get_platform_prf_secret(std::slice::from_ref(&id)),
+            Err(FidoError::PlatformCredentialMissing)
+        ));
+    }
+
+    #[test]
+    fn wh_d2_platform_registration_debug_redacts_prf() {
+        let reg = PlatformRegistration {
+            credential: RegisteredCredential {
+                credential_id: vec![7u8; 4],
+                aaguid: [0u8; 16],
+                label: "L".into(),
+                kind: KeyKind::WindowsManaged,
+            },
+            creation_prf: zeroize::Zeroizing::new([0xABu8; 32]),
+        };
+        let shown = format!("{reg:?}");
+        assert!(!shown.contains("171"), "PRF bytes leaked: {shown}");
+        assert!(
+            !shown.to_lowercase().contains("ab, ab"),
+            "PRF bytes leaked: {shown}"
+        );
+        assert!(shown.contains("redacted"), "{shown}");
+    }
+
+    #[test]
+    fn wh_d2_platform_error_messages() {
+        let exists = FidoError::PlatformCredentialExists.to_string();
+        assert!(exists.contains("已註冊 Windows Hello"), "{exists}");
+        assert!(exists.contains("未新增"), "{exists}");
+        let prf = FidoError::PlatformPrfUnsupported.to_string();
+        assert!(prf.contains("不支援金庫解鎖所需的 PRF"), "{prf}");
+        assert!(prf.contains("未新增"), "{prf}");
+        let missing = FidoError::PlatformCredentialMissing.to_string();
+        assert!(missing.contains("這台電腦沒有"), "{missing}");
+        // 既有 YubiKey 訊息不變
+        assert!(FidoError::CredentialExcluded.to_string().contains("A 或 B"));
+    }
+
+    #[test]
+    fn d9f1_mock_roaming_handoff_once_then_succeeds_and_logs_calls() {
+        let mut b = MockBackend::new()
+            .with_next_kind(KeyKind::TouchOnly)
+            .with_roaming_handoff(MockHandoffRefusal::ForegroundHandoffRequired, 1);
+        let detected = b.detect().expect("detect");
+        let reg = b.register_credential(&detected, None).expect("register");
+        assert!(matches!(
+            b.get_prf_secret(&reg.credential_id, None),
+            Err(FidoError::ForegroundHandoffRequired)
+        ));
+        assert!(matches!(
+            b.get_prf_secret(&reg.credential_id, None),
+            Ok(secret) if secret == MockBackend::prf_for_credential(&reg.credential_id)
+        ));
+        assert_eq!(
+            b.calls(),
+            &[
+                MockCall::Detect,
+                MockCall::RegisterCredential,
+                MockCall::GetPrfSecret,
+                MockCall::GetPrfSecret
+            ]
+        );
+    }
+
+    #[test]
+    fn d9f1_mock_platform_handoff_counts_down_and_logs_delete() {
+        let mut b =
+            MockBackend::new().with_platform_handoff(MockHandoffRefusal::OwnerNotForeground, 2);
+        let reg = b.register_platform_credential("x", &[]).expect("register");
+        let ids = vec![reg.credential.credential_id.clone()];
+        for _ in 0..2 {
+            assert!(matches!(
+                b.get_platform_prf_secret(&ids),
+                Err(FidoError::OwnerNotForeground)
+            ));
+        }
+        assert!(b.get_platform_prf_secret(&ids).is_ok());
+        assert!(b.list_platform_credentials().is_ok());
+        assert!(b.delete_platform_credential(&ids[0]).is_ok());
+        assert_eq!(
+            b.calls(),
+            &[
+                MockCall::RegisterPlatform,
+                MockCall::GetPlatformPrf,
+                MockCall::GetPlatformPrf,
+                MockCall::GetPlatformPrf,
+                MockCall::ListPlatform,
+                MockCall::DeletePlatform
+            ]
+        );
+        // roaming 注入不影響平台，反之亦然。
+        let mut r = MockBackend::new()
+            .with_next_kind(KeyKind::TouchOnly)
+            .with_platform_handoff(MockHandoffRefusal::ForegroundHandoffRequired, 1);
+        let d = r.detect().expect("detect");
+        let reg = r.register_credential(&d, None).expect("register");
+        assert!(r.get_prf_secret(&reg.credential_id, None).is_ok());
+    }
+
+    #[test]
+    fn d9f1_handoff_error_messages() {
+        assert_eq!(
+            FidoError::ForegroundHandoffRequired.to_string(),
+            "金鑰已建立，但 Windows 未將焦點交回 FidoVault；請按「繼續驗證」完成註冊，或按「取消」放棄。"
+        );
+        // 登入路徑使用者看到的文字不變：與舊 Internal(OWNER_NOT_FOREGROUND_MSG) 的顯示逐字相同。
+        assert_eq!(
+            FidoError::OwnerNotForeground.to_string(),
+            FidoError::Internal(OWNER_NOT_FOREGROUND_MSG.into()).to_string()
+        );
+        assert!(FidoError::ForegroundHandoffRequired.is_foreground_handoff());
+        assert!(FidoError::OwnerNotForeground.is_foreground_handoff());
+        for other in [
+            FidoError::NoDevice,
+            FidoError::PlatformPrfUnsupported,
+            FidoError::PlatformCredentialMissing,
+            FidoError::Internal(OWNER_NOT_FOREGROUND_MSG.into()),
+            FidoError::Internal("Windows WebAuthn continuation refused: owner-invalid".into()),
+        ] {
+            assert!(!other.is_foreground_handoff(), "{other:?}");
+        }
+    }
+
     #[test]
     fn credential_excluded_message_is_clear() {
         let m = FidoError::CredentialExcluded.to_string();
@@ -1701,6 +2435,16 @@ mod tests {
             b.get_prf_secret(&reg.credential_id, Some("1234")).unwrap(),
             MockBackend::prf_for_credential(&reg.credential_id)
         );
+    }
+
+    #[test]
+    fn d9f2_platform_authenticator_substituted_message_is_exact_and_not_a_handoff() {
+        let error = FidoError::PlatformAuthenticatorSubstituted;
+        assert_eq!(
+            error.to_string(),
+            "Windows 以安全性金鑰完成，而非本機 Windows Hello；未註冊。該安全性金鑰上可能留下一筆 fido-vault.local 測試憑證，可用 YubiKey 管理工具移除。"
+        );
+        assert!(!error.is_foreground_handoff());
     }
 
     #[test]

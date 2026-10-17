@@ -18,11 +18,12 @@ Windows 桌面、**完全離線**、**portable 免安裝**的 FIDO2 密碼金庫
 - 支援在已實測矩陣內以 RDP（WebAuthn 重新導向）使用金鑰；WebAuthn 不可用（API < v4）時程式仍可啟動並以主密碼登入，金鑰操作會說明原因並拒絕
 - ⚠️ **無復原機制**：主密碼遺忘且所有 FIDO2 金鑰全失 = 資料永久無法取回
 
-## 目前狀態（2026-10-11）
+## 目前狀態（2026-10-13）
 
 - `main` 已包含 PR #2–#26；目前 Win11-NB 正式部署 GUI 來自 PR #25（commit `5b943c7`，`main` `5073642` 起），SHA-256 `3b3f7367be81baab1a37c5249788f815c397b9e5241289880a3e6f7618996322`，2026-10-11 部署至 `C:\FidoVault`。
 - 自動化驗證（GitHub Actions，Windows）：UI 65/65、Rust `--features real-ctap` 200/200、mock Gate E2E 20/20。
 - 部署、驗收與殘餘未測項目見 `docs/PROJECT.md` §17、`docs/user-verification-steps.md` 末節與 `docs/rdp-webauthn-verification.md` R6。
+- **單人版 Windows Hello（PR #30，Draft）**：D1–D7 程式及 Mock Gate 已完成；D8 文件同步已審查完成；D9 Release／隔離 staging／實機驗收尚未完成。PR 未合併、未部署；目前正式安裝版本沒有由本分支交付的 Windows Hello，不能把 mock 通過當成實機支援。細節見下方「單人版 Windows Hello」、`docs/spec.md` 與 `docs/user-verification-steps.md` 的 V1–V9。
 - **雙群組控管版（開發中）**：分支 `feature/dual-control-20261011`、draft PR #29。D1–D11（程式與全套自動化驗證）已完成，Win11-NB 實機驗收（D13）尚未執行；**未合併、未部署，不是可發佈產物**。見下方「雙群組控管版」與 `docs/plans/dual-control.md`。
 
 ## 目錄結構
@@ -85,6 +86,16 @@ Windows Release GUI（`real-ctap`）從檔案總管啟動時使用 Windows WebAu
 Windows Release 硬體模式以單一通用「以金鑰登入」入口呼叫 Windows WebAuthn；金鑰選擇、PIN/UV 與觸碰由 Windows 安全性提示處理。操作期間，程式會對唯一的新同 session 安全性 broker 視窗做一次受限的前景請求，但只有在 FidoVault 仍為前景時才嘗試；不會把提示設成 topmost，也不會繞過 Windows 的全域前景政策。這是 best-effort，Windows 仍可能切換焦點。
 
 Win11-NB 本機 Console 已確認通用登入不需先選金鑰。每次金鑰操作的第一個 Windows 安全性視窗會被拉到前景；已知問題：同一次操作的第二個視窗（按指紋／觸碰提示）仍可能被 FidoVault 擋住，直接操作金鑰即可完成，不影響使用（需同一操作多次拉前景才能修正，目前未授權）。Windows WebAuthn API v4+ 仍是硬體 GUI 的必要條件；較舊 API 版本會 fail closed。
+
+## 單人版 Windows Hello（本機 Console；尚待 D9 實機驗收）
+
+Windows Hello 是單人版的本機平台憑證，和外接 YubiKey 是兩種不同的解鎖方式。可用性檢查要求 Windows WebAuthn API v8+、Windows Hello 平台驗證器可用，且程式在本機 Console 執行；RDP／WinRM／session 0 不提供此功能。外接 FIDO2 金鑰既有的 API v4+ 與 RDP 支援範圍，不能套用到 Windows Hello。
+
+註冊時 Windows 會進行建立及 PRF assertion 驗證；只有 assertion 回傳預期憑證及 32-byte PRF 後才新增金庫槽位。若建立成功但 PRF 驗證失敗，金庫不新增槽位，程式會嘗試清理 Windows 憑證；清理也失敗時可能留下 Windows 端的測試憑證。主密碼和已註冊的 YubiKey 仍是備援解鎖方式。
+
+Windows Hello 使用 Windows platform authenticator；此功能範圍限 Windows 本機儲存的 credential，第三方／同步型 passkey manager 不支援。**目前 backend 使用 v8 options，只要求 PLATFORM attachment；未呼叫 v9 `WebAuthNGetAuthenticatorList`／傳入 authenticator ID 來鎖定特定 provider。**Microsoft API v9 提供指定 authenticator 的能力，但 FidoVault 尚未實作；Windows 的 provider 選擇不是程式可保證的設定。credential 不存放於 `vault.db`，因此複製金庫檔案本身不會匯出該 credential。執行驗收前須在「設定 → 帳戶 → 通行金鑰 → 進階選項」確認使用「儲存到這部 Windows 裝置」的本機 provider；若 provider 為第三方同步服務或狀態不明，停止並標記超出範圍／未測，不要改同步設定。從 Windows 11 24H2 起，應用程式存取 passkeys 前可能出現 privacy-consent 提示；若出現，記錄實際選擇與結果。只有在專用測試機且經使用者／管理員核准時才允許本測試程式使用 passkeys；不要變更組織政策或全域設定。若未授權或被拒絕，將該次驗收標記為「受同意設定阻擋／未測」，不可誤報成 PRF 不支援。
+
+本分支的自動化結果僅為 Mock Gate：9 cases／29 checks；不代表實體 Windows Hello、Windows Settings 清理結果或 GUI 提示前景已驗收。此功能尚未合併／部署；完整狀態以 `docs/PROJECT.md` 最新 Windows Hello 段落為準。
 
 ## portable 部署到別台電腦（含 Win11-NB）
 
